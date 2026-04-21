@@ -1,0 +1,24 @@
+project:
+  name: graphslm-contextual-ids
+  seed: 42
+
+data:
+  input_glob:
+    - data/raw/**/*.pcap
+    - data/raw/**/*.pcapng
+  output_dir: data/interim/payload_dataset
+  payload_length: 256
+  max_packets_per_file: null
+  include_empty_payload: false
+
+teacher:
+  model_name: ehsanaghaei/SecureBERT
+  batch_size: 64
+  max_length: 512
+  l2_normalize: true
+  output_path: data/processed/teacher_targets.npy
+
+mitre:
+  techniques_csv: data/mitre/mitre_techniques.csv
+  embedding_path: data/mitre/mitre_techniques_embeddings.npy
+  similarity_threshold: 0.85

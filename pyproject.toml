@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "context-rich-hetero-ids"
+version = "0.1.0"
+description = "Context-rich and explainable intrusion detection with heterogeneous graph learning"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.26",
+  "pandas>=2.1",
+  "scapy>=2.5.0",
+  "tqdm>=4.66",
+  "pyyaml>=6.0"
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

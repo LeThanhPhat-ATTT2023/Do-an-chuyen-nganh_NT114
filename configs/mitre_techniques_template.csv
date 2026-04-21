@@ -1,0 +1,4 @@
+technique_id,name,description
+T1190,Exploit Public-Facing Application,Adversaries may exploit internet-facing software vulnerabilities.
+T1110,Brute Force,Adversaries may attempt password guessing against remote services.
+T1046,Network Service Discovery,Adversaries may probe open ports and services.
