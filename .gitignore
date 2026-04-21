@@ -1,0 +1,41 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+.deps/
+
+# IDE
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+
+# Local environment files
+.env
+.env.*
+
+# Data outputs
+outputs/
+logs/
+*.pt
+*.onnx
+*.npz
+
+# Large generated arrays
+*.npy
+
+# Ignore data folder content except placeholders
+/data/raw/*
+/data/interim/*
+/data/processed/*
+/data/mitre/*
+!/data/raw/.gitkeep
+!/data/interim/.gitkeep
+!/data/processed/.gitkeep
+!/data/mitre/.gitkeep

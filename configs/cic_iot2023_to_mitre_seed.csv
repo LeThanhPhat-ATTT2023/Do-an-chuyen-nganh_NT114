@@ -1,0 +1,12 @@
+dataset_label,technique_id,priority,notes
+WebBased,T1190,high,Exploit public-facing app is a core web attack mapping.
+WebBased,T1505.003,medium,Web shell behavior can appear in web exploit scenarios.
+BruteForce,T1110,high,Credential brute force and guessing.
+Recon,T1595,high,Active scanning before exploitation.
+Recon,T1046,high,Network service and port discovery.
+Spoofing,T1557,medium,Adversary-in-the-middle or spoofing-oriented behavior.
+Dos,T1499,high,Endpoint denial of service behavior.
+DDos,T1498,high,Network denial of service and volumetric attacks.
+Mirai,T1498,high,Botnet-driven DDoS behavior often aligns here.
+Mirai,T1110,medium,IoT botnet propagation can include credential brute force.
+Benign,,none,No ATT&CK mapping for benign traffic.

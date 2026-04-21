@@ -1,0 +1,6 @@
+-r requirements.txt
+torch>=2.2
+transformers>=4.42
+sentence-transformers>=2.7
+faiss-cpu>=1.8
+onnxruntime>=1.18
