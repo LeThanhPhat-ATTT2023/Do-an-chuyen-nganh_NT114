@@ -1,84 +1,83 @@
-# Context-Rich Explainable IDS (NT114 Thesis)
+# Context-Rich Explainable IDS - NT114
 
-This repository bootstraps the thesis project:
+Dự án xây dựng hệ thống phát hiện xâm nhập mạng dựa trên payload embedding, đồ thị dị thể và ngữ cảnh MITRE ATT&CK.
 
-Context-rich and explainable network intrusion detection based on heterogeneous graph learning, MITRE ATT&CK integration, and embedding-level LLM reasoning.
+Ý tưởng chính là không đưa trực tiếp payload raw vào GNN. Pipeline hiện tại dùng transformer teacher để tạo embedding, distill sang student 1D-CNN nhẹ hơn, sau đó dùng embedding này để tạo graph 3 tầng gồm `flow`, `packet`, `MITRE technique/tactic` và train HGT flow classifier.
 
-## Problem and direction
+## Trạng Thái Hiện Tại
 
-Many graph-based IDS pipelines still push high-dimensional raw payload bytes directly into GNN layers. This hurts real-time viability and introduces noise.
+Baseline đang được giữ trong repo là cấu hình HGT với graph:
 
-This project follows a pragmatic strategy:
+`data/processed/graph_artifact_3tier_t082_k5.npz`
 
-1. Use only the first 256 payload bytes per packet.
-2. Distill a transformer teacher (for example SecureBERT) into a compact 1D-CNN student.
-3. Build heterogeneous graph representations with flow, packet, and MITRE semantic context.
-4. Split deployment into fast detection path and slower explainability path.
+Thông số graph chính:
 
-## Current bootstrap scope
+| Tham số | Giá trị |
+|---|---:|
+| similarity threshold | 0.82 |
+| packet top-k | 5 |
+| flow top-k | 5 |
+| num flows | 27,541 |
+| num packets | 86,548 |
+| num techniques | 691 |
+| num tactics | 14 |
 
-This repository already contains runnable scaffolding for:
+Kết quả train tốt nhất hiện tại:
 
-1. Extracting fixed-size payload vectors from PCAP files.
-2. Creating teacher embedding targets with a transformer model.
-3. Training a compact student 1D-CNN by distillation.
+| Metric | Giá trị |
+|---|---:|
+| best epoch | 143 |
+| validation macro-F1 | 0.351063 |
+| test macro-F1 | 0.363932 |
+| test accuracy | 0.347621 |
 
-The graph/HGT and slow-path XAI modules are the next implementation stages.
+Checkpoint chính:
 
-## Repository layout
+`outputs/hgt_flow_classifier_t082_k5_l3_d01/hgt_flow_best.pt`
+
+## Cấu Trúc Repo
 
 ```text
 .
 |-- configs/
-|   `-- pipeline.example.yaml
+|   |-- hgt.example.yaml
+|   |-- hgt_t082_k5_l3_d01.yaml
+|   |-- pipeline.example.yaml
+|   |-- cic_iot2023_to_mitre_seed.csv
+|   `-- mitre_techniques_template.csv
 |-- data/
 |   |-- raw/
 |   |-- interim/
 |   |-- processed/
 |   `-- mitre/
 |-- docs/
-|   `-- feasibility_assessment_vi.md
+|-- outputs/
+|   |-- hgt_flow_classifier_t082_k5_l3_d01/
+|   `-- student_cnn/
 |-- scripts/
-|   |-- extract_payload_dataset.py
-|   |-- build_teacher_targets.py
-|   `-- train_student_cnn.py
 |-- src/graphslm_ids/
-|   |-- data/pcap_payload_extractor.py
-|   |-- models/student_cnn.py
-|   `-- utils/io.py
 |-- tests/
-|   `-- test_payload_extractor.py
 |-- requirements.txt
 |-- requirements-ml.txt
 `-- pyproject.toml
 ```
 
-## Quickstart (Windows PowerShell)
+`outputs/`, `data/raw/`, `data/interim/`, `data/processed/` và `data/mitre/` là dữ liệu sinh ra trong quá trình chạy nên đã được ignore khỏi git. Repo chỉ giữ source, config, test và tài liệu.
 
-### 1) Create and activate environment
+## Cài Đặt
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-```
-
-### 2) Install dependencies
-
-For phase 1 only:
-
-```powershell
 pip install -r requirements.txt
-```
-
-For distillation/training phases:
-
-```powershell
 pip install -r requirements-ml.txt
 ```
 
-## Phase 0: Prepare MITRE Knowledge Base (for semantic layer)
+## Pipeline Chạy Lại Từ Đầu
 
-Download official ATT&CK Enterprise STIX data:
+### 1. Chuẩn bị MITRE ATT&CK
+
+Tải Enterprise ATT&CK STIX:
 
 ```powershell
 $outDir = "data/mitre"
@@ -86,152 +85,137 @@ New-Item -ItemType Directory -Path $outDir -Force | Out-Null
 Invoke-WebRequest -Uri "https://raw.githubusercontent.com/mitre/cti/master/enterprise-attack/enterprise-attack.json" -OutFile "$outDir/enterprise-attack.json"
 ```
 
-Build MITRE node/edge CSV files from STIX:
+Sinh CSV technique/tactic:
 
 ```powershell
 python scripts/prepare_mitre_knowledge_base.py --input-json "data/mitre/enterprise-attack.json"
 ```
 
-Outputs:
+Tài liệu chi tiết bằng tiếng Việt:
 
-1. data/mitre/mitre_techniques.csv
-2. data/mitre/mitre_tactics.csv
-3. data/mitre/mitre_technique_tactic_edges.csv
-4. data/mitre/mitre_export_stats.json
+`docs/mitre_setup_cic_iot2023_vi.md`
 
-For CIC-IoT2023 bootstrap mapping, use the seed file:
+### 2. Trích Xuất Payload Dataset
 
-1. configs/cic_iot2023_to_mitre_seed.csv
-
-Detailed step-by-step (Vietnamese):
-
-1. docs/mitre_setup_cic_iot2023_vi.md
-
-## Phase 1: Extract payload dataset (256 bytes)
-
-Put your .pcap/.pcapng files under data/raw/ then run:
+Đặt file `.pcap` hoặc `.pcapng` vào `data/raw/`, sau đó chạy:
 
 ```powershell
 python scripts/extract_payload_dataset.py --input-glob "data/raw/**/*.pcap" "data/raw/**/*.pcapng" --output-dir "data/interim/payload_dataset" --payload-length 256
 ```
 
-Optional (review/debug only): export graph-review CSV files:
+Output chính:
 
-```powershell
-python scripts/extract_payload_dataset.py --input-glob "data/raw/**/*.pcap" "data/raw/**/*.pcapng" --output-dir "data/interim/payload_dataset" --payload-length 256 --export-graph-csv --graph-flow-timeout-seconds 30 --graph-max-packets-per-flow 20
-```
+`data/interim/payload_dataset/payload_256.npy`  
+`data/interim/payload_dataset/metadata.csv`  
+`data/interim/payload_dataset/stats.json`
 
-Expected outputs:
-
-1. data/interim/payload_dataset/payload_256.npy
-2. data/interim/payload_dataset/metadata.csv
-3. data/interim/payload_dataset/stats.json
-4. data/interim/payload_dataset/flow_nodes.csv (when --export-graph-csv is enabled)
-5. data/interim/payload_dataset/packet_nodes.csv (when --export-graph-csv is enabled)
-6. data/interim/payload_dataset/contain_edges.csv (when --export-graph-csv is enabled)
-7. data/interim/payload_dataset/link_edges.csv (when --export-graph-csv is enabled)
-
-## Phase 1.5: Build Graph Artifact Directly (no 4 CSV required)
-
-This is the recommended path when you only need graph tensors/artifacts for training.
-
-```powershell
-python scripts/build_graph_artifact.py --metadata-csv "data/interim/payload_dataset/metadata.csv" --payload-npy "data/interim/payload_dataset/payload_256.npy" --output-npz "data/processed/graph_artifact.npz" --flow-timeout-seconds 30 --max-packets-per-flow 20
-```
-
-Outputs:
-
-1. data/processed/graph_artifact.npz
-2. data/processed/graph_artifact.meta.json
-
-## Phase 2: Build teacher targets
+### 3. Tạo Teacher Targets
 
 ```powershell
 python scripts/build_teacher_targets.py --payload-npy "data/interim/payload_dataset/payload_256.npy" --metadata-csv "data/interim/payload_dataset/metadata.csv" --output-path "data/processed/teacher_targets.npy" --model-name "ehsanaghaei/SecureBERT" --batch-size 32
 ```
 
-Notes:
+Output:
 
-1. If RAM is tight, lower --batch-size to 8 or 16.
-2. Use --max-rows for quick smoke testing before full run.
-3. metadata.csv is recommended to preserve the real payload length for each packet.
+`data/processed/teacher_targets.npy`  
+`data/processed/teacher_targets.meta.json`
 
-## Phase 3: Train student 1D-CNN
+### 4. Train Student 1D-CNN
 
 ```powershell
 python scripts/train_student_cnn.py --payload-npy "data/interim/payload_dataset/payload_256.npy" --teacher-npy "data/processed/teacher_targets.npy" --output-dir "outputs/student_cnn" --batch-size 256 --epochs 30
 ```
 
-Expected outputs:
+Output:
 
-1. outputs/student_cnn/student_cnn_best.pt
-2. outputs/student_cnn/training_summary.json
+`outputs/student_cnn/student_cnn_best.pt`  
+`outputs/student_cnn/training_summary.json`
 
-## Phase 3.5: Evaluate student embedding quality
+Đánh giá student:
 
 ```powershell
 python scripts/evaluate_student_cnn.py --payload-npy "data/interim/payload_dataset/payload_256.npy" --teacher-npy "data/processed/teacher_targets.npy" --metadata-csv "data/interim/payload_dataset/metadata.csv" --checkpoint "outputs/student_cnn/student_cnn_best.pt" --output-path "outputs/student_cnn/evaluation_summary.json" --batch-size 512 --val-ratio 0.1 --seed 42
 ```
 
-Expected output:
-
-1. outputs/student_cnn/evaluation_summary.json
-
-The evaluation report includes:
-
-1. Overall MSE and cosine metrics for all/train/val splits.
-2. Per-label metrics from metadata labels.
-3. Top-5 labels with lowest cosine similarity for error analysis.
-
-## Phase 4: Export student model to ONNX
+Export ONNX:
 
 ```powershell
 python scripts/export_student_onnx.py --checkpoint "outputs/student_cnn/student_cnn_best.pt" --output-path "outputs/student_cnn/student_cnn.onnx" --input-length 256 --opset 17 --verify
 ```
 
-Expected outputs:
-
-1. outputs/student_cnn/student_cnn.onnx
-2. outputs/student_cnn/student_cnn.meta.json
-
-## Phase 4.5: Export student embeddings for all packets
+### 5. Export Student Embeddings
 
 ```powershell
 python scripts/export_student_embeddings.py --payload-npy "data/interim/payload_dataset/payload_256.npy" --checkpoint "outputs/student_cnn/student_cnn_best.pt" --output-path "data/processed/student_embeddings.npy" --batch-size 1024 --device auto
 ```
 
-Expected outputs:
+Output:
 
-1. data/processed/student_embeddings.npy
-2. data/processed/student_embeddings.meta.json
+`data/processed/student_embeddings.npy`  
+`data/processed/student_embeddings.meta.json`
 
-## Phase 4.6: Build MITRE technique embeddings
+### 6. Tạo MITRE Technique Embeddings
 
 ```powershell
 python scripts/build_mitre_technique_embeddings.py --techniques-csv "data/mitre/mitre_techniques.csv" --output-path "data/mitre/mitre_techniques_embeddings.npy" --teacher-meta-json "data/processed/teacher_targets.meta.json" --device auto
 ```
 
-Expected outputs:
+Output:
 
-1. data/mitre/mitre_techniques_embeddings.npy
-2. data/mitre/mitre_techniques_embeddings.meta.json
+`data/mitre/mitre_techniques_embeddings.npy`  
+`data/mitre/mitre_techniques_embeddings.meta.json`
 
-## Phase 5: Build Three-Tier Graph Artifact (flow, packet, MITRE)
+### 7. Tạo Graph 3 Tầng Đã Chọn
+
+Baseline hiện tại dùng threshold `0.82` và top-k `5`.
 
 ```powershell
-python scripts/build_three_tier_graph_artifact.py --metadata-csv "data/interim/payload_dataset/metadata.csv" --payload-npy "data/interim/payload_dataset/payload_256.npy" --student-embedding-npy "data/processed/student_embeddings.npy" --mitre-techniques-csv "data/mitre/mitre_techniques.csv" --mitre-technique-embeddings-npy "data/mitre/mitre_techniques_embeddings.npy" --mitre-technique-tactic-edges-csv "data/mitre/mitre_technique_tactic_edges.csv" --output-npz "data/processed/graph_artifact_3tier.npz" --similarity-threshold 0.85 --packet-top-k 3 --flow-top-k 3
+python scripts/build_three_tier_graph_artifact.py --metadata-csv "data/interim/payload_dataset/metadata.csv" --payload-npy "data/interim/payload_dataset/payload_256.npy" --student-embedding-npy "data/processed/student_embeddings.npy" --mitre-techniques-csv "data/mitre/mitre_techniques.csv" --mitre-technique-embeddings-npy "data/mitre/mitre_techniques_embeddings.npy" --mitre-technique-tactic-edges-csv "data/mitre/mitre_technique_tactic_edges.csv" --output-npz "data/processed/graph_artifact_3tier_t082_k5.npz" --similarity-threshold 0.82 --packet-top-k 5 --flow-top-k 5
 ```
 
-Expected outputs:
+Output:
 
-1. data/processed/graph_artifact_3tier.npz
-2. data/processed/graph_artifact_3tier.meta.json
+`data/processed/graph_artifact_3tier_t082_k5.npz`  
+`data/processed/graph_artifact_3tier_t082_k5.meta.json`
 
-This artifact keeps the original flow-packet structure and adds semantic tactical edges:
+### 8. Train HGT Flow Classifier
 
-1. packet -> MITRE technique edges by cosine similarity.
-2. flow -> MITRE technique edges by aggregated packet similarity.
-3. MITRE technique -> tactic edges from ATT&CK knowledge base.
+Cấu hình baseline:
+
+`configs/hgt_t082_k5_l3_d01.yaml`
+
+Chạy train:
+
+```powershell
+python scripts/train_hgt_flow_classifier.py --config "configs/hgt_t082_k5_l3_d01.yaml"
+```
+
+Output:
+
+`outputs/hgt_flow_classifier_t082_k5_l3_d01/hgt_flow_best.pt`  
+`outputs/hgt_flow_classifier_t082_k5_l3_d01/training_summary.json`
+
+`configs/hgt.example.yaml` cũng đang trỏ về cùng baseline `t082` để tiện chạy nhanh.
+
+## Artifact Đang Giữ
+
+Sau khi dọn repo, các artifact quan trọng còn lại là:
+
+```text
+data/processed/
+|-- graph_artifact_3tier_t082_k5.npz
+|-- graph_artifact_3tier_t082_k5.meta.json
+|-- student_embeddings.npy
+|-- student_embeddings.meta.json
+|-- teacher_targets.npy
+`-- teacher_targets.meta.json
+
+outputs/
+|-- hgt_flow_classifier_t082_k5_l3_d01/
+`-- student_cnn/
+```
+
+Các graph thử nghiệm không được chọn, graph default cũ, cache Python và output HGT smoke/default đã được xóa để repo gọn hơn.
 
 ## Test
 
@@ -239,17 +223,19 @@ This artifact keeps the original flow-packet structure and adds semantic tactica
 pytest
 ```
 
-## Thesis tracking notes
+## Ghi Chú Triển Khai
 
-1. Feasibility and risk notes are tracked in docs/feasibility_assessment_vi.md.
-2. Pipeline defaults are tracked in configs/pipeline.example.yaml.
+1. Teacher transformer chỉ dùng offline để sinh target/embedding.
+2. Online detection path nên dùng student CNN hoặc ONNX runtime.
+3. HGT hiện là flow classifier trên graph dị thể, chưa phải module giải thích cuối cùng.
+4. Slow-path XAI và reasoning layer là giai đoạn tiếp theo.
 
-## Important implementation reminders
+## Tài Liệu Liên Quan
 
-1. Keep teacher computation offline; do not use transformer teacher in online detection path.
-2. Keep online embedding path small and exportable (PyTorch -> ONNX Runtime).
-3. Introduce MITRE tactical edge only after validating embedding quality of the student.
+`docs/feasibility_assessment_vi.md`  
+`docs/mitre_setup_cic_iot2023_vi.md`  
+`docs/system_execution_flows.md`
 
 ## License
 
-This project follows the repository LICENSE file.
+Xem file `LICENSE`.

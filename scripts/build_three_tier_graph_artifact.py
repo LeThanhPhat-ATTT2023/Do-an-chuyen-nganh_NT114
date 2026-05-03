@@ -48,7 +48,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output-npz",
-        default="data/processed/graph_artifact_3tier.npz",
+        default="data/processed/graph_artifact_3tier_t082_k5.npz",
         help="Output NPZ path for three-tier graph arrays.",
     )
     parser.add_argument(
@@ -58,9 +58,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--flow-timeout-seconds", type=float, default=30.0)
     parser.add_argument("--max-packets-per-flow", type=int, default=20)
-    parser.add_argument("--similarity-threshold", type=float, default=0.85)
-    parser.add_argument("--packet-top-k", type=int, default=3)
-    parser.add_argument("--flow-top-k", type=int, default=3)
+    parser.add_argument("--similarity-threshold", type=float, default=0.82)
+    parser.add_argument("--packet-top-k", type=int, default=5)
+    parser.add_argument("--flow-top-k", type=int, default=5)
     return parser.parse_args()
 
 
