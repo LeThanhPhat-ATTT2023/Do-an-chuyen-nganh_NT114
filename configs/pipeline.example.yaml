@@ -21,4 +21,28 @@ teacher:
 mitre:
   techniques_csv: data/mitre/mitre_techniques.csv
   embedding_path: data/mitre/mitre_techniques_embeddings.npy
-  similarity_threshold: 0.85
+  similarity_threshold: 0.82
+  packet_top_k: 5
+  flow_top_k: 5
+
+hgt:
+  graph_npz: data/processed/graph_artifact_3tier_t082_k5.npz
+  graph_meta_json: data/processed/graph_artifact_3tier_t082_k5.meta.json
+  packet_feature: semantic
+  add_reverse_edges: true
+  standardize_flow_features: true
+  use_semantic_edge_weights: true
+  hidden_dim: 128
+  num_layers: 3
+  num_heads: 4
+  dropout: 0.1
+  lr: 0.001
+  weight_decay: 0.00005
+  val_ratio: 0.1
+  test_ratio: 0.1
+  patience: 30
+  class_weight: balanced
+  seed: 42
+  device: cpu
+  monitor: val_macro_f1
+  output_dir: outputs/hgt_flow_classifier_t082_k5_l3_d01
