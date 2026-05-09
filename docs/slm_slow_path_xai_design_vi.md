@@ -42,7 +42,7 @@ flowchart TD
         S2 --> S3[Evidence Builder\nAttention + Counterfactual + MITRE]
         S3 --> S4[Evidence Ranker\nTop-k Packets / Techniques / Paths]
         S4 --> S5[Evidence Bundle JSON]
-        S5 --> S6[SecGPT-7B-GGUF\nReport Generator]
+        S5 --> S6[Qwen2.5-3B-Instruct-GGUF\nReport Generator]
         S6 --> S7[Report Validator]
         S7 -->|PASS| S8[Save Report\nSOC Dashboard]
         S7 -->|FAIL Tier-2| S9[Simplified Prompt\nRe-generate]
@@ -103,10 +103,13 @@ Contribution 3 — Quantitative Faithfulness Metrics:
   human annotation cho mỗi sample. Human annotation chỉ cần cho validation ban
   đầu.
 
-Contribution 4 — Domain-Aligned SLM với Fallback Tiers:
-  Dùng SecGPT-7B — SLM chuyên cybersecurity — thay general-purpose model. Kết
-  hợp với tiered fallback (SLM → simplified SLM → template) để đảm bảo output
-  luôn có trong mọi điều kiện tài nguyên.
+Contribution 4 — Model-Agnostic True-SLM Pipeline với Fallback Tiers:
+  Dùng true SLM 3B params (Qwen2.5-3B-Instruct hoặc Llama-3.2-3B-Instruct)
+  thay vì 7B+ "small LLM". Evidence Bundle + Validator làm cho pipeline
+  model-agnostic — domain-agnostic 3B SLM đạt grounding rate ngang ngửa
+  cybersecurity-specialized 7B model. Kết hợp với tiered fallback
+  (3B SLM → simplified 3B → 1.5B SLM → template) đảm bảo output luôn có
+  trong mọi điều kiện tài nguyên, kể cả edge device 4GB RAM.
 ```
 
 Câu mô tả hệ thống cho paper:
@@ -118,8 +121,8 @@ embedding via teacher-student distillation, MITRE ATT&CK semantic mapping, and
 HGT-based flow classification under strict latency constraints. When a flow is
 flagged as suspicious or malicious, the slow path hydrates a structured Evidence
 Bundle from HGT attention weights, counterfactual perturbation, and MITRE cosine
-scores, then invokes a cybersecurity-specialized SLM to generate an auditable
-English XAI report. A rule-based validator enforces evidence citation and entity
+scores, then invokes a domain-agnostic 3B-parameter Small Language Model
+(Qwen2.5-3B-Instruct) to generate an auditable English XAI report. A rule-based validator enforces evidence citation and entity
 consistency, enabling quantitative faithfulness evaluation without human
 annotation at scale.
 ```
@@ -543,45 +546,93 @@ Nếu bundle > 4000 tokens (flow nhiều packets bất thường):
 
 ## 7. SLM Integration
 
-### 7.1 Model Chính: SecGPT-7B-GGUF
+### 7.0 Định Nghĩa SLM Trong Dự Án
 
 ```
-Model   : clouditera/SecGPT-7B-GGUF
-Lý do   : causal LM chuyên cybersecurity, có thể chạy local với llama.cpp
-Quant   : Q4_K_M (cân bằng tốc độ / chất lượng) hoặc Q5_K_M (chất lượng cao hơn)
-Runtime : llama.cpp hoặc Ollama (khuyến nghị Ollama cho development)
-RAM     : Q4_K_M ≈ 5-6GB VRAM/RAM
+Tiny LM         : < 1B params      (TinyLlama, SmolLM2)
+True SLM        : 1B - 4B params   <-- ĐÂY LÀ MỤC TIÊU CỦA DỰ ÁN
+Borderline      : 7B params        (SecGPT-7B, Mistral-7B - thường gọi "small LLM")
+LLM             : > 7B params
+
+Tên repo "graphslm_ids" — chữ SLM yêu cầu model phải nằm trong dải 1B-4B.
+Dùng model 7B sẽ mâu thuẫn với branding và làm yếu novelty claim.
 ```
 
-### 7.2 Fallback Model Nếu SecGPT Không Available
+### 7.1 Model Chính: Qwen2.5-3B-Instruct-GGUF
 
 ```
-Fallback 1: mistralai/Mistral-7B-Instruct-v0.3-GGUF  (Q4_K_M)
-  Lý do: instruction-tuned tốt, widely available
-  Khi dùng: thêm vào system prompt "You are a cybersecurity analyst..."
+Model   : Qwen/Qwen2.5-3B-Instruct-GGUF
+Lý do   : true SLM 3B params, instruction-tuned mạnh, 32K context window,
+          multilingual (English + tiếng Việt cho phần phân tích nội bộ),
+          Apache 2.0 license, thân thiện với deployment commercial.
+Quant   : Q4_K_M (~2.0GB RAM) hoặc Q5_K_M (~2.4GB RAM, chất lượng cao hơn)
+Runtime : Ollama (development) hoặc llama.cpp (production)
+RAM     : Q4_K_M ≈ 2.0-2.5GB — phù hợp Asus Vivobook i5/16GB
+Context : 32,768 tokens — dư cho Evidence Bundle 2400 + system + output 1500
+```
 
-Fallback 2: microsoft/Phi-3.5-mini-instruct-GGUF  (Q4_K_M, 3.8B)
-  Lý do: nhẹ hơn, phù hợp hardware yếu (≤8GB RAM)
-  Khi dùng: giảm max_new_tokens xuống 800
+### 7.2 Alternative Model Pool (Theo Thứ Tự Ưu Tiên)
 
-Paper claim: "We use SecGPT-7B as the primary SLM due to its cybersecurity
-specialization. For resource-constrained deployments, the architecture is
-compatible with any GGUF-format causal LM."
+```
+Alternative 1: meta-llama/Llama-3.2-3B-Instruct-GGUF  (Q4_K_M ~2.0GB)
+  Lý do: 3B params, 128K context, Meta-tuned mạnh cho instruction following.
+  Khi dùng: tương đương Qwen2.5-3B; có thể swap không đổi prompt.
+
+Alternative 2: microsoft/Phi-3.5-mini-instruct-GGUF  (Q4_K_M ~2.3GB, 3.8B)
+  Lý do: reasoning mạnh, MIT license, được Microsoft maintain ổn định.
+  Khi dùng: giảm max_new_tokens xuống 1000 vì context default 4K.
+
+Alternative 3: Qwen/Qwen2.5-1.5B-Instruct-GGUF  (Q4_K_M ~1.0GB)
+  Lý do: ultra-light cho edge deployment (Raspberry Pi, IoT gateway).
+  Khi dùng: giảm Evidence Bundle xuống top_packets=3, max_new_tokens=800.
+
+Ablation Upper-Bound (CHỈ dùng để so sánh, không phải production model):
+  - clouditera/SecGPT-7B-GGUF
+    Mục đích: chứng minh SLM 3B đạt parity với 7B chuyên cybersec khi có
+    Evidence Bundle. Đây là argument quan trọng trong Section 12.5 Ablation.
+  - cisco/Foundation-Sec-8B (2024)
+    Mục đích: state-of-the-art cybersec LLM 8B, dùng làm trần benchmark.
+
+Paper claim: "We adopt Qwen2.5-3B-Instruct as the primary SLM. By grounding
+generation in a structured Evidence Bundle and a rule-based validator, we
+demonstrate that a domain-agnostic 3B-parameter SLM achieves XAI faithfulness
+competitive with cybersecurity-specialized 7B+ models, while running entirely
+on commodity laptop hardware (Intel i5 / 16GB RAM) without GPU."
 ```
 
 ### 7.3 Inference Configuration
 
 ```yaml
 slm:
-  backend: ollama          # hoặc llamacpp
-  model: secgpt:7b-q4_k_m
+  backend: ollama                # hoặc llamacpp
+  model: qwen2.5:3b-instruct-q4_k_m
+  fallback_models:
+    - llama3.2:3b-instruct-q4_k_m
+    - phi3.5:3.8b-mini-instruct-q4_k_m
+    - qwen2.5:1.5b-instruct-q4_k_m
   temperature: 0.15
   top_p: 0.80
   repeat_penalty: 1.10
-  context_length: 8192
+  context_length: 8192           # giới hạn nội bộ; Qwen2.5-3B hỗ trợ 32K
   max_new_tokens: 1500
-  timeout_seconds: 30      # hard timeout, trigger fallback nếu quá
-  num_threads: 4           # CPU threads cho llama.cpp
+  timeout_seconds: 30
+  num_threads: 4                 # CPU threads cho llama.cpp
+```
+
+### 7.4 Lý Do Loại Bỏ SecGPT-7B Khỏi Production Path
+
+```
+1. Tham số 7B vượt định nghĩa SLM (1B-4B). Mâu thuẫn với tên dự án.
+2. RAM tối thiểu 5-6GB Q4 — sát giới hạn 16GB khi đồng thời chạy:
+     HGT inference (~1GB)
+     Hot Graph Buffer (~2-4GB tùy max_events)
+     Process khác trên máy dev
+3. Latency cao hơn ~2-3x so với 3B model trên CPU.
+4. Cybersecurity specialization của SecGPT bị giảm tác dụng vì SLM trong
+   thiết kế này KHÔNG quyết định label — HGT đã quyết định. SLM chỉ
+   serialize evidence sang prose. Domain knowledge của 7B không tạo ra
+   advantage có ý nghĩa đo được khi đã có Evidence Bundle.
+5. SecGPT-7B vẫn hữu ích như ablation upper-bound (Section 12.5).
 ```
 
 ---
@@ -1040,22 +1091,22 @@ Compute Pearson correlation:
 Nếu corr > 0.70: automatic metrics được dùng làm proxy chính.
 ```
 
-### 12.5 Ablation R1–R5
+### 12.5 Ablation R1–R5 (component ablation, primary = Qwen2.5-3B)
 
 ```
 R1: Deterministic template (không có SLM)
   Baseline — zero hallucination nhưng evidence_coverage thấp
 
-R2: SecGPT + alert metadata only (không có packet / MITRE / paths)
+R2: Qwen2.5-3B + alert metadata only (không có packet / MITRE / paths)
   Kiểm tra tầm quan trọng của context
 
-R3: SecGPT + raw graph text (dump toàn bộ tensor/adjacency dưới dạng text)
+R3: Qwen2.5-3B + raw graph text (dump toàn bộ tensor/adjacency dạng text)
   Kiểm tra xem structured Evidence Bundle có tốt hơn raw text không
 
-R4: SecGPT + structured Evidence Bundle (không có Validator)
+R4: Qwen2.5-3B + structured Evidence Bundle (không có Validator)
   Kiểm tra contribution của Evidence Bundle
 
-R5: SecGPT + structured Evidence Bundle + Report Validator (full system)
+R5: Qwen2.5-3B + structured Evidence Bundle + Report Validator (full system)
   Kiểm tra contribution của Validator
 
 Kỳ vọng kết quả:
@@ -1064,6 +1115,29 @@ Kỳ vọng kết quả:
   hallucinated_entity: R1 ≈ R5 < R4 < R3 < R2
   readability:         R5 ≥ R4 > R3 > R2 > R1
   latency:             R1 << R2 ≤ R3 ≤ R4 ≤ R5
+```
+
+### 12.5b Cross-Model Ablation M1–M5 (model size / domain specialization)
+
+Giữ nguyên full Evidence Bundle + Validator (tức R5 setup), chỉ swap SLM:
+
+```
+M1: Qwen2.5-1.5B-Instruct          (ultra-light SLM, 1.5B)
+M2: Qwen2.5-3B-Instruct            (PRIMARY — true SLM, 3B, domain-agnostic)
+M3: Llama-3.2-3B-Instruct          (true SLM, 3B, domain-agnostic)
+M4: Phi-3.5-mini-instruct          (true SLM, 3.8B, reasoning-focused)
+M5: SecGPT-7B-GGUF                 (upper-bound, 7B, cybersecurity-specialized)
+
+Kỳ vọng kết quả (đây là contribution quan trọng cho paper):
+  grounding_rate:      M5 ≈ M4 ≈ M3 ≈ M2 > M1
+  evidence_coverage:   M5 ≈ M4 ≈ M3 ≈ M2 ≥ M1
+  hallucinated_entity: M5 ≤ M2 ≈ M3 ≤ M4 ≤ M1
+  latency p50 (CPU):   M1 ~0.8s < M2 ~1.5s ≈ M3 ~1.5s < M4 ~2.0s < M5 ~4.5s
+  RAM Q4:              M1 ~1GB < M2 ~2GB ≈ M3 ~2GB < M4 ~2.3GB < M5 ~5GB
+
+Paper insight: nếu M2 đạt grounding_rate ≥ 95% so với M5 nhưng latency thấp
+hơn 3x và RAM thấp hơn 2.5x, thì 3B SLM là lựa chọn Pareto-optimal cho XAI
+deployment thực tế.
 ```
 
 ### 12.6 Comparison With Existing XAI Methods
@@ -1088,12 +1162,18 @@ Ours (R5)           | SLM + evidence | multi-level | Yes         | Yes
 
 ## 13. Rủi Ro Và Giảm Thiểu
 
-### Rủi ro 1: SecGPT-7B không available hoặc quality thấp
+### Rủi ro 1: 3B SLM quality thấp / không follow format Markdown
 ```
 Giải pháp:
-  Luôn implement fallback Mistral-7B-Instruct trong report_generator.py
-  Test với cả hai model trong ablation — nếu kết quả tương đương, dùng Mistral
-  Paper claim: "SecGPT-7B; Mistral-7B with cybersecurity system prompt as ablation"
+  - Primary Qwen2.5-3B đã được instruction-tuned tốt cho structured output.
+    Nếu output không đúng format, fallback Tier 2 (simplified prompt) sẽ
+    tự động kích hoạt qua Validator.
+  - Test với cả Qwen2.5-3B và Llama-3.2-3B trong ablation. Nếu một model
+    có grounding_rate cao hơn rõ rệt, dùng làm primary.
+  - Phi-3.5-mini (3.8B) là cứu cánh nếu cả hai 3B model đều fail vì có
+    reasoning mạnh hơn. Tradeoff: 3.8B chậm hơn 3B khoảng 25%.
+  - Chỉ rơi xuống template Tier 3 nếu cả 4 model đều fail — xác suất rất thấp
+    với Evidence Bundle có grounding rõ.
 ```
 
 ### Rủi ro 2: HGT macro-F1 = 0.364 — thấp cho Q1
@@ -1171,8 +1251,11 @@ slow_path:
 
 slm:
   backend: ollama
-  model: secgpt:7b-q4_k_m
-  fallback_model: mistral:7b-instruct-q4_k_m
+  model: qwen2.5:3b-instruct-q4_k_m
+  fallback_models:
+    - llama3.2:3b-instruct-q4_k_m
+    - phi3.5:3.8b-mini-instruct-q4_k_m
+    - qwen2.5:1.5b-instruct-q4_k_m
   temperature: 0.15
   top_p: 0.80
   repeat_penalty: 1.10
@@ -1200,12 +1283,15 @@ to a lightweight 1D-CNN, MITRE ATT&CK semantic mapping via cosine similarity,
 and HGT-based flow classification in under 50ms (p95). When a flow is flagged as
 suspicious or malicious, an asynchronous slow path constructs a structured
 Evidence Bundle from HGT attention weights, counterfactual perturbation, and
-MITRE cosine scores, then invokes SecGPT-7B-GGUF to generate an analyst-readable
-English XAI report. A rule-based validator enforces evidence citation and entity
-consistency, enabling quantitative faithfulness evaluation. Ablation across five
-report generation configurations demonstrates that structured Evidence Bundles
-combined with the validator reduce hallucinated entity rate to X% while achieving
-grounding rate of Y%.
+MITRE cosine scores, then invokes a domain-agnostic 3B-parameter Small Language
+Model (Qwen2.5-3B-Instruct) to generate an analyst-readable English XAI report.
+A rule-based validator enforces evidence citation and entity consistency,
+enabling quantitative faithfulness evaluation. Ablation across five report
+generation configurations demonstrates that structured Evidence Bundles combined
+with the validator allow a 3B SLM to achieve grounding rate competitive with
+cybersecurity-specialized 7B+ models, reducing hallucinated entity rate to X%
+while achieving grounding rate of Y%, all running on commodity Intel i5 / 16GB
+laptop hardware without GPU acceleration.
 ```
 
 ### Related Work framing
@@ -1236,11 +1322,16 @@ is always produced within the timeout budget.
 ```
 Classifier      : HGT (không thay đổi)
 Bridge          : Evidence Bundle (evidence_id traceable)
-SLM             : SecGPT-7B-GGUF (causal LM, cybersecurity-specialized)
+SLM (primary)   : Qwen2.5-3B-Instruct-GGUF (true SLM 3B, domain-agnostic, ~2GB Q4)
+SLM (fallbacks) : Llama-3.2-3B → Phi-3.5-mini-3.8B → Qwen2.5-1.5B
+SLM (ablation)  : SecGPT-7B / Foundation-Sec-8B (upper-bound only, không production)
 Validator       : Rule-based, grounding_rate ≥ 0.60 để pass
-Fallback        : Tier 1 (full SLM) → Tier 2 (simplified SLM) → Tier 3 (template)
+Fallback        : Tier 1 (3B SLM) → Tier 2 (simplified 3B) → Tier 3 (template)
 Runtime claim   : real-time detection + asynchronous near-real-time explanation
-Paper novelty   : Evidence Bundle + dual-score importance + quantitative faithfulness
+                  toàn bộ trên Intel i5 / 16GB không cần GPU
+Paper novelty   : Evidence Bundle + dual-score importance + quantitative
+                  faithfulness + chứng minh true 3B SLM đủ cho XAI khi có
+                  evidence grounding
 ```
 
 Điểm mạnh học thuật: SLM không phải black-box security oracle. Nó là report
