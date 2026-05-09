@@ -18,7 +18,7 @@ Invoke-WebRequest -Uri "https://raw.githubusercontent.com/mitre/cti/master/enter
 ## Buoc 2: Trich xuat bang node/edge MITRE
 
 ```powershell
-python scripts/prepare_mitre_knowledge_base.py --input-json "data/mitre/enterprise-attack.json"
+graphslm-prepare-mitre --input-json "data/mitre/enterprise-attack.json"
 ```
 
 Du lieu tao ra:

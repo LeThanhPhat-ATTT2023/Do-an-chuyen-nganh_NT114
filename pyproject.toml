@@ -16,6 +16,20 @@ dependencies = [
   "pyyaml>=6.0"
 ]
 
+[project.scripts]
+graphslm-extract-payload = "graphslm_ids.offline_path.preprocessing.extract_payload_dataset:main"
+graphslm-prepare-mitre = "graphslm_ids.offline_path.preprocessing.prepare_mitre_knowledge_base:main"
+graphslm-build-teacher = "graphslm_ids.offline_path.preprocessing.build_teacher_targets:main"
+graphslm-build-mitre-emb = "graphslm_ids.offline_path.preprocessing.build_mitre_technique_embeddings:main"
+graphslm-build-graph = "graphslm_ids.offline_path.preprocessing.build_graph_artifact:main"
+graphslm-build-three-tier-graph = "graphslm_ids.offline_path.preprocessing.build_three_tier_graph_artifact:main"
+graphslm-train-student = "graphslm_ids.offline_path.training.train_student_cnn:main"
+graphslm-eval-student = "graphslm_ids.offline_path.training.evaluate_student_cnn:main"
+graphslm-export-student-onnx = "graphslm_ids.offline_path.training.export_student_onnx:main"
+graphslm-export-student-emb = "graphslm_ids.offline_path.training.export_student_embeddings:main"
+graphslm-train-hgt = "graphslm_ids.offline_path.training.train_hgt_flow_classifier:main"
+graphslm-run-runtime = "graphslm_ids.runtime.run_runtime_pipeline:main"
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 

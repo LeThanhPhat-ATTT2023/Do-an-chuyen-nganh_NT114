@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 from graphslm_ids.slow_path.evidence_bundle import (
     AlertEvidence,
     BundleStats,
@@ -161,17 +161,14 @@ class EvidenceBuilder:
         job: SlowPathJob,
         packet_evidence: list[PacketEvidence],
     ) -> None:
-        if not job.hgt_attention:
-            return
-
-        attention_map: dict[str, float] | None = None
-        if isinstance(job.hgt_attention, dict):
-            raw_packet_map = job.hgt_attention.get("packet_attention")
-            if isinstance(raw_packet_map, dict):
-                attention_map = {str(key): float(val) for key, val in raw_packet_map.items()}
-            elif all(isinstance(key, str) for key in job.hgt_attention.keys()):
-                attention_map = {str(key): float(val) for key, val in job.hgt_attention.items()}
-
+        attention_map = self._coerce_packet_attention_map(job.hgt_attention)
+        if not attention_map:
+            attention_map = self._aggregate_edge_attention_to_packets(
+                job.hgt_attention,
+                job.subgraph_snapshot,
+            )
+        if not attention_map:
+            attention_map = self._compute_gradient_packet_saliency(job)
         if not attention_map:
             return
 
@@ -182,6 +179,162 @@ class EvidenceBuilder:
             packet.importance_sources["hgt_attention_weight"] = attn
             if attn > 0.0 and packet.importance_sources.get("counterfactual_drop", 0.0) <= 0.0:
                 packet.importance_reason = "Packet received high attention weight in the HGT model"
+
+    def _coerce_packet_attention_map(self, attention: Any) -> dict[str, float]:
+        if not isinstance(attention, Mapping):
+            return {}
+
+        raw_packet_map = attention.get("packet_attention") or attention.get("packet_scores")
+        if isinstance(raw_packet_map, Mapping):
+            return {
+                str(key): val
+                for key, raw_val in raw_packet_map.items()
+                if (val := self._to_float(raw_val)) is not None
+            }
+
+        packet_map: dict[str, float] = {}
+        for key, raw_val in attention.items():
+            if key in {"packet_attention", "packet_scores"}:
+                continue
+            if self._normalize_edge_key(key) is not None:
+                continue
+            value = self._to_float(raw_val)
+            if value is not None:
+                packet_map[str(key)] = value
+        return packet_map
+
+    def _aggregate_edge_attention_to_packets(
+        self,
+        attention: Any,
+        snapshot: Any,
+    ) -> dict[str, float]:
+        if not isinstance(attention, Mapping) or snapshot is None:
+            return {}
+
+        edge_index = self._snapshot_get(snapshot, "edge_index")
+        if not isinstance(edge_index, Mapping):
+            return {}
+
+        node_ids = (
+            self._snapshot_get(snapshot, "node_ids")
+            or self._snapshot_get(snapshot, "node_id_map")
+            or self._snapshot_get(snapshot, "node_index")
+        )
+        packet_id_to_idx = self._resolve_node_id_map(node_ids, "packet")
+        if not packet_id_to_idx:
+            packet_id_to_idx = self._resolve_flat_id_map(snapshot, "packet_id_map")
+        idx_to_packet_id = {idx: packet_id for packet_id, idx in packet_id_to_idx.items()}
+        if not idx_to_packet_id:
+            return {}
+
+        packet_scores: dict[str, float] = {}
+        for raw_key, raw_attention in attention.items():
+            edge_key = self._normalize_edge_key(raw_key)
+            if edge_key is None:
+                continue
+            src_type, _, dst_type = edge_key
+            if src_type != "packet" and dst_type != "packet":
+                continue
+
+            raw_edge_index = self._edge_index_for_key(edge_index, edge_key)
+            src_indices, dst_indices = self._edge_index_to_rows(raw_edge_index)
+            attention_values = self._attention_to_values(raw_attention)
+            if not src_indices or not attention_values:
+                continue
+
+            packet_indices = src_indices if src_type == "packet" else dst_indices
+            for packet_idx, score in zip(packet_indices, attention_values):
+                packet_id = idx_to_packet_id.get(packet_idx)
+                if packet_id is None:
+                    continue
+                packet_scores[packet_id] = max(packet_scores.get(packet_id, 0.0), score)
+        return packet_scores
+
+    def _compute_gradient_packet_saliency(self, job: SlowPathJob) -> dict[str, float]:
+        if not job.subgraph_snapshot or self.counterfactual_model is None:
+            return {}
+
+        target_idx = self._resolve_target_index(job)
+        if target_idx is None:
+            return {}
+
+        try:
+            import torch
+        except ImportError:
+            return {}
+
+        snapshot = job.subgraph_snapshot
+        node_features = self._snapshot_get(snapshot, "node_features")
+        edge_index = self._snapshot_get(snapshot, "edge_index")
+        if not isinstance(node_features, Mapping) or not isinstance(edge_index, Mapping):
+            return {}
+
+        node_ids = (
+            self._snapshot_get(snapshot, "node_ids")
+            or self._snapshot_get(snapshot, "node_id_map")
+            or self._snapshot_get(snapshot, "node_index")
+        )
+        packet_id_to_idx = self._resolve_node_id_map(node_ids, "packet")
+        if not packet_id_to_idx:
+            packet_id_to_idx = self._resolve_flat_id_map(snapshot, "packet_id_map")
+        if not packet_id_to_idx:
+            return {}
+
+        flow_id_to_idx = self._resolve_node_id_map(node_ids, "flow")
+        flow_idx = int(flow_id_to_idx.get(job.flow_id, 0)) if flow_id_to_idx else 0
+
+        model = self.counterfactual_model
+        model.eval()
+        device = self._model_device(model, torch)
+
+        node_tensors: dict[str, torch.Tensor] = {}
+        for node_type, features in node_features.items():
+            tensor = torch.as_tensor(features, dtype=torch.float32, device=device)
+            node_tensors[str(node_type)] = tensor
+
+        required_nodes = {"flow", "packet", "technique", "tactic"}
+        if not required_nodes.issubset(node_tensors.keys()):
+            return {}
+
+        edge_index_dict = self._prepare_edge_index_dict(model, dict(edge_index), device)
+        if not edge_index_dict:
+            return {}
+
+        edge_weight = self._snapshot_get(snapshot, "edge_weight")
+        if edge_weight is None:
+            edge_weight = self._snapshot_get(snapshot, "edge_attr")
+        edge_weight_dict = self._prepare_edge_weight_dict(model, edge_weight, device)
+
+        packet_x = node_tensors["packet"].clone().detach().requires_grad_(True)
+        node_tensors = dict(node_tensors)
+        node_tensors["packet"] = packet_x
+
+        try:
+            try:
+                model.zero_grad(set_to_none=True)
+            except TypeError:
+                model.zero_grad()
+            logits = model(node_tensors, edge_index_dict, edge_weight_dict=edge_weight_dict)
+            if isinstance(logits, tuple):
+                logits = logits[0]
+            if flow_idx >= logits.shape[0]:
+                flow_idx = 0
+            if target_idx >= logits.shape[1]:
+                return {}
+            score = logits[flow_idx, target_idx]
+            score.backward()
+        except Exception:
+            return {}
+
+        if packet_x.grad is None:
+            return {}
+
+        saliency = packet_x.grad.detach().abs().mean(dim=-1).cpu().tolist()
+        return {
+            packet_id: float(saliency[idx])
+            for packet_id, idx in packet_id_to_idx.items()
+            if idx < len(saliency)
+        }
 
     def _build_mitre(
         self,
@@ -404,7 +557,7 @@ class EvidenceBuilder:
 
         model = self.counterfactual_model
         model.eval()
-        device = next(model.parameters()).device if hasattr(model, "parameters") else torch.device("cpu")
+        device = self._model_device(model, torch)
 
         node_tensors: dict[str, torch.Tensor] = {}
         for node_type, features in node_features.items():
@@ -551,6 +704,89 @@ class EvidenceBuilder:
             if len(parts) == 3:
                 return (parts[0], parts[1], parts[2])
         return None
+
+    def _edge_index_for_key(
+        self,
+        edge_index: Mapping[Any, Any],
+        edge_key: tuple[str, str, str],
+    ) -> Any:
+        if edge_key in edge_index:
+            return edge_index[edge_key]
+        edge_name = "__".join(edge_key)
+        if edge_name in edge_index:
+            return edge_index[edge_name]
+        edge_text = str(edge_key)
+        if edge_text in edge_index:
+            return edge_index[edge_text]
+        for raw_key, value in edge_index.items():
+            if self._normalize_edge_key(raw_key) == edge_key:
+                return value
+        return None
+
+    def _edge_index_to_rows(self, value: Any) -> tuple[list[int], list[int]]:
+        if value is None:
+            return [], []
+        if hasattr(value, "detach"):
+            value = value.detach().cpu().tolist()
+        elif hasattr(value, "tolist"):
+            value = value.tolist()
+        if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+            return [], []
+        if len(value) == 2 and all(isinstance(row, Sequence) for row in value):
+            return [int(idx) for idx in value[0]], [int(idx) for idx in value[1]]
+        if value and all(isinstance(row, Sequence) and len(row) == 2 for row in value):
+            return [int(row[0]) for row in value], [int(row[1]) for row in value]
+        return [], []
+
+    def _attention_to_values(self, value: Any) -> list[float]:
+        if value is None:
+            return []
+        if hasattr(value, "detach"):
+            tensor = value.detach()
+            if getattr(tensor, "ndim", 0) > 1:
+                tensor = tensor.mean(dim=1)
+            return [float(item) for item in tensor.cpu().reshape(-1).tolist()]
+        if hasattr(value, "tolist"):
+            value = value.tolist()
+        if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+            numeric = self._to_float(value)
+            return [] if numeric is None else [numeric]
+        values: list[float] = []
+        for item in value:
+            if isinstance(item, Sequence) and not isinstance(item, (str, bytes, bytearray)):
+                row = [self._to_float(raw) for raw in item]
+                row = [raw for raw in row if raw is not None]
+                if row:
+                    values.append(float(sum(row) / len(row)))
+                continue
+            numeric = self._to_float(item)
+            if numeric is not None:
+                values.append(numeric)
+        return values
+
+    def _to_float(self, value: Any) -> float | None:
+        if hasattr(value, "detach"):
+            value = value.detach()
+        if hasattr(value, "item"):
+            try:
+                value = value.item()
+            except Exception:
+                return None
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(numeric):
+            return None
+        return numeric
+
+    def _model_device(self, model: Any, torch_module: Any) -> Any:
+        if hasattr(model, "parameters"):
+            try:
+                return next(model.parameters()).device
+            except (StopIteration, TypeError):
+                pass
+        return torch_module.device("cpu")
 
     def _truncate_payload_preview(self, payload_hex: str, payload_ascii: str) -> tuple[str, str]:
         limit = max(int(self.config.max_payload_preview_bytes), 0)

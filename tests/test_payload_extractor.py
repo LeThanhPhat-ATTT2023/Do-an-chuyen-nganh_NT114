@@ -2,7 +2,10 @@ from pathlib import Path
 
 import numpy as np
 
-from graphslm_ids.data.pcap_payload_extractor import infer_label_from_path, truncate_and_pad_payload
+from graphslm_ids.offline_path.preprocessing.pcap_payload_extractor import (
+    infer_label_from_path,
+    truncate_and_pad_payload,
+)
 
 
 def test_truncate_and_pad_payload_short_sequence() -> None:

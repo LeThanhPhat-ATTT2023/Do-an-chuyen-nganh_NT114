@@ -105,7 +105,8 @@ class HGTLayer(nn.Module):
         x_dict: dict[str, torch.Tensor],
         edge_index_dict: dict[EdgeKey, torch.Tensor],
         edge_weight_dict: dict[EdgeKey, torch.Tensor] | None = None,
-    ) -> dict[str, torch.Tensor]:
+        return_attention: bool = False,
+    ) -> dict[str, torch.Tensor] | tuple[dict[str, torch.Tensor], dict[EdgeKey, torch.Tensor]]:
         aggregated: dict[str, torch.Tensor] = {
             node_type: torch.zeros(
                 x.shape[0],
@@ -116,6 +117,7 @@ class HGTLayer(nn.Module):
             )
             for node_type, x in x_dict.items()
         }
+        attention_dict: dict[EdgeKey, torch.Tensor] = {}
 
         for edge_type in self.edge_types:
             src_type, _, dst_type = edge_type
@@ -145,6 +147,8 @@ class HGTLayer(nn.Module):
                 scores = scores + edge_weight.clamp_min(1e-6).log().view(-1, 1)
             attn = _edge_softmax_by_dst(scores, dst_index, int(dst_x.shape[0]))
             messages = attn.unsqueeze(-1) * v
+            if return_attention:
+                attention_dict[edge_type] = attn.detach().mean(dim=1)
 
             scatter_index = dst_index[:, None, None].expand(-1, self.num_heads, self.head_dim)
             aggregated[dst_type].scatter_add_(0, scatter_index, messages)
@@ -156,6 +160,8 @@ class HGTLayer(nn.Module):
             h = self.norm_attn[node_type](x + self.dropout(attended))
             h = self.norm_ffn[node_type](h + self.dropout(self.ffn[node_type](h)))
             next_x[node_type] = h
+        if return_attention:
+            return next_x, attention_dict
         return next_x
 
 
@@ -221,7 +227,8 @@ class HeteroGraphTransformer(nn.Module):
         node_features: dict[str, torch.Tensor],
         edge_index_dict: dict[EdgeKey, torch.Tensor],
         edge_weight_dict: dict[EdgeKey, torch.Tensor] | None = None,
-    ) -> dict[str, torch.Tensor]:
+        return_attention: bool = False,
+    ) -> dict[str, torch.Tensor] | tuple[dict[str, torch.Tensor], dict[EdgeKey, torch.Tensor]]:
         x_dict = {
             "flow": self.input_projection["flow"](node_features["flow"].float()),
             "packet": self.input_projection["packet"](node_features["packet"].float()),
@@ -238,8 +245,29 @@ class HeteroGraphTransformer(nn.Module):
             tactic_index = torch.zeros(0, dtype=torch.long, device=node_features["flow"].device)
         x_dict["tactic"] = self.tactic_embedding(tactic_index.clamp_max(max(self.num_tactics - 1, 0)))
 
+        layer_attention: list[dict[EdgeKey, torch.Tensor]] = []
         for layer in self.layers:
-            x_dict = layer(x_dict, edge_index_dict, edge_weight_dict=edge_weight_dict)
+            if return_attention:
+                x_dict, attention_dict = layer(
+                    x_dict,
+                    edge_index_dict,
+                    edge_weight_dict=edge_weight_dict,
+                    return_attention=True,
+                )
+                layer_attention.append(attention_dict)
+            else:
+                x_dict = layer(x_dict, edge_index_dict, edge_weight_dict=edge_weight_dict)
+        if return_attention:
+            merged_attention: dict[EdgeKey, torch.Tensor] = {}
+            for edge_type in self.edge_types:
+                tensors = [
+                    attention_dict[edge_type]
+                    for attention_dict in layer_attention
+                    if edge_type in attention_dict
+                ]
+                if tensors:
+                    merged_attention[edge_type] = torch.stack(tensors, dim=0).mean(dim=0)
+            return x_dict, merged_attention
         return x_dict
 
     def forward(
@@ -247,6 +275,15 @@ class HeteroGraphTransformer(nn.Module):
         node_features: dict[str, torch.Tensor],
         edge_index_dict: dict[EdgeKey, torch.Tensor],
         edge_weight_dict: dict[EdgeKey, torch.Tensor] | None = None,
-    ) -> torch.Tensor:
+        return_attention: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[EdgeKey, torch.Tensor]]:
+        if return_attention:
+            x_dict, attention_dict = self.encode(
+                node_features,
+                edge_index_dict,
+                edge_weight_dict=edge_weight_dict,
+                return_attention=True,
+            )
+            return self.classifier(x_dict["flow"]), attention_dict
         x_dict = self.encode(node_features, edge_index_dict, edge_weight_dict=edge_weight_dict)
         return self.classifier(x_dict["flow"])

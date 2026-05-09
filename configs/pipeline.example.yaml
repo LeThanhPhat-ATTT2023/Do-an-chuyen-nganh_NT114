@@ -21,9 +21,25 @@ teacher:
 mitre:
   techniques_csv: data/mitre/mitre_techniques.csv
   embedding_path: data/mitre/mitre_techniques_embeddings.npy
+  technique_tactic_csv: data/mitre/mitre_technique_tactic_edges.csv
   similarity_threshold: 0.82
   packet_top_k: 5
   flow_top_k: 5
+
+fast_path:
+  student_onnx: outputs/student_cnn/student_cnn.onnx
+  mitre_embeddings: data/mitre/mitre_techniques_embeddings.npy
+  techniques_csv: data/mitre/mitre_techniques.csv
+  technique_tactic_csv: data/mitre/mitre_technique_tactic_edges.csv
+  mitre_topk: 5
+  mitre_threshold: 0.82
+  payload_length: 256
+
+hot_graph:
+  ttl_seconds: 60
+  max_events: 100000
+  max_packets_per_flow: 64
+  max_techniques_per_node: 5
 
 hgt:
   graph_npz: data/processed/graph_artifact_3tier_t082_k5.npz
@@ -46,3 +62,54 @@ hgt:
   device: cpu
   monitor: val_macro_f1
   output_dir: outputs/hgt_flow_classifier_t082_k5_l3_d01
+
+hgt_runtime:
+  checkpoint: outputs/hgt_flow_classifier_t082_k5_l3_d01/hgt_flow_best.pt
+  graph_meta_json: data/processed/graph_artifact_3tier_t082_k5.meta.json
+  device: cpu
+  num_layers: 3
+  packet_feature: semantic
+  add_reverse_edges: true
+  standardize_flow_features: true
+  use_semantic_edge_weights: true
+
+policy:
+  alert_threshold: 0.70
+  alert_labels:
+    - suspicious
+    - malicious
+
+slow_path:
+  enabled: true
+  queue_timeout: 1.0
+  queue_max_size: 1000
+  max_cf_packets: 10
+  top_packets: 5
+  top_techniques: 5
+  top_paths: 5
+  max_payload_preview_bytes: 64
+  cold_store: data/runtime/events.jsonl
+
+cold_store:
+  path: data/runtime/events.jsonl
+
+slm:
+  backend: ollama
+  model: qwen2.5:3b-instruct-q4_k_m
+  fallback_models:
+    - llama3.2:3b-instruct-q4_k_m
+    - phi3.5:3.8b-mini-instruct-q4_k_m
+    - qwen2.5:1.5b-instruct-q4_k_m
+  temperature: 0.15
+  top_p: 0.80
+  repeat_penalty: 1.10
+  context_length: 8192
+  max_new_tokens: 1500
+  tier2_max_new_tokens: 800
+  timeout_seconds: 30
+
+validator:
+  grounding_threshold: 0.60
+  max_hallucinated_entities: 2
+  max_unsupported_claims: 0
+  require_mitre_caution: true

@@ -5,7 +5,11 @@ from graphslm_ids.slow_path.evidence_builder import EvidenceBuilder, EvidenceBui
 from graphslm_ids.slow_path.evidence_bundle import EvidenceBundle
 from graphslm_ids.slow_path.evidence_ranker import EvidenceRanker, RankerConfig
 from graphslm_ids.slow_path.hot_buffer_adapter import HotBufferAdapter
-from graphslm_ids.slow_path.report_generator import ReportGenerator, ReportGeneratorConfig
+from graphslm_ids.slow_path.report_generator import (
+    ReportGenerationError,
+    ReportGenerator,
+    ReportGeneratorConfig,
+)
 from graphslm_ids.slow_path.report_validator import ReportValidator, ValidatorConfig
 from graphslm_ids.slow_path.slm_client import OllamaClient
 from graphslm_ids.slow_path.slow_path_worker import SlowPathConfig, SlowPathResult, SlowPathWorker
@@ -20,6 +24,7 @@ __all__ = [
     "RankerConfig",
     "HotBufferAdapter",
     "ReportGenerator",
+    "ReportGenerationError",
     "ReportGeneratorConfig",
     "ReportValidator",
     "ValidatorConfig",

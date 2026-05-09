@@ -38,19 +38,33 @@ class EvidenceRanker:
         if top_techniques > 0:
             bundle.mitre_evidence = bundle.mitre_evidence[:top_techniques]
 
+        surviving_packet_ids = {item.packet_id for item in bundle.packet_evidence}
+        surviving_technique_ids = {item.technique_id for item in bundle.mitre_evidence}
+        surviving_tech_evidence_ids = {item.evidence_id for item in bundle.mitre_evidence}
+        for packet in bundle.packet_evidence:
+            packet.linked_techniques = [
+                eid for eid in packet.linked_techniques if eid in surviving_tech_evidence_ids
+            ]
+
         bundle.graph_paths.sort(key=lambda item: item.path_score, reverse=True)
+        bundle.graph_paths = [
+            path
+            for path in bundle.graph_paths
+            if _path_refs_surviving_evidence(path, surviving_packet_ids, surviving_technique_ids)
+        ]
         if top_paths > 0:
             bundle.graph_paths = bundle.graph_paths[:top_paths]
 
-        surviving_tech_ids = {item.evidence_id for item in bundle.mitre_evidence}
-        for packet in bundle.packet_evidence:
-            packet.linked_techniques = [
-                eid for eid in packet.linked_techniques if eid in surviving_tech_ids
-            ]
+        bundle.counterfactual_evidence = [
+            item
+            for item in bundle.counterfactual_evidence
+            if item.masked_element_id in surviving_packet_ids
+        ]
 
         bundle.bundle_stats.num_packets_in_evidence = len(bundle.packet_evidence)
         bundle.bundle_stats.num_techniques_in_evidence = len(bundle.mitre_evidence)
         bundle.bundle_stats.num_paths_in_evidence = len(bundle.graph_paths)
+        bundle.bundle_stats.total_tokens_estimate = _estimate_tokens(bundle)
         return bundle
 
     def truncate_to_mini(self, bundle: EvidenceBundle) -> EvidenceBundle:
@@ -62,6 +76,7 @@ class EvidenceRanker:
         mini.bundle_stats.num_packets_in_evidence = len(mini.packet_evidence)
         mini.bundle_stats.num_techniques_in_evidence = len(mini.mitre_evidence)
         mini.bundle_stats.num_paths_in_evidence = len(mini.graph_paths)
+        mini.bundle_stats.total_tokens_estimate = _estimate_tokens(mini)
         return mini
 
     def _score_packets(self, bundle: EvidenceBundle) -> None:
@@ -133,3 +148,25 @@ def _min_max_norm(values: Iterable[float]) -> list[float]:
     if max_val - min_val <= 1e-9:
         return [0.0 for _ in values]
     return [(val - min_val) / (max_val - min_val) for val in values]
+
+
+def _path_refs_surviving_evidence(
+    path: object,
+    packet_ids: set[str],
+    technique_ids: set[str],
+) -> bool:
+    path_nodes = getattr(path, "path_nodes", [])
+    seen_packet = False
+    seen_technique = False
+    for node in path_nodes:
+        node_id = node.get("id") if isinstance(node, dict) else None
+        node_type = node.get("type") if isinstance(node, dict) else None
+        if node_type == "packet":
+            seen_packet = node_id in packet_ids
+        elif node_type == "technique":
+            seen_technique = node_id in technique_ids
+    return seen_packet and seen_technique
+
+
+def _estimate_tokens(bundle: EvidenceBundle) -> int:
+    return max(int(len(bundle.to_json(indent=2)) / 4), 1)

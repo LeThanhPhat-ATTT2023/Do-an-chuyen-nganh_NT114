@@ -1,19 +1,21 @@
 from __future__ import annotations
 
+import queue as queue_module
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping
 
 from graphslm_ids.slow_path.context_hydrator import ContextHydrator
 from graphslm_ids.slow_path.evidence_builder import EvidenceBuilder, EvidenceBuilderConfig
 from graphslm_ids.slow_path.evidence_ranker import EvidenceRanker, RankerConfig
 from graphslm_ids.slow_path.fallback_template import render_minimal, render_template
-from graphslm_ids.slow_path.report_generator import ReportGenerator
+from graphslm_ids.slow_path.report_generator import ReportGenerationError, ReportGenerator
 from graphslm_ids.slow_path.report_validator import ReportValidator, ValidatorConfig
-from graphslm_ids.slow_path.types import GraphContext, SlowPathJob
+from graphslm_ids.slow_path.types import SlowPathJob
 
 
 @dataclass
 class SlowPathConfig:
+    queue_timeout: float = 1.0
     max_cf_packets: int = 10
     top_packets: int = 5
     top_techniques: int = 5
@@ -40,6 +42,8 @@ class SlowPathWorker:
         report_generator: ReportGenerator | None = None,
         validator: ReportValidator | None = None,
         cold_store: Any | None = None,
+        counterfactual_model: Any | None = None,
+        label_to_index: Mapping[str, int] | None = None,
     ) -> None:
         self.config = config or SlowPathConfig()
         self.context_hydrator = context_hydrator or ContextHydrator()
@@ -47,7 +51,9 @@ class SlowPathWorker:
             EvidenceBuilderConfig(
                 alert_threshold=self.config.alert_threshold,
                 max_payload_preview_bytes=self.config.max_payload_preview_bytes,
-            )
+            ),
+            counterfactual_model=counterfactual_model,
+            label_to_index=label_to_index,
         )
         self.evidence_ranker = evidence_ranker or EvidenceRanker(RankerConfig())
         self.report_generator = report_generator or ReportGenerator()
@@ -75,19 +81,27 @@ class SlowPathWorker:
                 top_paths=self.config.top_paths,
             )
 
-            tier1_report = self.report_generator.generate(bundle, tier=1)
-            tier1_result = self.validator.validate(tier1_report, bundle)
+            tier1_result = None
+            try:
+                tier1_report = self.report_generator.generate(bundle, tier=1)
+                tier1_result = self.validator.validate(tier1_report, bundle)
+            except (ReportGenerationError, TimeoutError):
+                tier1_report = None
 
-            if tier1_result.overall_pass:
+            if tier1_result is not None and tier1_result.overall_pass:
                 final_report = tier1_report
                 final_validation = tier1_result
                 final_tier = 1
             else:
                 mini_bundle = self.evidence_ranker.truncate_to_mini(bundle)
-                tier2_report = self.report_generator.generate(mini_bundle, tier=2)
-                tier2_result = self.validator.validate(tier2_report, bundle)
+                tier2_result = None
+                try:
+                    tier2_report = self.report_generator.generate(mini_bundle, tier=2)
+                    tier2_result = self.validator.validate(tier2_report, bundle)
+                except (ReportGenerationError, TimeoutError):
+                    tier2_report = None
 
-                if tier2_result.overall_pass:
+                if tier2_result is not None and tier2_result.overall_pass:
                     final_report = tier2_report
                     final_validation = tier2_result
                     final_tier = 2
@@ -103,6 +117,40 @@ class SlowPathWorker:
             report = render_minimal(job)
             self._persist(job, None, report, None, 3, store)
             return SlowPathResult(report, None, None, 3)
+
+    def run_queue(
+        self,
+        slow_path_queue: Any,
+        hot_buffer: Any | None = None,
+        cold_store: Any | None = None,
+        stop_event: Any | None = None,
+        max_jobs: int | None = None,
+    ) -> list[SlowPathResult]:
+        results: list[SlowPathResult] = []
+        processed = 0
+
+        while max_jobs is None or processed < max_jobs:
+            if stop_event is not None and stop_event.is_set():
+                break
+
+            try:
+                job = slow_path_queue.get(timeout=self.config.queue_timeout)
+            except queue_module.Empty:
+                if max_jobs is not None:
+                    break
+                continue
+
+            try:
+                if job is None:
+                    break
+                result = self.process_job(job, hot_buffer=hot_buffer, cold_store=cold_store)
+                results.append(result)
+                processed += 1
+            finally:
+                if hasattr(slow_path_queue, "task_done"):
+                    slow_path_queue.task_done()
+
+        return results
 
     def _persist(
         self,

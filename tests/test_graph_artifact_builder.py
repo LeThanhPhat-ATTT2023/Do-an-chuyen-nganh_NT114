@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 
-from graphslm_ids.data.graph_artifact_builder import build_graph_artifact
+from graphslm_ids.offline_path.preprocessing.graph_artifact_builder import build_graph_artifact
 
 
 def test_build_graph_artifact_shapes() -> None:
