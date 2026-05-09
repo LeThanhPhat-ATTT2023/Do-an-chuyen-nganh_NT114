@@ -15,7 +15,7 @@ PromptCallable = Callable[[str, str], str]
 class ReportGeneratorConfig:
     backend: str | None = "ollama"
     endpoint: str = "http://localhost:11434"
-    model_name: str | None = "mistral:7b-instruct"
+    model_name: str | None = "qwen2.5:3b-instruct-q4_k_m"
     temperature: float = 0.15
     top_p: float = 0.80
     max_new_tokens: int = 1500
