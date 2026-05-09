@@ -1,1 +1,1 @@
-"""Data processing utilities."""
+"""Compatibility namespace for offline data processing utilities."""

@@ -22,6 +22,8 @@ class OllamaClient:
         user_prompt: str,
         temperature: float,
         top_p: float,
+        repeat_penalty: float,
+        context_length: int,
         max_new_tokens: int,
     ) -> str:
         payload = {
@@ -32,6 +34,8 @@ class OllamaClient:
             "options": {
                 "temperature": temperature,
                 "top_p": top_p,
+                "repeat_penalty": repeat_penalty,
+                "num_ctx": context_length,
                 "num_predict": max_new_tokens,
             },
         }

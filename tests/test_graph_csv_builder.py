@@ -1,7 +1,7 @@
 import pandas as pd
 import pytest
 
-from graphslm_ids.data.graph_csv_builder import build_graph_csv_tables
+from graphslm_ids.offline_path.preprocessing.graph_csv_builder import build_graph_csv_tables
 
 
 def test_graph_csv_builder_splits_flow_by_packet_cap() -> None:

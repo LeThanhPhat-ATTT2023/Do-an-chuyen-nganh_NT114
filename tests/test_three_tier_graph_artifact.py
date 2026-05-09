@@ -1,24 +1,10 @@
-import importlib.util
-from pathlib import Path
-
 import numpy as np
 import pandas as pd
 
-
-def _load_three_tier_module():
-    project_root = Path(__file__).resolve().parents[1]
-    script_path = project_root / "scripts" / "build_three_tier_graph_artifact.py"
-    spec = importlib.util.spec_from_file_location("build_three_tier_graph_artifact", script_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError("Unable to load build_three_tier_graph_artifact module")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+from graphslm_ids.offline_path.preprocessing import build_three_tier_graph_artifact as module
 
 
 def test_select_top_k_above_threshold() -> None:
-    module = _load_three_tier_module()
-
     similarity = np.array(
         [
             [0.91, 0.88, 0.10],
@@ -35,8 +21,6 @@ def test_select_top_k_above_threshold() -> None:
 
 
 def test_build_technique_tactic_arrays() -> None:
-    module = _load_three_tier_module()
-
     techniques_df = pd.DataFrame(
         [
             {"technique_id": "T1001", "name": "Technique A"},

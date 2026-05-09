@@ -92,7 +92,8 @@ def render_template(bundle: EvidenceBundle, template_tag: str = "TEMPLATE FALLBA
     lines.append("## 5. Confidence and Limitations")
     lines.append(f"HGT confidence: {alert.confidence:.2f}. [E_ALERT]")
     for limitation in bundle.limitations:
-        lines.append(f"- {limitation}")
+        citation = "" if "[E_" in limitation else " [E_ALERT]"
+        lines.append(f"- {limitation}{citation}")
     lines.append("")
 
     lines.append("## 6. Recommended Analyst Actions")

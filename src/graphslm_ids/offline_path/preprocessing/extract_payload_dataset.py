@@ -8,13 +8,13 @@ import sys
 
 import numpy as np
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[4]
 SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from graphslm_ids.data.pcap_payload_extractor import build_payload_dataset
-from graphslm_ids.data.graph_csv_builder import build_graph_csv_tables
+from graphslm_ids.offline_path.preprocessing.pcap_payload_extractor import build_payload_dataset
+from graphslm_ids.offline_path.preprocessing.graph_csv_builder import build_graph_csv_tables
 from graphslm_ids.utils.io import ensure_dir, write_json
 
 

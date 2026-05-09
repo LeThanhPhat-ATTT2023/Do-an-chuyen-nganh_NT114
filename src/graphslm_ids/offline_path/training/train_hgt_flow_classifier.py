@@ -13,12 +13,12 @@ import torch
 import torch.nn.functional as F
 import yaml
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[4]
 SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from graphslm_ids.data.hetero_graph_artifact import load_three_tier_graph_artifact
+from graphslm_ids.offline_path.training.hetero_graph_artifact import load_three_tier_graph_artifact
 from graphslm_ids.models.hgt import HeteroGraphTransformer
 from graphslm_ids.utils.io import ensure_dir, write_json
 

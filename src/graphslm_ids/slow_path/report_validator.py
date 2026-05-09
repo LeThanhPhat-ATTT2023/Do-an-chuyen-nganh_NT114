@@ -20,6 +20,7 @@ class ValidationResult:
 class ValidatorConfig:
     grounding_threshold: float = 0.60
     max_hallucinated_entities: int = 2
+    max_unsupported_claims: int = 0
     require_mitre_caution: bool = True
 
 
@@ -40,16 +41,20 @@ class ReportValidator:
             grounding_rate = len(cited_claims) / len(key_claims)
 
         hallucinated_entity_count = _count_hallucinated_entities(report, bundle)
-        mitre_caution_present = _has_mitre_caution(report)
+        mitre_caution_required = self.config.require_mitre_caution and _requires_mitre_caution(bundle)
+        mitre_caution_present = True
+        if mitre_caution_required:
+            mitre_caution_present = _has_mitre_caution(report)
         unsupported_claim_count = _count_unsupported_claims(sentences, evidence_ids)
         safety_pass = _check_safety(report)
 
         overall_pass = (
             grounding_rate >= self.config.grounding_threshold
             and hallucinated_entity_count <= self.config.max_hallucinated_entities
+            and unsupported_claim_count <= self.config.max_unsupported_claims
             and safety_pass
         )
-        if self.config.require_mitre_caution:
+        if mitre_caution_required:
             overall_pass = overall_pass and mitre_caution_present
 
         return ValidationResult(
@@ -63,8 +68,10 @@ class ReportValidator:
 
 
 def _split_sentences(text: str) -> list[str]:
-    parts = re.split(r"(?<=[.!?])\s+", text.strip())
-    return [part.strip() for part in parts if part.strip()]
+    evidence_ref = r"(?:E_[A-Z]+_\d{3}|E_ALERT|E_FLOW_\d{3})"
+    protected = re.sub(rf"([.!?])\s+(\[{evidence_ref}\])", r"\1@@CITE@@\2", text.strip())
+    parts = re.split(r"(?:(?<=[.!?])|(?<=\]))\s+", protected)
+    return [part.replace("@@CITE@@", " ").strip() for part in parts if part.strip()]
 
 
 def _is_key_claim(sentence: str) -> bool:
@@ -121,6 +128,7 @@ def _collect_valid_entities(bundle: EvidenceBundle) -> set[str]:
     for tech in bundle.mitre_evidence:
         entities.add(tech.technique_id)
         entities.add(tech.tactic_id)
+        entities.add(tech.tactic)
     return entities
 
 
@@ -132,9 +140,19 @@ def _count_hallucinated_entities(report: str, bundle: EvidenceBundle) -> int:
     extracted.update(re.findall(r"pkt_\w+", report))
     extracted.update(re.findall(r"flow_\w+", report))
     extracted.update(re.findall(r":(\d{2,5})\b", report))
+    extracted.update(re.findall(r"\bport\s+(\d{2,5})\b", report, flags=re.IGNORECASE))
 
     hallucinated = [entity for entity in extracted if entity not in valid_entities]
     return len(hallucinated)
+
+
+def _requires_mitre_caution(bundle: EvidenceBundle) -> bool:
+    return any(
+        "embedding" in tech.mapping_type.lower()
+        or "cosine" in tech.mapping_type.lower()
+        or "semantic" in tech.mapping_caution.lower()
+        for tech in bundle.mitre_evidence
+    )
 
 
 def _has_mitre_caution(report: str) -> bool:
@@ -158,7 +176,12 @@ def _count_unsupported_claims(sentences: list[str], evidence_ids: set[str]) -> i
     )
     count = 0
     for sentence in sentences:
-        if not any(pattern in sentence.lower() for pattern in patterns):
+        lower_sentence = sentence.lower()
+        has_unsupported_pattern = any(pattern in lower_sentence for pattern in patterns)
+        has_unsupported_pattern = has_unsupported_pattern or bool(
+            re.search(r"\bis (?:a|an) [a-z0-9 _-]+ attack\b", lower_sentence)
+        )
+        if not has_unsupported_pattern:
             continue
         if not _has_valid_citation(sentence, evidence_ids):
             count += 1

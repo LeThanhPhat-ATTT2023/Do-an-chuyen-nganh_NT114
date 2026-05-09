@@ -4,11 +4,14 @@ from dataclasses import dataclass
 from typing import Callable
 
 from graphslm_ids.slow_path.evidence_bundle import EvidenceBundle
-from graphslm_ids.slow_path.fallback_template import render_template
 from graphslm_ids.slow_path.slm_client import OllamaClient
 
 
 PromptCallable = Callable[[str, str], str]
+
+
+class ReportGenerationError(RuntimeError):
+    """Raised when an SLM report cannot be generated for a fallback tier."""
 
 
 @dataclass
@@ -18,7 +21,10 @@ class ReportGeneratorConfig:
     model_name: str | None = "qwen2.5:3b-instruct-q4_k_m"
     temperature: float = 0.15
     top_p: float = 0.80
+    repeat_penalty: float = 1.10
+    context_length: int = 8192
     max_new_tokens: int = 1500
+    tier2_max_new_tokens: int = 800
     timeout_seconds: int = 30
 
 
@@ -56,12 +62,18 @@ class ReportGenerator:
                     user_prompt=user_prompt,
                     temperature=self.config.temperature,
                     top_p=self.config.top_p,
-                    max_new_tokens=self.config.max_new_tokens,
+                    repeat_penalty=self.config.repeat_penalty,
+                    context_length=self.config.context_length,
+                    max_new_tokens=(
+                        min(self.config.max_new_tokens, self.config.tier2_max_new_tokens)
+                        if tier >= 2
+                        else self.config.max_new_tokens
+                    ),
                 )
-            except RuntimeError:
-                return render_template(bundle, template_tag="TEMPLATE FALLBACK")
+            except RuntimeError as exc:
+                raise ReportGenerationError(str(exc)) from exc
 
-        return render_template(bundle, template_tag="TEMPLATE FALLBACK")
+        raise ReportGenerationError("No SLM backend is configured.")
 
 
 def build_system_prompt() -> str:

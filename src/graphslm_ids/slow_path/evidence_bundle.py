@@ -20,7 +20,7 @@ class AlertEvidence:
     flow_id: str
     predicted_label: str
     confidence: float
-    top_classes: list[dict[str, float]]
+    top_classes: list[dict[str, Any]]
     alert_threshold: float
     trigger_reason: str
 

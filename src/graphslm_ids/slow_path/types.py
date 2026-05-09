@@ -13,8 +13,9 @@ class SlowPathJob:
     subgraph_snapshot: Any | None = None
     hgt_attention: Any | None = None
     timestamp: float | None = None
-    top_classes: list[dict[str, float]] | None = None
+    top_classes: list[dict[str, Any]] | None = None
     alert_threshold: float | None = None
+    predicted_label_idx: int | None = None
 
 
 @dataclass
