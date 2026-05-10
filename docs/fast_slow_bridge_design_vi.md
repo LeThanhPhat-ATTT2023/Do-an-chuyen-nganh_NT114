@@ -998,7 +998,7 @@ Tổng ~5 tuần solo.
 ## 12. Tham Chiếu
 
 - [slm_slow_path_xai_design_vi.md](slm_slow_path_xai_design_vi.md) — thiết kế Slow Path
-- [streaming_hgt_runtime_strategy_vi.md](streaming_hgt_runtime_strategy_vi.md) — chiến lược Hot Buffer / K-hop
+- [streaming_hgt_runtime_v3_vi.md](streaming_hgt_runtime_v3_vi.md) — runtime architecture (NeutronRT incremental RTEC + RelGT centroids)
 - [system_execution_flows.md](system_execution_flows.md) — sơ đồ training & runtime tổng
 - [hot_buffer_adapter.py](../src/graphslm_ids/slow_path/hot_buffer_adapter.py) — alias attribute mà buffer phải lộ
 - [hgt.py](../src/graphslm_ids/models/hgt.py) — chữ ký `forward(return_attention=True)`
