@@ -37,4 +37,5 @@ train:
   monitor: val_macro_f1
   log_every: 1
   amp: true
+  activation_checkpointing: true
 

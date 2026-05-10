@@ -4,6 +4,7 @@ import math
 
 import torch
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 
 EdgeKey = tuple[str, str, str]
@@ -179,6 +180,7 @@ class HeteroGraphTransformer(nn.Module):
         num_heads: int = 4,
         dropout: float = 0.2,
         ffn_multiplier: int = 2,
+        activation_checkpointing: bool = False,
     ) -> None:
         super().__init__()
         node_types = ["flow", "packet", "technique", "tactic"]
@@ -186,6 +188,7 @@ class HeteroGraphTransformer(nn.Module):
         self.edge_types = edge_types
         self.hidden_dim = hidden_dim
         self.num_tactics = num_tactics
+        self.activation_checkpointing = activation_checkpointing
 
         self.input_projection = nn.ModuleDict(
             {
@@ -255,6 +258,26 @@ class HeteroGraphTransformer(nn.Module):
                     return_attention=True,
                 )
                 layer_attention.append(attention_dict)
+            elif self.activation_checkpointing and self.training:
+                x_tuple = tuple(x_dict[node_type] for node_type in self.node_types)
+
+                def checkpointed_layer(*layer_inputs: torch.Tensor, layer: HGTLayer = layer) -> tuple[torch.Tensor, ...]:
+                    layer_x_dict = {
+                        node_type: tensor
+                        for node_type, tensor in zip(self.node_types, layer_inputs, strict=True)
+                    }
+                    next_x_dict = layer(
+                        layer_x_dict,
+                        edge_index_dict,
+                        edge_weight_dict=edge_weight_dict,
+                    )
+                    return tuple(next_x_dict[node_type] for node_type in self.node_types)
+
+                next_tuple = checkpoint(checkpointed_layer, *x_tuple, use_reentrant=False)
+                x_dict = {
+                    node_type: tensor
+                    for node_type, tensor in zip(self.node_types, next_tuple, strict=True)
+                }
             else:
                 x_dict = layer(x_dict, edge_index_dict, edge_weight_dict=edge_weight_dict)
         if return_attention:
