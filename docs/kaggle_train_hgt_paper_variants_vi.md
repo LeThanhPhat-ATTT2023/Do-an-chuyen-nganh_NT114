@@ -115,3 +115,30 @@ log .txt/.log
 ## Nếu Kaggle Bị Ngắt Giữa Chừng
 
 Notebook có logic skip run đã hoàn thành nếu `training_summary.json` tồn tại. Vì vậy khi chạy lại, các model train xong sẽ không bị train lại.
+
+## Nếu GPU Bị Hết VRAM
+
+Một số cấu hình lớn như `pyhgt_ogbmag_l4_h512_h8` có thể vượt 15GB VRAM của T4. Lý do là Kaggle `GPU T4 x2` có hai GPU 15GB riêng biệt, không cộng thành một GPU 30GB cho full-batch HGT. Trainer hiện tại dùng một device tại một thời điểm.
+
+Để vẫn giữ đúng cấu hình theo bài báo, config OGB-MAG gốc `512/4/8` được bật:
+
+```yaml
+train:
+  amp: true
+```
+
+AMP/mixed precision giúp giảm VRAM nhưng không đổi kiến trúc model.
+
+Notebook vẫn có logic:
+
+```text
+train bằng cuda -> nếu CUDA out of memory -> chạy lại config đó bằng cpu
+```
+
+Log fallback CPU sẽ có hậu tố:
+
+```text
+outputs/hgt_kaggle_logs/<run_name>_cpu_fallback.log
+```
+
+Trong `training_summary.json`, trường `config.train.device` sẽ ghi `cpu` nếu run đó phải fallback.

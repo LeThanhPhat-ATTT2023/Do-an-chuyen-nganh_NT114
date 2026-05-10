@@ -36,4 +36,5 @@ train:
   device: cuda
   monitor: val_macro_f1
   log_every: 1
+  amp: true
 

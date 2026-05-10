@@ -53,6 +53,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "device": "cpu",
         "monitor": "val_macro_f1",
         "log_every": 1,
+        "amp": False,
     },
 }
 
@@ -73,6 +74,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--weight-decay", type=float, default=None)
     parser.add_argument("--device", default=None)
+    parser.add_argument("--amp", action="store_true", help="Enable CUDA mixed precision training/evaluation.")
     parser.add_argument("--seed", type=int, default=None)
     return parser.parse_args()
 
@@ -122,6 +124,8 @@ def apply_cli_overrides(config: dict[str, Any], args: argparse.Namespace) -> dic
         config["train"]["weight_decay"] = args.weight_decay
     if args.device is not None:
         config["train"]["device"] = args.device
+    if args.amp:
+        config["train"]["amp"] = True
     if args.seed is not None:
         config["train"]["seed"] = args.seed
     return config
@@ -389,18 +393,24 @@ def main() -> None:
     history: list[dict[str, Any]] = []
     monitor = str(config["train"]["monitor"])
     log_every = max(1, int(config["train"]["log_every"]))
+    use_amp = bool(config["train"].get("amp", False)) and device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     for epoch in range(1, int(config["train"]["epochs"]) + 1):
         model.train()
         optimizer.zero_grad(set_to_none=True)
-        logits = model(node_features, edge_index, edge_weight_dict=edge_weight)
-        loss = F.cross_entropy(logits[train_idx], labels[train_idx], weight=weight)
-        loss.backward()
-        optimizer.step()
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            logits = model(node_features, edge_index, edge_weight_dict=edge_weight)
+            loss = F.cross_entropy(logits[train_idx], labels[train_idx], weight=weight)
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
         model.eval()
         with torch.no_grad():
-            logits_eval = model(node_features, edge_index, edge_weight_dict=edge_weight)
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                logits_eval = model(node_features, edge_index, edge_weight_dict=edge_weight)
+            logits_eval = logits_eval.float()
             train_metrics = compute_metrics(logits_eval, labels, train_idx, label_names)
             val_metrics = compute_metrics(logits_eval, labels, val_idx, label_names)
             test_metrics = compute_metrics(logits_eval, labels, test_idx, label_names)
