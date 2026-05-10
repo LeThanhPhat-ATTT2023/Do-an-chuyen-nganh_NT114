@@ -1,0 +1,38 @@
+﻿# Source: Stanford CS224W locomotion reconstruction with HGT.
+# Inspired config: physical/spatio-temporal graph uses fewer relation channels,
+# so 2 layers and 2 heads are enough and reduce parameter redundancy.
+experiment:
+  source_name: "Stanford CS224W Locomotion HGT-style"
+  citation_hint: "Locomotion Reconstruction with the Heterogeneous Graph Transformer, Stanford CS224W"
+  rationale: "Use 2 layers, hidden_dim 128, and 2 heads to test a compact low-head HGT for simpler relation structure."
+
+data:
+  graph_npz: data/processed/graph_artifact_3tier_t082_k5.npz
+  graph_meta_json: data/processed/graph_artifact_3tier_t082_k5.meta.json
+  packet_feature: semantic
+  add_reverse_edges: true
+  standardize_flow_features: true
+  use_semantic_edge_weights: true
+
+model:
+  hidden_dim: 128
+  num_layers: 2
+  num_heads: 2
+  dropout: 0.1
+  ffn_multiplier: 2
+
+train:
+  output_dir: outputs/hgt_paper_variants/cs224w_locomotion_l2_h128_h2
+  epochs: 150
+  batch_mode: full
+  lr: 0.001
+  weight_decay: 0.00005
+  val_ratio: 0.1
+  test_ratio: 0.1
+  patience: 30
+  class_weight: balanced
+  seed: 42
+  device: cuda
+  monitor: val_macro_f1
+  log_every: 1
+

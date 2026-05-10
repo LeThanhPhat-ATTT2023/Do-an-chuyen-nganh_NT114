@@ -567,7 +567,7 @@ Lý do   : true SLM 3B params, instruction-tuned mạnh, 32K context window,
           Apache 2.0 license, thân thiện với deployment commercial.
 Quant   : Q4_K_M (~2.0GB RAM) hoặc Q5_K_M (~2.4GB RAM, chất lượng cao hơn)
 Runtime : Ollama (development) hoặc llama.cpp (production)
-RAM     : Q4_K_M ≈ 2.0-2.5GB — phù hợp Asus Vivobook i5/16GB
+RAM     : Q4_K_M ≈ 2.0-2.5GB
 Context : 32,768 tokens — dư cho Evidence Bundle 2400 + system + output 1500
 ```
 
