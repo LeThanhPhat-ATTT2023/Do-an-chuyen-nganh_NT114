@@ -54,6 +54,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "monitor": "val_macro_f1",
         "log_every": 1,
         "amp": False,
+        "activation_checkpointing": False,
     },
 }
 
@@ -75,6 +76,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--amp", action="store_true", help="Enable CUDA mixed precision training/evaluation.")
+    parser.add_argument(
+        "--activation-checkpointing",
+        action="store_true",
+        help="Trade extra compute for lower activation memory during HGT training.",
+    )
     parser.add_argument("--seed", type=int, default=None)
     return parser.parse_args()
 
@@ -126,6 +132,8 @@ def apply_cli_overrides(config: dict[str, Any], args: argparse.Namespace) -> dic
         config["train"]["device"] = args.device
     if args.amp:
         config["train"]["amp"] = True
+    if args.activation_checkpointing:
+        config["train"]["activation_checkpointing"] = True
     if args.seed is not None:
         config["train"]["seed"] = args.seed
     return config
@@ -371,6 +379,7 @@ def main() -> None:
         num_heads=int(config["model"]["num_heads"]),
         dropout=float(config["model"]["dropout"]),
         ffn_multiplier=int(config["model"]["ffn_multiplier"]),
+        activation_checkpointing=bool(config["train"].get("activation_checkpointing", False)),
     ).to(device)
 
     optimizer = torch.optim.AdamW(

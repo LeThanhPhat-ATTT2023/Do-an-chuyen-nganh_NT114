@@ -125,9 +125,18 @@ Một số cấu hình lớn như `pyhgt_ogbmag_l4_h512_h8` có thể vượt 15
 ```yaml
 train:
   amp: true
+  activation_checkpointing: true
 ```
 
-AMP/mixed precision giúp giảm VRAM nhưng không đổi kiến trúc model.
+AMP/mixed precision và activation checkpointing giúp giảm VRAM nhưng không đổi kiến trúc model. Checkpointing chỉ đánh đổi thêm thời gian train vì phải tính lại activation trong backward pass.
+
+Sau khi gặp OOM, nên:
+
+```text
+Session options -> Restart session
+```
+
+rồi chạy lại notebook bằng code mới, vì CUDA memory sau OOM đôi khi bị phân mảnh.
 
 Notebook vẫn có logic:
 
