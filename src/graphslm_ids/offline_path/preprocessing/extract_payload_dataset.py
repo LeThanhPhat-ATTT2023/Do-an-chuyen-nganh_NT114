@@ -68,6 +68,12 @@ def parse_args() -> argparse.Namespace:
         help="Include packets that have empty payloads (all-zero vectors after padding).",
     )
     parser.add_argument(
+        "--log-every-packets",
+        type=int,
+        default=0,
+        help="Print progress every N packets per PCAP file (0 to disable).",
+    )
+    parser.add_argument(
         "--shuffle",
         action="store_true",
         help="Shuffle output rows before saving.",
@@ -104,11 +110,16 @@ def main() -> None:
     if not pcap_paths:
         raise SystemExit("No PCAP files found. Check --input-glob patterns.")
 
+    log_every = int(args.log_every_packets)
+    if log_every <= 0:
+        log_every = None
+
     payload_matrix, metadata = build_payload_dataset(
         pcap_paths=pcap_paths,
         payload_length=args.payload_length,
         max_packets_per_file=args.max_packets_per_file,
         include_empty_payload=args.include_empty_payload,
+        log_every=log_every,
     )
 
     if args.shuffle and payload_matrix.shape[0] > 0:
