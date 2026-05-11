@@ -948,9 +948,12 @@ src/graphslm_ids/fast_path/hot_graph_buffer.py
 src/graphslm_ids/fast_path/subgraph_builder.py
   → Replace K-hop expansion với affected-set propagation.
 
+src/graphslm_ids/runtime/graph_store.py
+  → PersistentGraphStore là source of truth append-only cho runtime/slow path.
+  → Hỗ trợ shard theo thời gian/kích thước, sealed shard, retention và bridge sang training.
+
 src/graphslm_ids/runtime/cold_store.py
-  → Mở rộng thành full Persistent Graph Store với shard 4-7K nodes.
-  → LSM compaction.
+  → Chỉ còn fallback JSONL khi tắt graph_store; không phải source of truth.
 
 src/graphslm_ids/slow_path/context_hydrator.py
   → Load shard from store thay vì query Hot Buffer.

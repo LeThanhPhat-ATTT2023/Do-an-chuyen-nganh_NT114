@@ -2,8 +2,10 @@
 
 from graphslm_ids.runtime.cold_store import ColdStore
 from graphslm_ids.runtime.counterfactual import HGTCounterfactual
+from graphslm_ids.runtime.graph_store import PersistentGraphStore
 from graphslm_ids.runtime.pipeline_config import (
     FastPathCfg,
+    GraphStoreCfg,
     HGTCfg,
     HotGraphCfg,
     PipelineConfig,
@@ -16,9 +18,11 @@ __all__ = [
     "DetectionResult",
     "FastPathCfg",
     "FastPathPipeline",
+    "GraphStoreCfg",
     "HGTCfg",
     "HGTCounterfactual",
     "HotGraphCfg",
     "PipelineConfig",
+    "PersistentGraphStore",
     "PolicyCfg",
 ]

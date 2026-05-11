@@ -57,7 +57,10 @@ def main() -> None:
             worker.join(timeout=60)
 
     print(f"[OK] Processed packets={count} alerts={alerts}")
-    print(f"[OK] Cold store: {cfg.cold_store_path}")
+    if cfg.graph_store.enabled:
+        print(f"[OK] Graph store: {cfg.graph_store.root}")
+    else:
+        print(f"[OK] Cold store: {cfg.cold_store_path}")
 
 
 if __name__ == "__main__":

@@ -23,6 +23,7 @@ graphslm-build-teacher = "graphslm_ids.offline_path.preprocessing.build_teacher_
 graphslm-build-mitre-emb = "graphslm_ids.offline_path.preprocessing.build_mitre_technique_embeddings:main"
 graphslm-build-graph = "graphslm_ids.offline_path.preprocessing.build_graph_artifact:main"
 graphslm-build-three-tier-graph = "graphslm_ids.offline_path.preprocessing.build_three_tier_graph_artifact:main"
+graphslm-convert-graph-store = "graphslm_ids.offline_path.training.on_disk_graph_store:main"
 graphslm-train-student = "graphslm_ids.offline_path.training.train_student_cnn:main"
 graphslm-eval-student = "graphslm_ids.offline_path.training.evaluate_student_cnn:main"
 graphslm-export-student-onnx = "graphslm_ids.offline_path.training.export_student_onnx:main"

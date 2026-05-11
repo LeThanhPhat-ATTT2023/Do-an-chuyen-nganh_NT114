@@ -1,5 +1,10 @@
 # Thiết Kế Lớp Cầu Nối Fast Path ↔ Slow Path
 
+> Cập nhật theo `docs/unified_graph_growth_strategy_vi.md`: `ColdStore` trong tài
+> liệu này chỉ còn là fallback JSONL khi tắt `graph_store`. Runtime hiện tại dùng
+> `PersistentGraphStore` làm source of truth, HotGraphBuffer là cache RAM, slow
+> path hydrate từ graph store trước.
+
 Tài liệu này đặc tả chi tiết lớp runtime nằm giữa **Fast Path** (online detection)
 và **Slow Path** (XAI report generation) đã được triển khai trong
 `src/graphslm_ids/slow_path/`. Mục tiêu là khép kín pipeline online: từ packet

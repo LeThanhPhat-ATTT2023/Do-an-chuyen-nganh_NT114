@@ -11,6 +11,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.utils.data import DataLoader
 import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
@@ -18,15 +19,30 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from graphslm_ids.offline_path.training.hetero_graph_artifact import load_three_tier_graph_artifact
+from graphslm_ids.offline_path.training.hetero_graph_artifact import (
+    load_graph_store_artifact,
+    load_three_tier_graph_artifact,
+)
+from graphslm_ids.offline_path.training.neighbor_sampling import (
+    FlowSeedDataset,
+    HeteroNeighborSampler,
+    InMemoryNeighborBackend,
+    MiniBatchSubgraph,
+    NeighborBackend,
+    NeighborSamplingCollator,
+)
+from graphslm_ids.offline_path.training.on_disk_graph_store import OnDiskHeteroGraphStore
 from graphslm_ids.models.hgt import HeteroGraphTransformer
 from graphslm_ids.utils.io import ensure_dir, write_json
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "data": {
+        "source": "npz",
         "graph_npz": "data/processed/graph_artifact_3tier_t082_k5.npz",
         "graph_meta_json": "data/processed/graph_artifact_3tier_t082_k5.meta.json",
+        "graph_store_root": "data/graph_store_v1",
+        "read_sealed_only": True,
         "packet_feature": "semantic",
         "add_reverse_edges": True,
         "standardize_flow_features": True,
@@ -55,6 +71,31 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "log_every": 1,
         "amp": False,
         "activation_checkpointing": False,
+        "batch_seed_flows": 256,
+        "grad_accum_steps": 1,
+    },
+    "sampler": {
+        "hops": None,
+        "fanouts": {
+            "flow__contains__packet": 20,
+            "packet__next_packet__packet": 4,
+            "packet__matches_technique__technique": 5,
+            "flow__matches_technique__technique": 5,
+            "technique__belongs_to_tactic__tactic": 1,
+        },
+        "reverse_fanouts": {
+            "rev_contains": 1,
+            "rev_next_packet": 1,
+            "rev_matches_technique": 0,
+            "rev_belongs_to_tactic": 0,
+        },
+        "always_include_all_tactics": True,
+        "always_include_all_techniques": True,
+    },
+    "dataloader": {
+        "num_workers": 0,
+        "prefetch_factor": 2,
+        "pin_memory": False,
     },
 }
 
@@ -66,6 +107,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", default="configs/hgt.example.yaml")
     parser.add_argument("--graph-npz", default=None)
     parser.add_argument("--graph-meta-json", default=None)
+    parser.add_argument("--graph-store-root", default=None)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--hidden-dim", type=int, default=None)
@@ -112,6 +154,9 @@ def apply_cli_overrides(config: dict[str, Any], args: argparse.Namespace) -> dic
         config["data"]["graph_npz"] = args.graph_npz
     if args.graph_meta_json is not None:
         config["data"]["graph_meta_json"] = args.graph_meta_json
+    if args.graph_store_root is not None:
+        config["data"]["source"] = "graph_store"
+        config["data"]["graph_store_root"] = args.graph_store_root
     if args.output_dir is not None:
         config["train"]["output_dir"] = args.output_dir
     if args.epochs is not None:
@@ -311,6 +356,475 @@ def label_name_mapping(metadata: dict[str, Any], labels: np.ndarray) -> dict[int
     return {int(label): str(label) for label in sorted(np.unique(labels).tolist())}
 
 
+def load_neighbor_backend(config: dict[str, Any]) -> NeighborBackend:
+    source = str(config["data"].get("source", "npz")).lower()
+    if source in {"on_disk_graph_store", "graph_store_csr", "graph_store"}:
+        graph_store_root = Path(config["data"]["graph_store_root"])
+        try:
+            return OnDiskHeteroGraphStore(graph_store_root)
+        except (FileNotFoundError, ValueError):
+            if source != "graph_store":
+                raise
+            artifact = load_graph_store_artifact(
+                graph_store_root=graph_store_root,
+                packet_feature=str(config["data"]["packet_feature"]),
+                add_reverse_edges=bool(config["data"]["add_reverse_edges"]),
+                sealed_only=bool(config["data"].get("read_sealed_only", True)),
+            )
+            return InMemoryNeighborBackend(artifact)
+
+    artifact = load_three_tier_graph_artifact(
+        graph_npz=Path(config["data"]["graph_npz"]),
+        graph_meta_json=Path(config["data"]["graph_meta_json"]),
+        packet_feature=str(config["data"]["packet_feature"]),
+        add_reverse_edges=bool(config["data"]["add_reverse_edges"]),
+    )
+    return InMemoryNeighborBackend(artifact)
+
+
+def backend_splits(
+    backend: NeighborBackend,
+    labels: np.ndarray,
+    config: dict[str, Any],
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    split_ids = getattr(backend, "split_ids", None)
+    if callable(split_ids):
+        train = split_ids("train")
+        val = split_ids("val")
+        test = split_ids("test")
+        if train is not None and val is not None and test is not None:
+            return (
+                np.asarray(train, dtype=np.int64),
+                np.asarray(val, dtype=np.int64),
+                np.asarray(test, dtype=np.int64),
+            )
+    return stratified_split(
+        labels=labels,
+        val_ratio=float(config["train"]["val_ratio"]),
+        test_ratio=float(config["train"]["test_ratio"]),
+        seed=seed,
+    )
+
+
+def compute_flow_feature_stats_backend(
+    backend: NeighborBackend,
+    train_ids: np.ndarray,
+    chunk_size: int = 65_536,
+) -> dict[str, list[float]]:
+    train_ids = np.asarray(train_ids, dtype=np.int64)
+    dim = int(backend.feature_dims["flow"])
+    if train_ids.size == 0:
+        return {"mean": [0.0] * dim, "std": [1.0] * dim}
+
+    total = np.zeros((dim,), dtype=np.float64)
+    total_sq = np.zeros((dim,), dtype=np.float64)
+    count = 0
+    for start in range(0, int(train_ids.shape[0]), chunk_size):
+        ids = train_ids[start : start + chunk_size]
+        rows = backend.get_flow_features(ids).astype(np.float64)
+        total += rows.sum(axis=0)
+        total_sq += np.square(rows).sum(axis=0)
+        count += int(rows.shape[0])
+    mean = total / max(count, 1)
+    var = np.maximum(total_sq / max(count, 1) - np.square(mean), 0.0)
+    std = np.maximum(np.sqrt(var), 1e-6)
+    return {
+        "mean": mean.astype(float).tolist(),
+        "std": std.astype(float).tolist(),
+    }
+
+
+def class_weights_from_backend(
+    backend: NeighborBackend,
+    train_idx: np.ndarray,
+    num_classes: int,
+) -> torch.Tensor:
+    manifest_weights = (backend.manifest or {}).get("class_weights")
+    if isinstance(manifest_weights, list) and len(manifest_weights) >= num_classes:
+        return torch.tensor(manifest_weights[:num_classes], dtype=torch.float32)
+    labels = backend.get_flow_labels(np.asarray(train_idx, dtype=np.int64))
+    counts = np.bincount(labels, minlength=num_classes).astype(np.float32)
+    weights = np.zeros(num_classes, dtype=np.float32)
+    nonzero = counts > 0
+    weights[nonzero] = counts[nonzero].sum() / (float(num_classes) * counts[nonzero])
+    return torch.from_numpy(weights)
+
+
+def to_torch_batch(
+    batch: MiniBatchSubgraph,
+    edge_types: list[tuple[str, str, str]],
+    device: torch.device,
+    use_semantic_edge_weights: bool,
+) -> tuple[
+    dict[str, torch.Tensor],
+    dict[tuple[str, str, str], torch.Tensor],
+    dict[tuple[str, str, str], torch.Tensor] | None,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    node_tensors = {
+        key: torch.from_numpy(np.asarray(value)).to(device)
+        for key, value in batch.node_features.items()
+    }
+    edge_tensors: dict[tuple[str, str, str], torch.Tensor] = {}
+    for edge_type in edge_types:
+        value = batch.edge_index.get(edge_type)
+        if value is None:
+            value = np.empty((2, 0), dtype=np.int64)
+        edge_tensors[edge_type] = torch.from_numpy(np.asarray(value, dtype=np.int64)).to(device)
+
+    edge_weights: dict[tuple[str, str, str], torch.Tensor] = {}
+    if use_semantic_edge_weights:
+        for edge_type in edge_types:
+            if "matches_technique" not in edge_type[1]:
+                continue
+            values = np.asarray(batch.edge_attr.get(edge_type, np.empty((0,), dtype=np.float32)), dtype=np.float32)
+            edge_weights[edge_type] = torch.from_numpy(values.reshape(-1)).to(device)
+
+    seed_mask = torch.from_numpy(np.asarray(batch.seed_mask, dtype=bool)).to(device)
+    seed_labels = torch.from_numpy(np.asarray(batch.seed_labels, dtype=np.int64)).to(device)
+    return node_tensors, edge_tensors, edge_weights or None, seed_mask, seed_labels
+
+
+def metrics_from_predictions(
+    pred_np: np.ndarray,
+    label_np: np.ndarray,
+    num_classes: int,
+    label_names: dict[int, str],
+    loss_sum: float | None = None,
+) -> dict[str, Any]:
+    if label_np.size == 0:
+        return {"count": 0, "loss": None, "accuracy": None, "macro_f1": None, "per_class": {}}
+
+    correct = int((pred_np == label_np).sum())
+    count = int(label_np.shape[0])
+    per_class: dict[str, dict[str, float | int]] = {}
+    f1_values: list[float] = []
+    for class_id in range(num_classes):
+        tp = int(((pred_np == class_id) & (label_np == class_id)).sum())
+        fp = int(((pred_np == class_id) & (label_np != class_id)).sum())
+        fn = int(((pred_np != class_id) & (label_np == class_id)).sum())
+        support = int((label_np == class_id).sum())
+        precision = tp / max(tp + fp, 1)
+        recall = tp / max(tp + fn, 1)
+        f1 = 2.0 * precision * recall / max(precision + recall, 1e-12)
+        if support > 0:
+            f1_values.append(float(f1))
+        per_class[label_names.get(class_id, str(class_id))] = {
+            "support": support,
+            "precision": float(precision),
+            "recall": float(recall),
+            "f1": float(f1),
+        }
+    return {
+        "count": count,
+        "loss": float(loss_sum / max(count, 1)) if loss_sum is not None else None,
+        "accuracy": float(correct / max(count, 1)),
+        "macro_f1": float(np.mean(f1_values)) if f1_values else 0.0,
+        "per_class": per_class,
+    }
+
+
+def make_neighbor_loader(
+    flow_ids: np.ndarray,
+    sampler: HeteroNeighborSampler,
+    config: dict[str, Any],
+    *,
+    shuffle: bool,
+) -> DataLoader:
+    num_workers = int(config.get("dataloader", {}).get("num_workers", 0))
+    loader_kwargs: dict[str, Any] = {
+        "batch_size": int(config["train"].get("batch_seed_flows", 256)),
+        "shuffle": bool(shuffle),
+        "collate_fn": NeighborSamplingCollator(sampler),
+        "num_workers": num_workers,
+        "pin_memory": bool(config.get("dataloader", {}).get("pin_memory", False)),
+    }
+    if num_workers > 0:
+        loader_kwargs["prefetch_factor"] = int(config.get("dataloader", {}).get("prefetch_factor", 2))
+    return DataLoader(FlowSeedDataset(flow_ids), **loader_kwargs)
+
+
+def evaluate_neighbor_sampling(
+    *,
+    model: HeteroGraphTransformer,
+    loader: DataLoader,
+    edge_types: list[tuple[str, str, str]],
+    device: torch.device,
+    use_amp: bool,
+    use_semantic_edge_weights: bool,
+    num_classes: int,
+    label_names: dict[int, str],
+) -> dict[str, Any]:
+    model.eval()
+    preds: list[np.ndarray] = []
+    labels: list[np.ndarray] = []
+    loss_sum = 0.0
+    with torch.no_grad():
+        for batch in loader:
+            node_features, edge_index, edge_weight, seed_mask, seed_labels = to_torch_batch(
+                batch,
+                edge_types,
+                device,
+                use_semantic_edge_weights,
+            )
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                logits = model(node_features, edge_index, edge_weight_dict=edge_weight)
+                seed_logits = logits[seed_mask]
+                loss = F.cross_entropy(seed_logits.float(), seed_labels, reduction="sum")
+            loss_sum += float(loss.item())
+            preds.append(seed_logits.detach().float().argmax(dim=1).cpu().numpy())
+            labels.append(seed_labels.detach().cpu().numpy())
+    pred_np = np.concatenate(preds) if preds else np.empty((0,), dtype=np.int64)
+    label_np = np.concatenate(labels) if labels else np.empty((0,), dtype=np.int64)
+    return metrics_from_predictions(pred_np, label_np, num_classes, label_names, loss_sum)
+
+
+def train_neighbor_sampling(config: dict[str, Any], seed: int, device: torch.device) -> None:
+    backend = load_neighbor_backend(config)
+    all_flow_ids = np.arange(int(backend.num_flows), dtype=np.int64)
+    labels_np = backend.get_flow_labels(all_flow_ids)
+    if labels_np.size == 0:
+        raise ValueError("Cannot train HGT: graph has no flow labels.")
+    num_classes = int(labels_np.max()) + 1
+    train_idx_np, val_idx_np, test_idx_np = backend_splits(backend, labels_np, config, seed)
+
+    flow_feature_stats: dict[str, list[float]] | None = None
+    if bool(config["data"]["standardize_flow_features"]):
+        manifest_stats = (backend.manifest or {}).get("flow_feature_stats")
+        if isinstance(manifest_stats, dict) and "mean" in manifest_stats and "std" in manifest_stats:
+            flow_feature_stats = {
+                "mean": list(manifest_stats["mean"]),
+                "std": list(manifest_stats["std"]),
+            }
+        else:
+            flow_feature_stats = compute_flow_feature_stats_backend(backend, train_idx_np)
+
+    sampler_cfg = dict(config.get("sampler") or {})
+    sampler_hops = sampler_cfg.get("hops")
+    if sampler_hops is None:
+        sampler_hops = int(config["model"]["num_layers"])
+    sampler = HeteroNeighborSampler(
+        backend,
+        hops=int(sampler_hops),
+        fanouts=dict(sampler_cfg.get("fanouts") or {}),
+        reverse_fanouts=dict(sampler_cfg.get("reverse_fanouts") or {}),
+        always_include_all_tactics=bool(sampler_cfg.get("always_include_all_tactics", True)),
+        always_include_all_techniques=bool(sampler_cfg.get("always_include_all_techniques", True)),
+        flow_feature_stats=flow_feature_stats,
+        standardize_flow_features=bool(config["data"]["standardize_flow_features"]),
+        seed=seed,
+    )
+    train_loader = make_neighbor_loader(train_idx_np, sampler, config, shuffle=True)
+    val_loader = make_neighbor_loader(val_idx_np, sampler, config, shuffle=False)
+    test_loader = make_neighbor_loader(test_idx_np, sampler, config, shuffle=False)
+
+    edge_types = list(backend.edge_types)
+    node_input_dims = {
+        "flow": int(backend.feature_dims["flow"]),
+        "packet": int(backend.feature_dims["packet"]),
+        "technique": int(backend.feature_dims["technique"]),
+    }
+    model = HeteroGraphTransformer(
+        node_input_dims=node_input_dims,
+        edge_types=edge_types,
+        num_classes=num_classes,
+        num_tactics=int(backend.num_tactics),
+        hidden_dim=int(config["model"]["hidden_dim"]),
+        num_layers=int(config["model"]["num_layers"]),
+        num_heads=int(config["model"]["num_heads"]),
+        dropout=float(config["model"]["dropout"]),
+        ffn_multiplier=int(config["model"]["ffn_multiplier"]),
+        activation_checkpointing=bool(config["train"].get("activation_checkpointing", False)),
+    ).to(device)
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=float(config["train"]["lr"]),
+        weight_decay=float(config["train"]["weight_decay"]),
+    )
+    weight = None
+    if str(config["train"]["class_weight"]).lower() == "balanced":
+        weight = class_weights_from_backend(backend, train_idx_np, num_classes).to(device)
+
+    output_dir = ensure_dir(Path(config["train"]["output_dir"]))
+    best_checkpoint = output_dir / "hgt_flow_best.pt"
+    label_names = label_name_mapping(backend.manifest, labels_np)
+    monitor = str(config["train"]["monitor"])
+    log_every = max(1, int(config["train"]["log_every"]))
+    use_amp = bool(config["train"].get("amp", False)) and device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    grad_accum_steps = max(1, int(config["train"].get("grad_accum_steps", 1)))
+    use_semantic_edge_weights = bool(config["data"]["use_semantic_edge_weights"])
+
+    best_score = -float("inf")
+    best_epoch = 0
+    epochs_without_improvement = 0
+    history: list[dict[str, Any]] = []
+
+    for epoch in range(1, int(config["train"]["epochs"]) + 1):
+        model.train()
+        optimizer.zero_grad(set_to_none=True)
+        preds: list[np.ndarray] = []
+        labels: list[np.ndarray] = []
+        loss_sum = 0.0
+        examples = 0
+        pending_step = False
+        sampled_nodes: dict[str, list[int]] = {"flow": [], "packet": [], "technique": [], "tactic": []}
+        sampled_edges: dict[str, list[int]] = {}
+
+        for step, batch in enumerate(train_loader):
+            node_features, edge_index, edge_weight, seed_mask, seed_labels = to_torch_batch(
+                batch,
+                edge_types,
+                device,
+                use_semantic_edge_weights,
+            )
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                logits = model(node_features, edge_index, edge_weight_dict=edge_weight)
+                seed_logits = logits[seed_mask]
+                loss = F.cross_entropy(seed_logits, seed_labels, weight=weight)
+                scaled_loss = loss / grad_accum_steps
+            scaler.scale(scaled_loss).backward()
+            pending_step = True
+            if (step + 1) % grad_accum_steps == 0:
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                pending_step = False
+
+            batch_count = int(seed_labels.numel())
+            loss_sum += float(loss.detach().item()) * batch_count
+            examples += batch_count
+            preds.append(seed_logits.detach().float().argmax(dim=1).cpu().numpy())
+            labels.append(seed_labels.detach().cpu().numpy())
+            for node_type, count in batch.stats.get("nodes", {}).items():
+                sampled_nodes.setdefault(node_type, []).append(int(count))
+            for edge_name, count in batch.stats.get("edges", {}).items():
+                sampled_edges.setdefault(edge_name, []).append(int(count))
+
+        if pending_step:
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+
+        train_pred = np.concatenate(preds) if preds else np.empty((0,), dtype=np.int64)
+        train_label = np.concatenate(labels) if labels else np.empty((0,), dtype=np.int64)
+        train_metrics = metrics_from_predictions(
+            train_pred,
+            train_label,
+            num_classes,
+            label_names,
+            loss_sum if examples else None,
+        )
+        val_metrics = evaluate_neighbor_sampling(
+            model=model,
+            loader=val_loader,
+            edge_types=edge_types,
+            device=device,
+            use_amp=use_amp,
+            use_semantic_edge_weights=use_semantic_edge_weights,
+            num_classes=num_classes,
+            label_names=label_names,
+        )
+        test_metrics = evaluate_neighbor_sampling(
+            model=model,
+            loader=test_loader,
+            edge_types=edge_types,
+            device=device,
+            use_amp=use_amp,
+            use_semantic_edge_weights=use_semantic_edge_weights,
+            num_classes=num_classes,
+            label_names=label_names,
+        )
+
+        avg_nodes = {
+            node_type: float(np.mean(values)) if values else 0.0
+            for node_type, values in sampled_nodes.items()
+        }
+        avg_edges = {
+            edge_name: float(np.mean(values)) if values else 0.0
+            for edge_name, values in sampled_edges.items()
+        }
+        entry = {
+            "epoch": epoch,
+            "train": {key: value for key, value in train_metrics.items() if key != "per_class"},
+            "val": {key: value for key, value in val_metrics.items() if key != "per_class"},
+            "test": {key: value for key, value in test_metrics.items() if key != "per_class"},
+            "sampler": {
+                "avg_subgraph_nodes": avg_nodes,
+                "avg_subgraph_edges": avg_edges,
+            },
+        }
+        history.append(entry)
+
+        monitor_score = float(val_metrics["macro_f1"] if monitor == "val_macro_f1" else -val_metrics["loss"])
+        if monitor_score > best_score:
+            best_score = monitor_score
+            best_epoch = epoch
+            epochs_without_improvement = 0
+            torch.save(
+                {
+                    "model_state_dict": model.state_dict(),
+                    "config": config,
+                    "node_input_dims": node_input_dims,
+                    "edge_types": [list(edge_key) for edge_key in edge_types],
+                    "num_classes": num_classes,
+                    "num_tactics": int(backend.num_tactics),
+                    "label_names": label_names,
+                    "flow_feature_stats": flow_feature_stats,
+                    "epoch": epoch,
+                    "val_metrics": val_metrics,
+                    "test_metrics": test_metrics,
+                },
+                best_checkpoint,
+            )
+        else:
+            epochs_without_improvement += 1
+
+        if epoch == 1 or epoch % log_every == 0:
+            print(
+                f"Epoch {epoch:03d} | "
+                f"loss={float(train_metrics['loss'] or 0.0):.4f} "
+                f"val_acc={val_metrics['accuracy']:.4f} "
+                f"val_macro_f1={val_metrics['macro_f1']:.4f} "
+                f"test_macro_f1={test_metrics['macro_f1']:.4f} "
+                f"avg_flow_nodes={avg_nodes.get('flow', 0.0):.1f} "
+                f"avg_packet_nodes={avg_nodes.get('packet', 0.0):.1f}"
+            )
+
+        if epochs_without_improvement >= int(config["train"]["patience"]):
+            print(f"Early stopping at epoch {epoch}.")
+            break
+
+    best_payload = load_checkpoint(best_checkpoint, device)
+    summary = {
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "config": config,
+        "device": str(device),
+        "best_checkpoint": str(best_checkpoint),
+        "best_epoch": int(best_epoch),
+        "best_score": float(best_score),
+        "num_flows": int(backend.num_flows),
+        "num_techniques": int(backend.num_techniques),
+        "num_tactics": int(backend.num_tactics),
+        "num_edge_types": int(len(edge_types)),
+        "splits": {
+            "train": int(train_idx_np.shape[0]),
+            "val": int(val_idx_np.shape[0]),
+            "test": int(test_idx_np.shape[0]),
+        },
+        "label_names": {str(key): value for key, value in label_names.items()},
+        "best_val_metrics": best_payload["val_metrics"],
+        "best_test_metrics": best_payload["test_metrics"],
+        "history": history,
+    }
+    write_json(output_dir / "training_summary.json", summary)
+    print(f"[OK] Best checkpoint: {best_checkpoint}")
+    print(f"[OK] Training summary: {output_dir / 'training_summary.json'}")
+
+
 def load_checkpoint(path: Path, device: torch.device) -> dict[str, Any]:
     try:
         return torch.load(path, map_location=device, weights_only=False)
@@ -325,15 +839,27 @@ def main() -> None:
     seed = int(config["train"]["seed"])
     set_seed(seed)
     device = resolve_device(str(config["train"]["device"]))
-    if str(config["train"]["batch_mode"]).lower() != "full":
-        raise ValueError("Only full batch HGT training is supported in this script.")
+    batch_mode = str(config["train"]["batch_mode"]).lower()
+    if batch_mode in {"neighbor_sampling", "neighbor", "mini_batch", "minibatch"}:
+        train_neighbor_sampling(config, seed, device)
+        return
+    if batch_mode != "full":
+        raise ValueError("train.batch_mode must be 'full' or 'neighbor_sampling'.")
 
-    artifact = load_three_tier_graph_artifact(
-        graph_npz=Path(config["data"]["graph_npz"]),
-        graph_meta_json=Path(config["data"]["graph_meta_json"]),
-        packet_feature=str(config["data"]["packet_feature"]),
-        add_reverse_edges=bool(config["data"]["add_reverse_edges"]),
-    )
+    if str(config["data"].get("source", "npz")).lower() == "graph_store":
+        artifact = load_graph_store_artifact(
+            graph_store_root=Path(config["data"]["graph_store_root"]),
+            packet_feature=str(config["data"]["packet_feature"]),
+            add_reverse_edges=bool(config["data"]["add_reverse_edges"]),
+            sealed_only=bool(config["data"].get("read_sealed_only", True)),
+        )
+    else:
+        artifact = load_three_tier_graph_artifact(
+            graph_npz=Path(config["data"]["graph_npz"]),
+            graph_meta_json=Path(config["data"]["graph_meta_json"]),
+            packet_feature=str(config["data"]["packet_feature"]),
+            add_reverse_edges=bool(config["data"]["add_reverse_edges"]),
+        )
 
     labels_np = artifact.flow_y.astype(np.int64)
     num_classes = int(labels_np.max()) + 1

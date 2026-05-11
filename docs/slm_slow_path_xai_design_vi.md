@@ -1,5 +1,9 @@
 # Thiết Kế Chi Tiết SLM Slow Path — XAI Report Generation
 
+> Cập nhật theo kiến trúc graph store thống nhất: Slow Path hiện ưu tiên hydrate
+> context từ `PersistentGraphStore` source of truth. Hot Buffer/ColdStore trong
+> các đoạn cũ chỉ là cache/fallback, không phải nguồn dữ liệu chính.
+
 Tài liệu này chốt toàn bộ thiết kế kỹ thuật cho Slow Path trong hệ thống IDS dựa
 trên payload embedding, heterogeneous graph, MITRE ATT&CK và HGT classifier. Mục
 tiêu cuối cùng là một bài báo Q1 với đóng góp đo được về XAI faithfulness.

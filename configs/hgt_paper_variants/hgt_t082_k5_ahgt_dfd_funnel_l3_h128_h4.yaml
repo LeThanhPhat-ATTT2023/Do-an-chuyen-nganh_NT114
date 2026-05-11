@@ -1,0 +1,75 @@
+# Source: AHGT-DFD Adaptive Hierarchical Graph Transformer for Dynamic Fraud
+# Detection, 2026.
+# Inspired config: the paper uses a 3-scale funnel of embedding dimensions
+# (individual=128, neighborhood=64, global=32) plus Elastic Weight Consolidation
+# (EWC) for continual learning, Dirichlet prior with alpha=0.5 for automated
+# pattern discovery, and a Lipschitz-constrained Transformer for certified
+# robustness under adversarial perturbations (radius ~0.1).
+# Local approximation: this trainer keeps hidden_dim constant across layers,
+# so we choose the largest funnel level (128) and 3 layers to mimic the
+# hop-by-hop information bottleneck (individual -> neighborhood -> global).
+# EWC, Dirichlet priors, and Lipschitz constraints are NOT implemented in
+# this script - they belong to a continual-learning pipeline (see
+# docs/unified_graph_growth_strategy_vi.md section 10 for the integration plan).
+experiment:
+  source_name: "AHGT-DFD Hierarchical Funnel (backbone only)"
+  citation_hint: "AHGT-DFD: Adaptive Hierarchical Graph Transformer for Dynamic Fraud Detection in Blockchain Networks, 2026"
+  rationale: "Approximate the 128 -> 64 -> 32 hierarchical funnel with a 3-layer / 128-hidden / 4-head HGT to test whether the bottleneck topology helps the IDS task without the EWC continual-learning module."
+
+data:
+  source: graph_store
+  graph_npz: data/processed/graph_artifact_3tier_t082_k5.npz
+  graph_meta_json: data/processed/graph_artifact_3tier_t082_k5.meta.json
+  graph_store_root: data/graph_store_v1
+  read_sealed_only: true
+  packet_feature: semantic
+  add_reverse_edges: true
+  standardize_flow_features: true
+  use_semantic_edge_weights: true
+
+model:
+  hidden_dim: 128
+  num_layers: 3
+  num_heads: 4
+  dropout: 0.2
+  ffn_multiplier: 2
+
+train:
+  output_dir: outputs/hgt_paper_variants/ahgt_dfd_funnel_l3_h128_h4
+  epochs: 150
+  batch_mode: neighbor_sampling
+  batch_seed_flows: 256
+  grad_accum_steps: 4
+  lr: 0.0005
+  weight_decay: 0.0001
+  val_ratio: 0.1
+  test_ratio: 0.1
+  patience: 30
+  class_weight: balanced
+  seed: 42
+  device: cuda
+  monitor: val_macro_f1
+  log_every: 1
+  amp: true
+  activation_checkpointing: true
+
+sampler:
+  hops: 3
+  fanouts:
+    flow__contains__packet: 20
+    packet__next_packet__packet: 4
+    packet__matches_technique__technique: 5
+    flow__matches_technique__technique: 5
+    technique__belongs_to_tactic__tactic: 1
+  reverse_fanouts:
+    rev_contains: 1
+    rev_next_packet: 1
+    rev_matches_technique: 0
+    rev_belongs_to_tactic: 0
+  always_include_all_tactics: true
+  always_include_all_techniques: true
+
+dataloader:
+  num_workers: 2
+  prefetch_factor: 2
+  pin_memory: true

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +31,47 @@ class HotGraphCfg:
 
 
 @dataclass
+class SigcCfg:
+    enabled: bool = False
+    alpha: float = 0.4
+    min_score_to_keep_edge: float = 0.15
+    apply_to_edge_types: tuple[str, ...] = (
+        "flow__contains__packet",
+        "packet__next_packet__packet",
+        "packet__matches_technique__technique",
+    )
+
+
+@dataclass
+class PreprocessorCfg:
+    sigc: SigcCfg = field(default_factory=SigcCfg)
+
+
+@dataclass
+class DlgIdsTopNCfg:
+    enabled: bool = False
+    top_n_per_seed: dict[str, int] = field(default_factory=dict)
+    sort_by: str = "semantic_edge_weight"
+    fallback_to_random_when_tie: bool = False
+
+
+@dataclass
+class SubgraphBuilderCfg:
+    dlg_ids_top_n: DlgIdsTopNCfg = field(default_factory=DlgIdsTopNCfg)
+
+
+@dataclass
+class GraphStoreCfg:
+    root: str = "data/graph_store_v1"
+    enabled: bool = True
+    shard_seal_by_time_seconds: float = 3600.0
+    shard_seal_by_size_nodes: int = 6000
+    drop_after_days: float | None = 365.0
+    disk_quota_gb: float | None = None
+    on_quota_exceeded: str = "drop_oldest"
+
+
+@dataclass
 class HGTCfg:
     checkpoint: str
     graph_meta_json: str
@@ -45,13 +86,17 @@ class HGTCfg:
 @dataclass
 class PolicyCfg:
     alert_threshold: float = 0.70
-    alert_labels: tuple[str, ...] = ("suspicious", "malicious")
+    alert_labels: tuple[str, ...] = ()
+    benign_labels: tuple[str, ...] = ("benign",)
 
 
 @dataclass
 class PipelineConfig:
     fast_path: FastPathCfg
     hot_graph: HotGraphCfg
+    preprocessor: PreprocessorCfg
+    subgraph_builder: SubgraphBuilderCfg
+    graph_store: GraphStoreCfg
     hgt: HGTCfg
     policy: PolicyCfg
     slow_path: SlowPathConfig
@@ -78,6 +123,9 @@ class PipelineConfig:
         validator_raw = dict(raw.get("validator") or {})
         policy_raw = dict(raw.get("policy") or {})
         hot_raw = dict(raw.get("hot_graph") or {})
+        preprocessor_raw = dict(raw.get("preprocessor") or {})
+        subgraph_builder_raw = dict(raw.get("subgraph_builder") or {})
+        graph_store_raw = dict(raw.get("graph_store") or {})
         cold_raw = raw.get("cold_store")
 
         hgt_output_dir = hgt_raw.get("output_dir", "outputs/hgt_flow_classifier_t082_k5_l3_d01")
@@ -131,9 +179,70 @@ class PipelineConfig:
             ),
         )
 
+        sigc_raw = dict(preprocessor_raw.get("sigc") or {})
+        preprocessor = PreprocessorCfg(
+            sigc=SigcCfg(
+                enabled=bool(sigc_raw.get("enabled", False)),
+                alpha=float(sigc_raw.get("alpha", 0.4)),
+                min_score_to_keep_edge=float(sigc_raw.get("min_score_to_keep_edge", 0.15)),
+                apply_to_edge_types=tuple(
+                    str(item)
+                    for item in sigc_raw.get(
+                        "apply_to_edge_types",
+                        [
+                            "flow__contains__packet",
+                            "packet__next_packet__packet",
+                            "packet__matches_technique__technique",
+                        ],
+                    )
+                ),
+            )
+        )
+
+        dlg_raw = dict(subgraph_builder_raw.get("dlg_ids_top_n") or {})
+        subgraph_builder = SubgraphBuilderCfg(
+            dlg_ids_top_n=DlgIdsTopNCfg(
+                enabled=bool(dlg_raw.get("enabled", False)),
+                top_n_per_seed={
+                    str(key): int(value)
+                    for key, value in dict(dlg_raw.get("top_n_per_seed") or {}).items()
+                },
+                sort_by=str(dlg_raw.get("sort_by", "semantic_edge_weight")),
+                fallback_to_random_when_tie=bool(dlg_raw.get("fallback_to_random_when_tie", False)),
+            )
+        )
+
+        shard_seal_raw = dict(graph_store_raw.get("shard_seal") or {})
+        retention_raw = dict(graph_store_raw.get("retention") or {})
+        graph_store = GraphStoreCfg(
+            root=str(graph_store_raw.get("root", "data/graph_store_v1")),
+            enabled=bool(graph_store_raw.get("enabled", True)),
+            shard_seal_by_time_seconds=float(
+                shard_seal_raw.get(
+                    "by_time_seconds",
+                    graph_store_raw.get("shard_seal_by_time_seconds", 3600.0),
+                )
+            ),
+            shard_seal_by_size_nodes=int(
+                shard_seal_raw.get(
+                    "by_size_nodes",
+                    graph_store_raw.get(
+                        "shard_seal_by_size_nodes",
+                        graph_store_raw.get("shard_max_nodes", 6000),
+                    ),
+                )
+            ),
+            drop_after_days=_optional_float(
+                retention_raw.get("drop_after_days", graph_store_raw.get("drop_after_days", 365.0))
+            ),
+            disk_quota_gb=_optional_float(graph_store_raw.get("disk_quota_gb")),
+            on_quota_exceeded=str(graph_store_raw.get("on_quota_exceeded", "drop_oldest")),
+        )
+
         policy = PolicyCfg(
             alert_threshold=float(policy_raw.get("alert_threshold", slow_raw.get("alert_threshold", 0.70))),
-            alert_labels=tuple(str(x) for x in policy_raw.get("alert_labels", ["suspicious", "malicious"])),
+            alert_labels=tuple(str(x) for x in policy_raw.get("alert_labels", [])),
+            benign_labels=tuple(str(x) for x in policy_raw.get("benign_labels", ["benign"])),
         )
 
         slow_path = SlowPathConfig(
@@ -146,6 +255,7 @@ class PipelineConfig:
             max_payload_preview_bytes=int(slow_raw.get("max_payload_preview_bytes", 64)),
         )
         setattr(slow_path, "queue_max_size", int(slow_raw.get("queue_max_size", 1000)))
+        setattr(slow_path, "cold_source", str(slow_raw.get("cold_source", "graph_store")))
 
         slm = ReportGeneratorConfig(
             backend=slm_raw.get("backend", "ollama"),
@@ -176,6 +286,9 @@ class PipelineConfig:
         return PipelineConfig(
             fast_path=fast_path,
             hot_graph=hot_graph,
+            preprocessor=preprocessor,
+            subgraph_builder=subgraph_builder,
+            graph_store=graph_store,
             hgt=hgt,
             policy=policy,
             slow_path=slow_path,

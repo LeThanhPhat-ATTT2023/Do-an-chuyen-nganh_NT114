@@ -1,0 +1,74 @@
+# Source: GATransformer (graph-sequence enhanced Transformer for network
+# threat detection), 2025.
+# Inspired config: 1 GAT feature-extraction layer followed by 6 stacked
+# Transformer blocks with hidden_dim 256, 8 attention heads, very low LR
+# (1e-4), and a rolling time window of 30 events on CIDDS-002.
+# Reported accuracy ~99.7% on node classification and ~99.1% on edge
+# classification, at the cost of being the deepest variant in the comparison.
+# Local approximation: our model is a single uniform HGT stack, so we set
+# num_layers=6 and rely on per-edge-type attention to play the same role as
+# the GAT prefix. The rolling time window is enforced upstream by the runtime
+# Hot Graph Buffer + sliding seal scheduler (see unified_graph_growth_strategy
+# section 10.2), not by this training config.
+experiment:
+  source_name: "GATransformer Deep Stack (GAT + Transformer hybrid)"
+  citation_hint: "GATransformer: A Network Threat Detection Method Based on Graph-Sequence Enhanced Transformer, 2025"
+  rationale: "Probe whether a deeper 6-layer / 256-hidden / 8-head HGT recovers long-range temporal pattern accuracy reported by GATransformer; expect higher VRAM cost and slower per-step latency."
+
+data:
+  source: graph_store
+  graph_npz: data/processed/graph_artifact_3tier_t082_k5.npz
+  graph_meta_json: data/processed/graph_artifact_3tier_t082_k5.meta.json
+  graph_store_root: data/graph_store_v1
+  read_sealed_only: true
+  packet_feature: semantic
+  add_reverse_edges: true
+  standardize_flow_features: true
+  use_semantic_edge_weights: true
+
+model:
+  hidden_dim: 256
+  num_layers: 6
+  num_heads: 8
+  dropout: 0.1
+  ffn_multiplier: 2
+
+train:
+  output_dir: outputs/hgt_paper_variants/gatransformer_deep_l6_h256_h8
+  epochs: 200
+  batch_mode: neighbor_sampling
+  batch_seed_flows: 128
+  grad_accum_steps: 4
+  lr: 0.0001
+  weight_decay: 0.00005
+  val_ratio: 0.1
+  test_ratio: 0.1
+  patience: 40
+  class_weight: balanced
+  seed: 42
+  device: cuda
+  monitor: val_macro_f1
+  log_every: 1
+  amp: true
+  activation_checkpointing: true
+
+sampler:
+  hops: 6
+  fanouts:
+    flow__contains__packet: 16
+    packet__next_packet__packet: 3
+    packet__matches_technique__technique: 4
+    flow__matches_technique__technique: 4
+    technique__belongs_to_tactic__tactic: 1
+  reverse_fanouts:
+    rev_contains: 1
+    rev_next_packet: 1
+    rev_matches_technique: 0
+    rev_belongs_to_tactic: 0
+  always_include_all_tactics: true
+  always_include_all_techniques: false
+
+dataloader:
+  num_workers: 2
+  prefetch_factor: 2
+  pin_memory: true

@@ -488,9 +488,203 @@ THAY ĐỔI:
   - Có shard theo thời gian thay vì shard tự do.
 ```
 
-## 10. Roadmap thực thi thống nhất
+## 10. Quyết định: giữ kỹ thuật cũ, thay mới, hay kết hợp?
 
-### Phase A: Persistent Graph Store offline only
+Phần này trả lời thẳng ba câu hỏi thiết kế quan trọng nhất khi đối
+chiếu kiến trúc cũ (mục 1-9) với các kỹ thuật chống phình to công bố
+trong giai đoạn 2024-2026:
+
+```text
+Q1. Có giữ kỹ thuật cũ không?
+Q2. Có thể thay hoàn toàn bằng kỹ thuật 2024-2026 không?
+Q3. Nếu phải kết hợp, có nặng / phức tạp quá không?
+```
+
+### 10.1 Trả lời nhanh
+
+```text
+Q1. CÓ, bắt buộc giữ kỹ thuật cũ (Phase A-D).
+Q2. KHÔNG. Kỹ thuật 2024-2026 không thay thế được kiến trúc cũ.
+Q3. CÓ NGUY CƠ. Bật tất cả cùng lúc sẽ nặng và khó debug.
+    Phải triển khai theo TẦNG, mỗi tầng giải một triệu chứng cụ thể.
+```
+
+Lý do gốc: **hai nhóm kỹ thuật giải hai bài toán hoàn toàn khác nhau.**
+
+```text
+Kỹ thuật cũ  (Phase A-D)  = NỀN MÓNG dữ liệu.
+  Trả lời các câu: "Dữ liệu sống ở đâu? Khi nào hết hạn? Đọc lại
+  bằng cách nào? Schema thế nào?"
+
+Kỹ thuật mới (2024-2026)  = TỐI ƯU tính toán/bộ nhớ.
+  Trả lời các câu: "Cạnh nào đáng giữ? Quên gì sớm? Học liên tục
+  không bị forget? Train mô hình rộng trên VRAM nhỏ thế nào?"
+```
+
+Bỏ nền móng -> không có chỗ lưu dữ liệu, không có gì cho tối ưu
+chạy lên trên. Bật toàn bộ tối ưu cùng lúc -> nhiều mảnh logic, mỗi
+mảnh có hyperparameter riêng, một bug ở SIGC có thể bị che bởi HERO,
+debug rất khó.
+
+### 10.2 Bảng quyết định: layer-by-layer
+
+Bảng so sánh trực tiếp **từng tầng kiến trúc**, đối chiếu kỹ thuật cũ
+với kỹ thuật mới, và đưa ra quyết định cuối.
+
+| Tầng kiến trúc | Kỹ thuật cũ (Phase A-D) | Kỹ thuật 2024-2026 | Quyết định | Diễn giải |
+|---|---|---|---|---|
+| Storage backend | Persistent Graph Store on disk + sharding theo thời gian + retention 4-mức | RapidStore (multi-version, decoupled R/W) | **Giữ cũ, RapidStore chỉ là drop-in khi cần** | RapidStore là engine cao cấp hơn nhưng vẫn cần layout sharded. Chỉ thay khi đo được Read/Write amplification > 2x. |
+| RAM cache lifecycle | Hot Buffer TTL + `max_events` (passive evict) | BGML selective forgetting (active forget request) | **Kết hợp: TTL bắt buộc, BGML là add-on** | TTL bảo đảm cận trên dung lượng, BGML chỉ giúp drop sớm khi đã xác minh sạch. Không kỹ thuật nào thay được kỹ thuật còn lại. |
+| Data ingestion filter | (Không có ở doc cũ) | SIGC Local Contribution Score + HGSampling-budget per node-type | **Thêm SIGC, HGSampling-budget chỉ khi cần** | SIGC rất rẻ (1 phép tính tỷ lệ độ), lợi ích lớn: giảm số cạnh ghi xuống store. HGSampling-budget chỉ cần khi quan sát loại nút thiểu số (technique, tactic) bị nhấn chìm. |
+| Subgraph builder | K-hop với fanout cố định mỗi edge type | DLG-IDS Top-N edges per seed + localized temporal attention | **Thay fanout cố định bằng DLG-IDS Top-N** | Bản chất giống nhau (đều là chiến lược lấy mẫu lân cận), DLG-IDS chỉ thông minh hơn: chọn cạnh theo trọng số cosine/score thay vì lấy ngẫu nhiên K cạnh. Latency giảm ~50% theo paper. |
+| Time encoding | Timestamp tuyệt đối lưu cùng shard | RTE (Relative Temporal Encoding, sinusoid hàm delta_t) | **Cộng thêm, không thay** | Timestamp vẫn cần cho retention và compaction; RTE chỉ thêm vector embedding khi đọc cross-shard cho HGT. Bỏ qua được nếu chưa thấy lợi ở thực nghiệm. |
+| Training data loop | Cumulative retrain trên toàn bộ shard sealed | HERO continual learning (DiSCo sampling + knowledge distillation) | **Thay khi data > vài tháng** | HERO thực sự thay được retrain full. Cứ tiếp tục cumulative thì sau 6-12 tháng sẽ vỡ. Tuy nhiên HERO có thêm hyperparameter (replay size, distillation weight), nên chỉ bật khi data growth thực sự yêu cầu. |
+| Optimizer memory | AdamW + AMP + activation checkpointing | GaLore (gradient low-rank projection) hoặc ZeRO | **Tùy chọn cho cấu hình rộng** | Cấu hình baseline (hidden 128) không cần GaLore. Khi train GATransformer (hidden 256 / 6 layers) trên T4 15GB và OOM, mới cần GaLore rank=128. |
+| Schema / static knowledge | Tách static MITRE/tactic khỏi dynamic data | (Không có kỹ thuật mới tương ứng) | **Giữ cũ** | Đây vẫn là tối ưu rẻ và bắt buộc cho kiến trúc IDS này. |
+
+### 10.3 Kiến trúc tinh gọn tối ưu (Lean Optimal)
+
+Đây là cấu hình **ưu việt nhất cho project IDS hiện tại** theo các
+tiêu chí: thấp về độ phức tạp, cao về tỷ lệ lợi ích / chi phí, có thể
+triển khai trong 1-2 tuần.
+
+```text
++----------------------------------------------------------+
+|  TIER 1 - NỀN MÓNG (bắt buộc, giữ nguyên kỹ thuật cũ)    |
++----------------------------------------------------------+
+| 1. Persistent Graph Store on disk, sharding theo thời    |
+|    gian, retention 4-mức (mục 4).                        |
+| 2. Hot Graph Buffer write-through, TTL + max_events      |
+|    (mục 5).                                              |
+| 3. Slow Path đọc thẳng Persistent Store, không qua Hot   |
+|    Buffer (mục 6).                                       |
+| 4. Training đọc shard đã sealed qua memmap + Neighbor    |
+|    Sampler K-hop (mục 7).                                |
+| 5. Static knowledge MITRE/tactic luôn nằm trong RAM      |
+|    (mục 2.3).                                            |
++----------------------------------------------------------+
+
++----------------------------------------------------------+
+|  TIER 2 - TỐI ƯU RẺ (thêm ngay, lợi ích / chi phí cao)   |
++----------------------------------------------------------+
+| 6. SIGC ở Common Preprocessor: chỉ thêm 1 score = (out/  |
+|    in_degree_ratio) * decay(hop_distance). Cạnh dưới     |
+|    ngưỡng bị bỏ trước khi ghi store.                     |
+| 7. DLG-IDS Top-N edges ở subgraph builder: thay fanout   |
+|    cố định bằng chọn N cạnh có trọng số semantic cao     |
+|    nhất cho mỗi seed.                                    |
++----------------------------------------------------------+
+
++----------------------------------------------------------+
+|  TIER 3 - TỐI ƯU TÙY CHỌN (chỉ bật khi có triệu chứng)   |
++----------------------------------------------------------+
+| 8. BGML selective forgetting -> Triệu chứng: Hot Buffer  |
+|    churn > 80%, tỷ lệ evict / insert vượt 0.5.           |
+| 9. HERO continual learning -> Triệu chứng: test macro-F1 |
+|    giảm > 3% sau retraining full hoặc data lịch sử > 6   |
+|    tháng.                                                |
+|10. GaLore low-rank optimizer -> Triệu chứng: OOM khi     |
+|    train hidden_dim >= 256 trên GPU 15GB.                |
+|11. RapidStore multi-version backend -> Triệu chứng: I/O  |
+|    contention giữa writer runtime và reader training.    |
+|12. RTE cross-shard -> Triệu chứng: XAI cần lý giải chuỗi |
+|    tấn công dài (> 6h) và cosine similarity chuỗi không  |
+|    đủ phân biệt.                                         |
++----------------------------------------------------------+
+```
+
+Mặc định triển khai chỉ gồm **Tier 1 + Tier 2**. Tier 3 nằm trong
+backlog, mỗi mục có entry trong runbook với chỉ số đo lường cụ thể
+để biết khi nào cần kích hoạt.
+
+### 10.4 So sánh chi phí ba phương án
+
+Đánh giá định tính ba lựa chọn triển khai:
+
+| Tiêu chí | A. Chỉ giữ kỹ thuật cũ (Phase A-D) | B. Lean Optimal (Tier 1 + 2) | C. Full Stack (Tier 1 + 2 + 3) |
+|---|---|---|---|
+| Số module logic | ~5 | ~7 | ~12 |
+| Số hyperparameter cần tune | ~8 | ~12 | ~25 |
+| Effort triển khai | 1-2 tuần (đã thiết kế) | +1 tuần | +2-3 tuần thêm |
+| Effort vận hành | Tháp | Trung bình | Cao (cần dashboard cho từng kỹ thuật) |
+| Disk growth | Đúng theo retention | Giảm 30-50% (SIGC lọc cạnh trước khi ghi) | Như Lean Optimal (Tier 3 không động vào disk) |
+| Fast path latency | OK | Giảm 30-50% (DLG-IDS Top-N) | Giảm thêm 5-10% (BGML giảm cache lookup miss) |
+| Catastrophic Forgetting | Có rủi ro nếu retraining đè trực tiếp | Vẫn có rủi ro | Được giải quyết (HERO) |
+| Khả năng debug | Dễ | Dễ | Khó (nhiều tầng tương tác) |
+| Phù hợp với project hiện tại | Đủ tốt nhưng để lại tiềm năng | **Khuyến nghị** | Quá sức cho 1 đồ án |
+
+Phương án B (**Lean Optimal**) là điểm cân bằng tốt nhất giữa lợi ích
+ká»¹ thuật và độ phức tạp vận hành. Nó giữ toàn bộ ưu điểm của kiến trúc
+cũ (một nguồn sự thật, write-through, sealed-shard training) và chỉ
+thêm hai kỹ thuật mới (SIGC, DLG-IDS Top-N) - cả hai đều rẻ, có công
+thức rõ ràng, không phá vỡ luồng dữ liệu.
+
+### 10.5 Cấu hình tham khảo cho Lean Optimal
+
+```yaml
+# Phụ lục cho mục 12 (Cấu hình thống nhất mẫu). Chỉ bao gồm các trường
+# mới của Tier 2; các trường Tier 1 đã có sẵn ở mục 12.
+
+preprocessor:
+  sigc:
+    enabled: true
+    score_formula: "in_out_ratio * exp(-alpha * hop_distance)"
+    alpha: 0.4
+    min_score_to_keep_edge: 0.15
+    apply_to_edge_types:
+      - flow__contains__packet
+      - packet__next_packet__packet
+      - packet__matches_technique__technique
+
+subgraph_builder:
+  dlg_ids_top_n:
+    enabled: true
+    top_n_per_seed:
+      flow__contains__packet: 24
+      packet__next_packet__packet: 4
+      packet__matches_technique__technique: 5
+      flow__matches_technique__technique: 5
+    sort_by: semantic_edge_weight    # đã có trong manifest
+    fallback_to_random_when_tie: true
+
+# Tier 3 (default tắt). Bật khi có triệu chứng ở mục 10.3.
+hot_graph:
+  bgml_selective_forgetting:
+    enabled: false
+training:
+  hero_continual_learning:
+    enabled: false
+  galore:
+    enabled: false
+```
+
+Tinh thần: ngoại trừ hai block `sigc` và `dlg_ids_top_n` được bật mặc
+định, mọi kỹ thuật 2024-2026 khác đều `enabled: false` và chỉ kích
+hoạt khi runbook xác nhận triệu chứng đã xuất hiện.
+
+### 10.6 Bảng nguồn kỹ thuật 2024-2026
+
+Tham chiếu nhanh để khi báo cáo / bảo vệ đồ án có thể trích dẫn.
+
+| Kỹ thuật | Nguồn / Bài báo | Bản chất tóm gọn |
+|---|---|---|
+| SIGC | Structural Importance Graph Compression literature, 2025 | Score độ-bậc * suy giảm theo khoảng cách hop, loại cạnh dưới ngưỡng |
+| DLG-IDS | DLG-IDS for ICS, 2026 | Sparse topology + localized temporal attention, giảm 53% latency |
+| BGML | Graph Memory Learning, 2024-2025 | Quên có chọn lọc, lấy cảm hứng từ tháp khớp thần kinh |
+| HERO + DiSCo | HEterogeneous continual gRaph learning via meta-knOwledge distillation, 2025 | Replay subgraph + chưng cất tri thức để chống Catastrophic Forgetting |
+| GaLore | Gradient Low-Rank Projection, 2024-2025 | Chiếu gradient vào không gian low-rank, giảm 65% VRAM optimizer |
+| RapidStore | Dynamic graph storage systems, 2025 | Multi-version + decoupled R/W cho concurrent queries |
+| RTE | Heterogeneous Graph Transformer (Hu et al.) + dynamic graph variants | Sinusoid encoding của delta_t cho cross-shard temporal attention |
+
+## 11. Roadmap thực thi thống nhất
+
+Roadmap chia hai mảng: **Bắt buộc** (Tier 1 + Tier 2 trong mục 10.3)
+và **Tùy chọn theo triệu chứng** (Tier 3). Mặc định chỉ làm Bắt buộc;
+Tùy chọn chỉ kích hoạt khi runbook xác nhận triệu chứng.
+
+### Bắt buộc
+
+#### Phase A: Persistent Graph Store offline only
 
 ```text
 - Implement Graph Store layout + writer + reader (mục 4).
@@ -499,7 +693,7 @@ THAY ĐỔI:
 - Phase này không động đến runtime.
 ```
 
-### Phase B: Mini-batch training trên store
+#### Phase B: Mini-batch training trên store
 
 ```text
 - Implement NeighborLoader (đã đề xuất ở scalable_hgt_training_design_vi.md).
@@ -507,7 +701,7 @@ THAY ĐỔI:
 - Kéo dữ liệu test lên 5-10x để verify scale.
 ```
 
-### Phase C: Runtime ghi vào store
+#### Phase C: Runtime ghi vào store
 
 ```text
 - Refactor runtime preprocessor: ghi write-through Hot Buffer + Store.
@@ -516,23 +710,75 @@ THAY ĐỔI:
 - Bỏ JSONL cold_store nhỏ.
 ```
 
-### Phase D: Continuous training loop
+#### Phase D: Continuous training loop (đơn giản)
 
 ```text
 - Cron retraining đọc shard mới + validate + hot-swap.
 - Retention + compaction.
 - Alert khi disk/RAM gần ngưỡng.
+- KHÔNG bật HERO ở phase này. Retrain cumulative đơn giản đủ tốt
+  trong giai đoạn đầu, HERO chỉ kích hoạt ở Phase G nếu cần.
 ```
 
-### Phase E: tối ưu nâng cao
+#### Phase E: Tier 2 (SIGC + DLG-IDS Top-N)
 
 ```text
-- Distributed runtime ghi nhiều process / nhiều node.
-- WAL hoặc Kafka làm bộ đệm bền giữa preprocessor và store writer.
-- DDP training nhiều GPU đọc cùng store.
+- Thêm Local Contribution Score vào Common Preprocessor.
+  Drop cạnh dưới ngưỡng TRƯỚC khi ghi store.
+  -> Tiết kiệm disk + giảm số cạnh phải xử lý ở mọi tầng sau.
+- Thay fanout cố định trong subgraph_builder bằng DLG-IDS Top-N
+  per seed flow.
+  -> Mục tiêu đo: -30% inference latency, macro-F1 không giảm
+     quá 1%.
+- Hai thay đổi này độc lập, có thể release từng cái với A/B test.
 ```
 
-## 11. Cấu hình thống nhất mẫu
+### Tùy chọn (chỉ làm khi có triệu chứng)
+
+#### Phase F: BGML selective forgetting (nếu Hot Buffer churn cao)
+
+```text
+Triệu chứng kích hoạt:
+  - Tỷ lệ evict/insert ở Hot Buffer > 0.5 trong 24h.
+  - Hoặc CPU bị nghẽn vì traverse các cạnh nháp đã quá hạn.
+
+Hành động:
+  - Thêm Forgetting Request queue song song với write-through.
+  - Verified-benign events (whitelist signature) -> drop khỏi Hot
+    Buffer ngay, không chờ TTL.
+  - Giữ shadow log nhỏ để đo tỷ lệ false-forgetting.
+```
+
+#### Phase G: HERO continual learning (nếu Catastrophic Forgetting xuất hiện)
+
+```text
+Triệu chứng kích hoạt:
+  - Test macro-F1 trên các attack family cũ giảm > 3% sau retraining.
+  - Hoặc data lịch sử đã > 6 tháng và cumulative retrain bắt đầu
+    quá dài / quá tốn VRAM.
+
+Hành động:
+  - Implement DiSCo sampler: trích Top-K subgraph đại diện theo
+    meta-path từ shard sealed.
+  - Thêm knowledge distillation loss (teacher = checkpoint trước).
+  - Cron retraining: replay subgraphs + dữ liệu mới -> validate
+    bằng cách so accuracy trên cả task cũ và task mới trước khi
+    hot-swap.
+```
+
+#### Phase H: Tối ưu phần cứng & phân tán
+
+```text
+Triệu chứng kích hoạt:
+  - OOM khi train hidden_dim >= 256 trên GPU 15GB -> bật GaLore
+    rank=128, update_proj_gap=200.
+  - I/O contention giữa runtime writer và training reader -> đánh
+    giá RapidStore-style multi-version graph store.
+  - Nhu cầu xử lý nhiều node/process -> Distributed runtime, WAL
+    hoặc Kafka làm bộ đệm bền, DDP training nhiều GPU đọc cùng store.
+```
+
+## 12. Cấu hình thống nhất mẫu
 
 ```yaml
 graph_store:
@@ -581,7 +827,7 @@ training:
     always_include_all_tactics: true
 ```
 
-## 12. Cách viết trong báo cáo
+## 13. Cách viết trong báo cáo
 
 ```text
 Cả runtime online và offline training đều đối mặt với cùng một vấn đề: graph
@@ -599,9 +845,27 @@ thống nhất này, không lúc nào hệ thống cần load toàn bộ graph v
 thời tránh được việc duy trì hai store song song dễ lệch dữ liệu. Static
 knowledge gồm 691 MITRE technique embedding và 14 tactic vẫn được giữ thường
 trực trong RAM ở mọi tầng vì kích thước nhỏ.
+
+Để khống chế thêm hiện tượng Graph Bloating theo cập nhật nghiên cứu 2024-2026,
+hệ thống áp dụng phương án Lean Optimal: giữ nguyên kiến trúc cũ (Persistent
+Graph Store + Hot Buffer write-through + sealed-shard training) làm nền móng
+bắt buộc, và chỉ thêm hai tối ưu rẻ. Thứ nhất, Structural Importance Graph
+Compression (SIGC) đặt ở Common Preprocessor tính Local Contribution Score
+cho mỗi cạnh theo tỷ lệ bán bậc và suy giảm theo khoảng cách hop, loại bỏ
+cạnh dư thừa trước khi ghi xuống store, giúp giảm đáng kể disk growth. Thứ
+hai, DLG-IDS Top-N edge selection thay thế chiến lược fanout cố định trong
+subgraph builder bằng cách chỉ giữ N cạnh có trọng số semantic cao nhất cho
+mỗi seed flow, cho phép giảm 30-50% inference latency mà không suy giảm
+macro-F1. Các kỹ thuật tinh vi hơn (BGML selective forgetting, HERO continual
+learning với DiSCo + knowledge distillation, GaLore low-rank optimizer,
+RapidStore multi-version backend, RTE cross-shard temporal encoding) được
+giữ trong backlog Tier 3 với điều kiện kích hoạt rõ ràng - chỉ triển khai
+khi runbook phát hiện đúng triệu chứng (Catastrophic Forgetting, Hot Buffer
+churn, OOM khi train rộng, hay I/O contention). Cách tiếp cận tầng này tránh
+được vừa rủi ro phình to dữ liệu vừa rủi ro phình to độ phức tạp hệ thống.
 ```
 
-## 13. Bảng quan hệ ba tài liệu
+## 14. Bảng quan hệ ba tài liệu
 
 ```text
 streaming_hgt_runtime_v3_vi.md
@@ -624,6 +888,10 @@ unified_graph_growth_strategy_vi.md (tài liệu này)
   -> Slow path đọc thẳng store.
   -> Training đọc shard sealed.
   -> Schema và retention thống nhất.
+  -> Lean Optimal: GIỮ nguyên kiến trúc cũ (Tier 1), thêm SIGC +
+     DLG-IDS Top-N (Tier 2) làm tối ưu rẻ.
+  -> Kỹ thuật 2024-2026 còn lại (BGML, HERO, GaLore, RapidStore,
+     RTE) là Tier 3 - chỉ bật khi runbook xác nhận triệu chứng.
 ```
 
 Đọc theo thứ tự: doc này trước (kiến trúc tổng), rồi hai doc còn lại cho chi

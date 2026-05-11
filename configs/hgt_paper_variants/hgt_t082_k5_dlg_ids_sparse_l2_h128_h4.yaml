@@ -1,0 +1,75 @@
+# Source: DLG-IDS (Dynamic Graph and LLM-Semantic Enhanced Spatiotemporal
+# GNN for Lightweight Intrusion Detection in Industrial Control Systems),
+# 2026.
+# Inspired config: shallow 2-layer HGT designed for ICS edge devices where
+# both VRAM and bandwidth are scarce. The original paper reports a 53.2%
+# inference latency reduction at ~0.986 accuracy on SWaT/SBFF by combining
+# sparse topology modeling (drop edges with low Local Contribution Score)
+# with localized temporal attention. Even when forced to 60% edge sparsity,
+# the model still keeps ~80% of the original representation power.
+# Local approximation: we trim sampler fanouts to encourage sparsity, set
+# num_layers=2 to keep K-hop bounded, and bump dropout slightly to compensate
+# for the smaller receptive field. The LCS-based pruning module itself is
+# upstream (subgraph_builder), not part of this training script.
+experiment:
+  source_name: "DLG-IDS Sparse Spatio-Temporal (HGT backbone)"
+  citation_hint: "DLG-IDS: Dynamic Graph and LLM-Semantic Enhanced Spatiotemporal GNN for Lightweight Intrusion Detection in Industrial Control Systems, 2026"
+  rationale: "Test a sparse-friendly 2-layer / 128-hidden / 4-head HGT with tighter fanouts to validate the latency/accuracy trade-off reported by DLG-IDS when the runtime subgraph builder is dropping low-contribution edges."
+
+data:
+  source: graph_store
+  graph_npz: data/processed/graph_artifact_3tier_t082_k5.npz
+  graph_meta_json: data/processed/graph_artifact_3tier_t082_k5.meta.json
+  graph_store_root: data/graph_store_v1
+  read_sealed_only: true
+  packet_feature: semantic
+  add_reverse_edges: true
+  standardize_flow_features: true
+  use_semantic_edge_weights: true
+
+model:
+  hidden_dim: 128
+  num_layers: 2
+  num_heads: 4
+  dropout: 0.2
+  ffn_multiplier: 2
+
+train:
+  output_dir: outputs/hgt_paper_variants/dlg_ids_sparse_l2_h128_h4
+  epochs: 150
+  batch_mode: neighbor_sampling
+  batch_seed_flows: 256
+  grad_accum_steps: 2
+  lr: 0.001
+  weight_decay: 0.00005
+  val_ratio: 0.1
+  test_ratio: 0.1
+  patience: 30
+  class_weight: balanced
+  seed: 42
+  device: cuda
+  monitor: val_macro_f1
+  log_every: 1
+  amp: true
+  activation_checkpointing: true
+
+sampler:
+  hops: 2
+  fanouts:
+    flow__contains__packet: 10
+    packet__next_packet__packet: 2
+    packet__matches_technique__technique: 3
+    flow__matches_technique__technique: 3
+    technique__belongs_to_tactic__tactic: 1
+  reverse_fanouts:
+    rev_contains: 1
+    rev_next_packet: 0
+    rev_matches_technique: 0
+    rev_belongs_to_tactic: 0
+  always_include_all_tactics: true
+  always_include_all_techniques: false
+
+dataloader:
+  num_workers: 2
+  prefetch_factor: 2
+  pin_memory: true
