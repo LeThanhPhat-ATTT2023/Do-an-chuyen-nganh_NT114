@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import re
+import sys
 from typing import Iterable
 
 import numpy as np
@@ -26,14 +28,49 @@ class PacketRecord:
     payload_256: np.ndarray
 
 
+# Generic container folder names that are NOT traffic-class labels.
+_CONTAINER_DIRS: frozenset[str] = frozenset({"raw", "data", "pcap", "pcaps", "dataset"})
+
+# Remap folder names that need cleanup (folder → canonical label).
+_LABEL_NORMALIZE: dict[str, str] = {
+    "Benign_Final": "Benign",
+}
+
+# Strip trailing " - N" or "-N" numbering appended to multi-file stems.
+_SUFFIX_RE = re.compile(r"\s*-\s*\d+$")
+
+
 def infer_label_from_path(pcap_path: Path) -> str:
-    """Infer a coarse label from a file name prefix."""
-    stem = pcap_path.stem
-    if "-" in stem:
-        return stem.split("-")[0]
-    if "_" in stem:
-        return stem.split("_")[0]
-    return stem
+    """Derive the traffic-class label for a PCAP file.
+
+    Two layouts are supported:
+
+    1. Class subdir  — file lives inside a class-specific folder:
+         data/raw/<ClassName>/<ClassName> - <N>.pcap
+       → label = folder name  (possibly normalised via _LABEL_NORMALIZE)
+
+    2. Flat layout   — file sits directly in a container folder (raw, data …):
+         data/raw/<ClassName>.pcap
+         data/raw/<ClassName> - <N>.pcap
+       → label = stem with trailing " - N" stripped
+
+    Examples:
+        raw/DDoS-ACK_Fragmentation/DDoS-ACK_Fragmentation - 1.pcap  → DDoS-ACK_Fragmentation
+        raw/DDoS-RSTFINFlood/DDoS-RSTFINFlood - 3.pcap              → DDoS-RSTFINFlood
+        raw/Benign_Final/BenignTraffic - 1.pcap                      → Benign
+        raw/Mirai-udpplain/Mirai-udpplain - 2.pcap                   → Mirai-udpplain
+        raw/DDoS-SlowLoris.pcap                                       → DDoS-SlowLoris
+        raw/Recon-HostDiscovery.pcap                                  → Recon-HostDiscovery
+        raw/Uploading_Attack.pcap                                     → Uploading_Attack
+        raw/Backdoor_Malware.pcap                                     → Backdoor_Malware
+    """
+    folder = pcap_path.parent.name
+    if folder.lower() in _CONTAINER_DIRS:
+        # Flat layout: use stem as-is (strip only trailing numbering).
+        label = _SUFFIX_RE.sub("", pcap_path.stem).strip()
+        return _LABEL_NORMALIZE.get(label, label)
+    # Subdir layout: folder name is the ground-truth class.
+    return _LABEL_NORMALIZE.get(folder, folder)
 
 
 def truncate_and_pad_payload(payload: bytes, payload_length: int = 256) -> np.ndarray:
@@ -51,10 +88,12 @@ def extract_packet_records(
     payload_length: int = 256,
     max_packets: int | None = None,
     include_empty_payload: bool = False,
+    log_every: int | None = None,
 ) -> list[PacketRecord]:
     """Extract packet metadata and fixed-size payload vectors from a PCAP file."""
     label = infer_label_from_path(pcap_path)
     records: list[PacketRecord] = []
+    extracted_count = 0
 
     with PcapReader(str(pcap_path)) as reader:
         for packet_index, packet in enumerate(reader):
@@ -97,6 +136,15 @@ def extract_packet_records(
                     payload_256=truncate_and_pad_payload(raw_payload, payload_length=payload_length),
                 )
             )
+            extracted_count += 1
+
+            if log_every and log_every > 0 and (packet_index + 1) % log_every == 0:
+                print(
+                    f"[PROGRESS] {pcap_path.name}: seen {packet_index + 1} packets, "
+                    f"extracted {extracted_count}",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
     return records
 
@@ -106,6 +154,7 @@ def build_payload_dataset(
     payload_length: int = 256,
     max_packets_per_file: int | None = None,
     include_empty_payload: bool = False,
+    log_every: int | None = None,
 ) -> tuple[np.ndarray, pd.DataFrame]:
     """Build a matrix of payload vectors and aligned metadata rows from many PCAP files."""
     payload_rows: list[np.ndarray] = []
@@ -117,6 +166,7 @@ def build_payload_dataset(
             payload_length=payload_length,
             max_packets=max_packets_per_file,
             include_empty_payload=include_empty_payload,
+            log_every=log_every,
         )
 
         for record in records:
