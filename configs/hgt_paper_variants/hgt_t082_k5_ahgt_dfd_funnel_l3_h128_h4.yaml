@@ -36,7 +36,7 @@ model:
 
 train:
   output_dir: outputs/hgt_paper_variants/ahgt_dfd_funnel_l3_h128_h4
-  epochs: 150
+  epochs: 200
   batch_mode: neighbor_sampling
   batch_seed_flows: 256
   grad_accum_steps: 4

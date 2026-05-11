@@ -33,7 +33,7 @@ model:
 
 train:
   output_dir: outputs/hgt_paper_variants/one2_iov_l1_h64_h2
-  epochs: 150
+  epochs: 200
   batch_mode: neighbor_sampling
   batch_seed_flows: 128
   grad_accum_steps: 1
