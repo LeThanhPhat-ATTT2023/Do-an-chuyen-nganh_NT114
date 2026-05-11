@@ -1,8 +1,9 @@
 # Source: XG-NID Dual-Modality NID with HGT + LLM, 2024-2026.
 # Inspired config: very compact 1-layer HGT with hidden_dim 32 and 4 heads.
 # The paper uses 30 epochs (with early convergence around epoch 5 in their
-# loss curves) and a batch size of 70, mainly because the dual-modality
-# (flow stats + raw packet payload bytes) inflates per-batch VRAM footprint.
+# loss curves), but local comparison fixes all HGT variants at 200 epochs for
+# a uniform training budget. Batch size remains 70 because the dual-modality
+# setup inflates per-batch VRAM footprint.
 # Note: this local model does not implement the LLM-fusion XAI head, so this
 # config only mirrors the HGT backbone capacity and training schedule.
 experiment:
@@ -30,7 +31,7 @@ model:
 
 train:
   output_dir: outputs/hgt_paper_variants/xgnid_dual_modal_l1_h32_h4
-  epochs: 30
+  epochs: 200
   batch_mode: neighbor_sampling
   batch_seed_flows: 70
   grad_accum_steps: 1

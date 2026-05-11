@@ -53,6 +53,7 @@ data:
   read_sealed_only: true
 
 train:
+  epochs: 200
   batch_mode: neighbor_sampling
 ```
 
@@ -106,6 +107,11 @@ graphslm-train-hgt --config "configs/hgt_paper_variants/hgt_t082_k5_dlg_ids_spar
 Train trên Kaggle dùng:
 
 ```text
-notebooks/train_hgt_2024_variants_kaggle.py
-notebooks/train_hgt_paper_variants_kaggle.ipynb
+notebooks/train_hgt_existing_graph_pipeline_kaggle.ipynb
+notebooks/train_hgt_official_full_pipeline_kaggle.ipynb
 ```
+
+Trong đó:
+
+- `train_hgt_official_full_pipeline_kaggle.ipynb`: luồng thực thi chính thức cho retrain sau này, từ PCAP đến graph 3 tầng, convert mmap/CSR rồi train HGT.
+- `train_hgt_existing_graph_pipeline_kaggle.ipynb`: luồng train khi đã có sẵn `graph_artifact_3tier_t082_k5.npz` và `.meta.json`, bỏ qua teacher/student/graph rebuild, chỉ convert sang mmap/CSR rồi train HGT.

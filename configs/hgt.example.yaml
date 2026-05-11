@@ -25,7 +25,7 @@ model:
 
 train:
   output_dir: outputs/hgt_flow_classifier_t082_k5_l3_d01
-  epochs: 150
+  epochs: 200
   # "neighbor_sampling" = mini-batch (required for large graphs)
   # "full"              = full-graph training (OOM on large graphs)
   batch_mode: neighbor_sampling

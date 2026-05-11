@@ -651,7 +651,7 @@ train:
   batch_mode: neighbor_sampling
   batch_seed_flows: 256
   grad_accum_steps: 4
-  epochs: 150
+  epochs: 200
   lr: 0.001
   weight_decay: 0.00005
   class_weight: balanced
