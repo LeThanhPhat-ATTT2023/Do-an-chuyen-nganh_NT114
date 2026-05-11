@@ -1,0 +1,72 @@
+# Source: One^2 IDS for Internal/External Vehicular Networks (IoV), 2025-2026.
+# Inspired config: ultra-minimal HGT for edge-deployed real-time IDS.
+# Original paper uses 1 HGT layer, hidden_dim 64, 2 heads, LR=0.01, batch=128
+# to keep per-packet inference latency around 0.75 ms on automotive embedded
+# hardware. The aggressive 1-layer depth is deliberate: most IoV intrusions
+# (CAN-bus injection, lateral control commands) are 1-hop neighborhood signals,
+# so deeper HGTs add cost without lifting accuracy and risk over-smoothing.
+# Note: this local trainer uses AdamW with a constant LR; the original LR=0.01
+# is kept here as documented, but in practice you may want to lower it if the
+# loss diverges on the IDS three-tier graph (different label imbalance).
+experiment:
+  source_name: "One^2 IDS (IoV, weak-labeled vehicular HGT)"
+  citation_hint: "One^2: An Intrusion Detection System for Both Internal and External Vehicular Network from Weak Labeled Data, 2025"
+  rationale: "Test an ultra-shallow 1-layer / 64-hidden / 2-head HGT to verify whether minimum-depth attention is enough on the IDS three-tier graph for low-latency edge inference."
+
+data:
+  source: graph_store
+  graph_npz: data/processed/graph_artifact_3tier_t082_k5.npz
+  graph_meta_json: data/processed/graph_artifact_3tier_t082_k5.meta.json
+  graph_store_root: data/graph_store_v1
+  read_sealed_only: true
+  packet_feature: semantic
+  add_reverse_edges: true
+  standardize_flow_features: true
+  use_semantic_edge_weights: true
+
+model:
+  hidden_dim: 64
+  num_layers: 1
+  num_heads: 2
+  dropout: 0.1
+  ffn_multiplier: 2
+
+train:
+  output_dir: outputs/hgt_paper_variants/one2_iov_l1_h64_h2
+  epochs: 150
+  batch_mode: neighbor_sampling
+  batch_seed_flows: 128
+  grad_accum_steps: 1
+  lr: 0.01
+  weight_decay: 0.00005
+  val_ratio: 0.1
+  test_ratio: 0.1
+  patience: 30
+  class_weight: balanced
+  seed: 42
+  device: cuda
+  monitor: val_macro_f1
+  log_every: 1
+  amp: true
+  activation_checkpointing: false
+
+sampler:
+  hops: 1
+  fanouts:
+    flow__contains__packet: 12
+    packet__next_packet__packet: 2
+    packet__matches_technique__technique: 3
+    flow__matches_technique__technique: 3
+    technique__belongs_to_tactic__tactic: 1
+  reverse_fanouts:
+    rev_contains: 1
+    rev_next_packet: 0
+    rev_matches_technique: 0
+    rev_belongs_to_tactic: 0
+  always_include_all_tactics: true
+  always_include_all_techniques: false
+
+dataloader:
+  num_workers: 2
+  prefetch_factor: 2
+  pin_memory: true

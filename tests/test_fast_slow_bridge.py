@@ -11,6 +11,8 @@ from graphslm_ids.fast_path import (
     MitreIndex,
     PayloadExtractor,
     PolicyEngine,
+    SigcEdgeFilter,
+    SigcEdgeFilterConfig,
     SubgraphBuilder,
 )
 from graphslm_ids.runtime import ColdStore, PipelineConfig
@@ -117,6 +119,55 @@ def test_subgraph_builder_produces_hgt_snapshot() -> None:
     assert "packet__matches_technique__technique" in snapshot["edge_index"]
 
 
+def test_subgraph_builder_dlg_top_n_keeps_highest_semantic_packets() -> None:
+    buffer = _buffer_with_packet()
+    buffer.add_packet(
+        packet_id="pkt_2",
+        flow_id="flow_1",
+        embedding=np.asarray([0.0, 1.0, 0.0, 0.0], dtype=np.float32),
+        payload_hex="504f5354",
+        payload_ascii="POST",
+        payload_len_raw=4,
+        timestamp=2.0,
+        src_ip="192.168.1.10",
+        dst_ip="10.0.0.5",
+        src_port=51522,
+        dst_port=80,
+        protocol="TCP",
+        mitre_topk=[("T1002", 0.99)],
+    )
+
+    subgraph = SubgraphBuilder(
+        buffer,
+        protocol_mapping={"TCP": 1},
+        dlg_top_n_enabled=True,
+        dlg_top_n_per_seed={
+            "flow__contains__packet": 1,
+            "packet__matches_technique__technique": 1,
+            "flow__matches_technique__technique": 1,
+        },
+    ).build("flow_1")
+
+    assert subgraph.packet_local_to_id == {0: "pkt_2"}
+    assert subgraph.technique_local_to_id == {0: "T1002"}
+    assert subgraph.edge_index_dict[("flow", "contains", "packet")].shape[1] == 1
+
+
+def test_sigc_filter_drops_low_contribution_mitre_edges() -> None:
+    edge_filter = SigcEdgeFilter(
+        SigcEdgeFilterConfig(
+            enabled=True,
+            alpha=0.0,
+            min_score_to_keep_edge=0.5,
+            apply_to_edge_types=("packet__matches_technique__technique",),
+        )
+    )
+
+    assert edge_filter.filter_mitre_topk([("T1001", 0.9), ("T1002", 0.1)]) == [
+        ("T1001", 0.9)
+    ]
+
+
 def test_policy_dispatcher_and_cold_store_round_trip(tmp_path) -> None:
     buffer = _buffer_with_packet()
     subgraph = SubgraphBuilder(buffer, protocol_mapping={"TCP": 1}).build("flow_1")
@@ -149,6 +200,9 @@ def test_pipeline_config_reads_existing_example() -> None:
     cfg = PipelineConfig.from_yaml("configs/pipeline.example.yaml")
 
     assert cfg.fast_path.payload_length == 256
+    assert cfg.preprocessor.sigc.enabled is True
+    assert cfg.subgraph_builder.dlg_ids_top_n.enabled is True
+    assert cfg.graph_store.root == "data/graph_store_v1"
     assert cfg.hgt.checkpoint.endswith("hgt_flow_best.pt")
     assert cfg.slow_path.queue_max_size == 1000
     assert cfg.cold_store_path == "data/runtime/events.jsonl"

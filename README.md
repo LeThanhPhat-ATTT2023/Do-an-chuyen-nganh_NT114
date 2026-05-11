@@ -36,11 +36,14 @@ Repo hiện có đầy đủ mã nguồn cho:
 - Export student sang ONNX cho online inference.
 - Sinh embedding MITRE technique và cạnh technique-tactic.
 - Xây graph dị thể gồm `flow`, `packet`, `technique`, `tactic`.
-- Huấn luyện HGT flow classifier.
+- Huấn luyện HGT flow classifier với hai chế độ: `full` (full-graph, nhỏ) và `neighbor_sampling` (mini-batch BFS, scale với graph lớn).
+- On-disk CSR graph store (`OnDiskHeteroGraphStore`) đọc qua memory-mapped file — không cần load toàn bộ graph vào RAM.
 - Runtime replay PCAP qua fast path.
-- Hot graph buffer, policy engine, alert dispatcher, cold store.
+- `PersistentGraphStore`: append-only source of truth cho runtime/training/slow path.
+- Hot graph buffer chỉ còn là cache RAM cho fast path; JSONL `ColdStore` chỉ là fallback khi tắt `graph_store`.
+- SIGC edge filter và DLG-IDS Top-N subgraph selection theo thiết kế Lean Optimal.
 - Slow path tạo evidence bundle, gọi SLM qua Ollama, validate grounding và fallback report.
-- Unit test cho graph builders, HGT, payload extractor, fast-slow bridge và slow path.
+- Unit test cho graph builders, HGT, neighbor sampling, on-disk store, persistent graph store, payload extractor, fast-slow bridge và slow path.
 
 Baseline artifact đang dùng trong workspace local:
 
@@ -125,13 +128,15 @@ Packet stream
   -> online PayloadExtractor
   -> StudentRuntime ONNX
   -> MitreIndex top-k
-  -> HotGraphBuffer
-  -> SubgraphBuilder
+  -> SIGC edge filter
+  -> PersistentGraphStore (write-through source of truth)
+  -> HotGraphBuffer cache
+  -> SubgraphBuilder + DLG-IDS Top-N
   -> HGTRuntime
   -> PolicyEngine
   -> AlertDispatcher
   -> SlowPathWorker
-  -> XAI report + cold store
+  -> XAI report + graph store
 ```
 
 Các module chính:
@@ -141,10 +146,9 @@ Các module chính:
 | `graphslm_ids.offline_path.preprocessing` | Chuẩn bị dataset, MITRE KB, teacher target, graph artifact |
 | `graphslm_ids.offline_path.training` | Train/evaluate/export student và train HGT |
 | `graphslm_ids.models` | Mô hình `StudentCNN` và `HeteroGraphTransformer` |
-| `graphslm_ids.fast_path` | Data plane online: flow tracking, ONNX inference, MITRE index, hot graph, policy |
-| `graphslm_ids.runtime` | Control plane: config loader, pipeline orchestrator, cold store, counterfactual |
+| `graphslm_ids.fast_path` | Data plane online: flow tracking, ONNX inference, MITRE index, SIGC, hot graph, Top-N subgraph, policy |
+| `graphslm_ids.runtime` | Control plane: config loader, pipeline orchestrator, persistent graph store, cold-store fallback, counterfactual |
 | `graphslm_ids.slow_path` | Evidence builder, ranker, SLM report generator, validator, fallback report |
-| `graphslm_ids.data` | Compatibility wrappers cho các import cũ |
 
 ## Cấu Trúc Thư Mục
 
@@ -173,7 +177,6 @@ Các module chính:
 |   |-- hgt_flow_classifier_t082_k5_l3_d01/
 |   `-- student_cnn/
 |-- src/graphslm_ids/
-|   |-- data/
 |   |-- fast_path/
 |   |-- models/
 |   |-- offline_path/
@@ -262,12 +265,12 @@ graphslm-run-runtime `
   --no-worker
 ```
 
-Kết quả sẽ in số packet đã xử lý, số alert và đường dẫn cold store. Dòng `[ALERT]` chỉ xuất hiện khi label dự đoán nằm trong `policy.alert_labels` và confidence vượt `policy.alert_threshold`:
+Kết quả sẽ in số packet đã xử lý, số alert và đường dẫn graph store. Dòng `[ALERT]` xuất hiện khi label dự đoán không nằm trong `policy.benign_labels` (hoặc nằm trong `policy.alert_labels` nếu bạn cấu hình whitelist) và confidence vượt `policy.alert_threshold`:
 
 ```text
 [ALERT] ...
 [OK] Processed packets=<n> alerts=<m>
-[OK] Cold store: data/runtime/events.jsonl
+[OK] Graph store: data/graph_store_v1
 ```
 
 Nếu fresh clone chưa có artifact, hãy chạy pipeline offline ở phần tiếp theo trước.
@@ -496,6 +499,29 @@ Graph này có các loại cạnh chính:
 
 ### 10. Train HGT flow classifier
 
+Với graph lớn (hàng chục nghìn flow, hàng trăm nghìn packet), cần chuyển NPZ sang on-disk CSR store trước để tránh OOM khi load toàn bộ graph vào RAM:
+
+```powershell
+graphslm-convert-graph-store `
+  --graph-npz "data/processed/graph_artifact_3tier_t082_k5.npz" `
+  --graph-meta-json "data/processed/graph_artifact_3tier_t082_k5.meta.json" `
+  --output-root "data/graph_store_v1"
+```
+
+Output:
+
+```text
+data/graph_store_v1/manifest.json
+data/graph_store_v1/nodes/flow/features.f32
+data/graph_store_v1/nodes/flow/labels.i64
+data/graph_store_v1/edges/<edge_name>/indptr.i64
+data/graph_store_v1/edges/<edge_name>/indices.i64
+data/graph_store_v1/edges/<edge_name>/attr.f32
+data/graph_store_v1/splits/train_flow_ids.i64
+```
+
+Bước này chỉ cần làm một lần. Sau đó train với `source: graph_store` và `batch_mode: neighbor_sampling` (mặc định trong `hgt.example.yaml`), toàn bộ graph sẽ được đọc qua memory-mapped file — không load đầy vào RAM:
+
 Cấu hình baseline:
 
 ```text
@@ -596,12 +622,16 @@ Nếu không muốn gọi SLM khi smoke test, dùng `--no-worker`.
 
 ## Cấu Hình Quan Trọng
 
-### `configs/hgt_t082_k5_l3_d01.yaml`
+### `configs/hgt_t082_k5_l3_d01.yaml` / `configs/hgt.example.yaml`
 
-Điều khiển bước train HGT:
+Điều khiển bước train HGT. Các key quan trọng:
 
 ```yaml
 data:
+  # "graph_store" = mmap CSR (khuyến nghị, không load toàn bộ graph vào RAM)
+  # "npz"         = load NPZ đầy vào RAM (chỉ dùng khi graph nhỏ)
+  source: graph_store
+  graph_store_root: data/graph_store_v1
   graph_npz: data/processed/graph_artifact_3tier_t082_k5.npz
   graph_meta_json: data/processed/graph_artifact_3tier_t082_k5.meta.json
   packet_feature: semantic
@@ -616,11 +646,26 @@ model:
   dropout: 0.1
 
 train:
+  # "neighbor_sampling" = mini-batch BFS, bắt buộc khi graph lớn
+  # "full"              = full-graph (OOM với graph lớn)
+  batch_mode: neighbor_sampling
+  batch_seed_flows: 256
+  grad_accum_steps: 4
   epochs: 150
   lr: 0.001
   weight_decay: 0.00005
   class_weight: balanced
   monitor: val_macro_f1
+
+sampler:
+  fanouts:
+    flow__contains__packet: 20
+    packet__next_packet__packet: 4
+    packet__matches_technique__technique: 5
+    flow__matches_technique__technique: 5
+    technique__belongs_to_tactic__tactic: 1
+  always_include_all_tactics: true
+  always_include_all_techniques: true
 ```
 
 ### `configs/pipeline.example.yaml`
@@ -634,15 +679,18 @@ train:
 | `mitre` | Đường dẫn MITRE CSV/embedding và ngưỡng similarity |
 | `fast_path` | Student ONNX, MITRE top-k, payload length |
 | `hot_graph` | TTL, giới hạn packet/flow/event trong RAM |
+| `preprocessor` | SIGC Local Contribution Score, lọc cạnh yếu trước khi ghi store |
+| `graph_store` | Persistent Graph Store, shard seal, retention, disk quota |
+| `subgraph_builder` | DLG-IDS Top-N edge selection cho K-hop runtime subgraph |
 | `hgt` | Tham số train HGT |
 | `hgt_runtime` | Checkpoint và meta dùng khi inference |
 | `policy` | Alert threshold và các label được xem là alert |
 | `slow_path` | Queue, số evidence top-k, counterfactual |
-| `cold_store` | File JSONL lưu snapshot/report |
+| `cold_store` | Fallback JSONL khi `graph_store.enabled: false` |
 | `slm` | Backend/model sinh báo cáo |
 | `validator` | Ngưỡng kiểm tra grounding/hallucination |
 
-Lưu ý quan trọng: `policy.alert_labels` phải khớp tên nhãn mà checkpoint HGT trả về. Với baseline hiện tại, các nhãn là `Backdoor`, `BrowserHijacking`, `CommandInjection`, `DDoS`, `Recon`, `SqlInjection`, `Uploading`, `VulnerabilityScan`, `XSS`. Nếu config vẫn để nhãn generic như `suspicious` hoặc `malicious`, runtime có thể xử lý packet bình thường nhưng không dispatch alert.
+Lưu ý quan trọng: mặc định nên dùng `policy.benign_labels`. Bất kỳ nhãn nào không nằm trong danh sách benign và vượt threshold sẽ bắn alert. Chỉ dùng `policy.alert_labels` khi muốn whitelist chính xác các nhãn cần alert. Với baseline hiện tại, các nhãn tấn công là `Backdoor`, `BrowserHijacking`, `CommandInjection`, `DDoS`, `Recon`, `SqlInjection`, `Uploading`, `VulnerabilityScan`, `XSS`.
 
 ## Console Scripts
 
@@ -661,6 +709,7 @@ Các lệnh được khai báo trong `pyproject.toml`:
 | `graphslm-export-student-onnx` | `offline_path.training.export_student_onnx` | Export student sang ONNX |
 | `graphslm-export-student-emb` | `offline_path.training.export_student_embeddings` | Export student embeddings |
 | `graphslm-train-hgt` | `offline_path.training.train_hgt_flow_classifier` | Train HGT classifier |
+| `graphslm-convert-graph-store` | `offline_path.training.on_disk_graph_store` | Chuyển NPZ graph sang on-disk CSR store (cần chạy một lần trước khi train với `source: graph_store`) |
 | `graphslm-run-runtime` | `runtime.run_runtime_pipeline` | Replay PCAP qua runtime pipeline |
 
 ## Kiểm Thử
@@ -677,6 +726,9 @@ Chạy nhóm test chính:
 pytest tests/test_payload_extractor.py
 pytest tests/test_graph_artifact_builder.py tests/test_three_tier_graph_artifact.py
 pytest tests/test_hgt_model.py
+pytest tests/test_hgt_neighbor_sampling.py
+pytest tests/test_on_disk_graph_store_training.py
+pytest tests/test_persistent_graph_store.py
 pytest tests/test_fast_slow_bridge.py tests/test_slow_path.py
 ```
 
@@ -696,7 +748,8 @@ Các thư mục dữ liệu được dùng theo quy ước:
 | `data/interim/` | Dataset trung gian, ví dụ `payload_256.npy`, `metadata.csv` |
 | `data/processed/` | Teacher targets, student embeddings, graph artifact |
 | `data/mitre/` | MITRE STIX JSON, CSV và technique embeddings |
-| `data/runtime/` | Cold store JSONL sinh khi chạy runtime |
+| `data/runtime/` | Fallback cold store JSONL khi tắt `graph_store` |
+| `data/graph_store_v1/` | Persistent Graph Store runtime/training |
 | `outputs/student_cnn/` | Checkpoint/evaluation/ONNX của student |
 | `outputs/hgt_flow_classifier_t082_k5_l3_d01/` | Checkpoint và training summary HGT baseline |
 
@@ -776,22 +829,39 @@ Hoặc chạy runtime với `--no-worker` để bỏ qua slow path.
 
 ### Runtime chạy nhưng không có alert
 
-Kiểm tra `policy.alert_labels` trong `configs/pipeline.example.yaml`. Các nhãn này phải trùng với label trong checkpoint HGT. Với baseline hiện tại, có thể dùng ví dụ:
+Kiểm tra `policy.benign_labels` và `policy.alert_labels` trong `configs/pipeline.example.yaml`. Mặc định chỉ cần cấu hình benign:
 
 ```yaml
 policy:
   alert_threshold: 0.70
-  alert_labels:
-    - Backdoor
-    - BrowserHijacking
-    - CommandInjection
-    - DDoS
-    - Recon
-    - SqlInjection
-    - Uploading
-    - VulnerabilityScan
-    - XSS
+  benign_labels:
+    - Benign
 ```
+
+Nếu bật `alert_labels`, danh sách đó trở thành whitelist và phải khớp chính xác label trong checkpoint HGT.
+
+### OOM khi train HGT (graph quá lớn để load vào RAM)
+
+Dùng on-disk CSR store thay vì load NPZ trực tiếp. Chạy một lần:
+
+```powershell
+graphslm-convert-graph-store `
+  --graph-npz "data/processed/graph_artifact_3tier_t082_k5.npz" `
+  --graph-meta-json "data/processed/graph_artifact_3tier_t082_k5.meta.json" `
+  --output-root "data/graph_store_v1"
+```
+
+Sau đó trong config HGT đặt:
+
+```yaml
+data:
+  source: graph_store
+  graph_store_root: data/graph_store_v1
+train:
+  batch_mode: neighbor_sampling
+```
+
+Train sẽ đọc từng chunk qua mmap — không load toàn bộ graph.
 
 ### PowerShell không cho activate virtualenv
 

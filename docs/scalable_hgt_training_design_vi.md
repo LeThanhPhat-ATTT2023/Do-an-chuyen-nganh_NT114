@@ -20,7 +20,7 @@ src/graphslm_ids/offline_path/training/hetero_graph_artifact.py
 src/graphslm_ids/models/hgt.py
 ```
 
-Luồng hiện tại:
+Luồng full-batch ban đầu:
 
 ```text
 np.load(graph_artifact_3tier_t082_k5.npz)
@@ -30,14 +30,16 @@ np.load(graph_artifact_3tier_t082_k5.npz)
   -> loss trên train_idx (mask)
 ```
 
-Trong `train_hgt_flow_classifier.py` có dòng:
+Điểm nghẽn ban đầu từng nằm ở `train_hgt_flow_classifier.py`:
 
 ```python
 if str(config["train"]["batch_mode"]).lower() != "full":
     raise ValueError("Only full batch HGT training is supported in this script.")
 ```
 
-Đây là điểm nghẽn cứng cần phá bỏ.
+Điểm nghẽn này đã được phá bỏ trong code hiện tại. Trainer bây giờ hỗ trợ cả
+`train.batch_mode: full` cho baseline nhỏ và `train.batch_mode: neighbor_sampling`
+cho graph lớn qua `OnDiskHeteroGraphStore`/`HeteroNeighborSampler`.
 
 ### 1.2 Quy mô hiện tại và tương lai
 
@@ -550,19 +552,19 @@ Nếu sampler_time > forward_time, tăng `num_workers`.
 
 ## 8. Roadmap thực thi
 
-### Phase 0: hiện trạng
+### Phase 0: baseline ban đầu
 
 ```text
 Dataset: 27K flows, 223 MB NPZ.
-Code: full-batch hoạt động ổn.
-Hành động: KHÔNG xóa code full-batch. Giữ làm baseline so sánh.
+Code: full-batch vẫn được giữ để so sánh với cấu hình ban đầu.
+Hành động: KHÔNG xóa baseline full-batch `configs/hgt_t082_k5_l3_d01.yaml`.
 ```
 
 ### Phase 1: Drop-in graph store
 
 ```text
-- Viết script convert NPZ -> graph_store_v1 layout (mục 3.2).
-- Viết class GraphStore (mục 3.6) với memmap.
+- Đã có script `graphslm-convert-graph-store` convert NPZ -> `graph_store_v1`.
+- Đã có `OnDiskHeteroGraphStore` với memmap + CSR.
 - Sanity check: load qua GraphStore -> reconstruct NPZ-equivalent dict
   -> chạy train_hgt_flow_classifier.py không đổi -> kết quả giống Phase 0.
 - Mục đích: kiểm chứng store đúng, chưa thay đổi training loop.
@@ -571,9 +573,9 @@ Hành động: KHÔNG xóa code full-batch. Giữ làm baseline so sánh.
 ### Phase 2: Sampler + mini-batch training
 
 ```text
-- Viết HeteroNeighborSampler (mục 5).
-- Viết DataLoader collate_fn.
-- Thêm batch_mode = "neighbor_sampling" vào config.
+- Đã có `HeteroNeighborSampler`.
+- Đã có `NeighborSamplingCollator`.
+- Đã có `batch_mode = "neighbor_sampling"` trong trainer/config mới.
 - Train song song với baseline, so macro-F1 trên cùng split.
 - Yêu cầu: macro-F1 không tụt quá ~1-2 điểm so với full-batch.
 ```

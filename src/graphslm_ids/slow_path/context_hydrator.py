@@ -22,6 +22,11 @@ class ContextHydrator:
         hot_buffer: ContextSource | None = None,
         cold_store: ColdStoreSource | None = None,
     ) -> GraphContext:
+        if cold_store is not None and getattr(cold_store, "source_of_truth", False):
+            context = cold_store.load_context(flow_id)
+            if context is not None:
+                return context
+
         if hot_buffer is not None:
             context = hot_buffer.get_context(flow_id)
             if context is not None:

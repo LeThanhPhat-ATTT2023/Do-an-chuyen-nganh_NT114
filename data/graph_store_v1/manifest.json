@@ -1,0 +1,47 @@
+{
+  "created_or_updated_at_utc": "2026-05-11T05:24:23.561349+00:00",
+  "layout": "append_only_jsonl_shards",
+  "retention": {
+    "disk_quota_gb": 500.0,
+    "drop_after_days": 365.0,
+    "on_quota_exceeded": "drop_oldest"
+  },
+  "schema": {
+    "add_reverse_edges": true,
+    "edge_relations": [
+      "flow__contains__packet",
+      "packet__next_packet__packet",
+      "packet__matches_technique__technique",
+      "flow__matches_technique__technique",
+      "technique__belongs_to_tactic__tactic"
+    ],
+    "flow_feature_names": [
+      "packet_count",
+      "total_payload_bytes",
+      "duration_seconds",
+      "src_port",
+      "dst_port",
+      "protocol_id"
+    ],
+    "node_types": [
+      "flow",
+      "packet",
+      "technique",
+      "tactic"
+    ],
+    "packet_embedding_dim": 768,
+    "packet_feature_kind": "semantic",
+    "payload_length": 256,
+    "protocol_mapping": {
+      "OTHER": 0,
+      "TCP": 1,
+      "UDP": 2
+    },
+    "use_semantic_edge_weights": true
+  },
+  "shard_seal": {
+    "by_size_nodes": 6000,
+    "by_time_seconds": 3600.0
+  },
+  "version": "v1"
+}

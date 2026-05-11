@@ -1,6 +1,7 @@
 """Online fast-path components for runtime IDS detection."""
 
 from graphslm_ids.fast_path.alert_dispatcher import AlertDispatcher
+from graphslm_ids.fast_path.edge_filter import SigcEdgeFilter, SigcEdgeFilterConfig
 from graphslm_ids.fast_path.flow_tracker import FlowKey, FlowState, FlowTracker
 from graphslm_ids.fast_path.hgt_runtime import HGTOutput, HGTRuntime
 from graphslm_ids.fast_path.hot_graph_buffer import HotGraphBuffer
@@ -23,6 +24,8 @@ __all__ = [
     "PayloadExtractor",
     "PolicyDecision",
     "PolicyEngine",
+    "SigcEdgeFilter",
+    "SigcEdgeFilterConfig",
     "StudentRuntime",
     "Subgraph",
     "SubgraphBuilder",

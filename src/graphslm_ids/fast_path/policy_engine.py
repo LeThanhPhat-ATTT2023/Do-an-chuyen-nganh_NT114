@@ -22,12 +22,14 @@ class PolicyEngine:
         self,
         label_to_index: dict[str, int],
         alert_threshold: float = 0.70,
-        alert_labels: tuple[str, ...] = ("suspicious", "malicious"),
+        alert_labels: tuple[str, ...] = (),
+        benign_labels: tuple[str, ...] = ("benign",),
     ) -> None:
         self.label_to_index = {str(label): int(idx) for label, idx in label_to_index.items()}
         self.index_to_label = {idx: label for label, idx in self.label_to_index.items()}
         self.alert_threshold = float(alert_threshold)
         self.alert_labels = {str(label).lower() for label in alert_labels}
+        self.benign_labels = {str(label).lower() for label in benign_labels}
 
     def decide(self, hgt_output: Any) -> PolicyDecision:
         logits = _as_numpy(hgt_output.logits).reshape(-1)
@@ -44,7 +46,11 @@ class PolicyEngine:
             }
             for idx in order[: min(5, len(order))]
         ]
-        label_alert = label.lower() in self.alert_labels
+        # alert_labels (whitelist) takes precedence; fall back to benign_labels (blacklist)
+        if self.alert_labels:
+            label_alert = label.lower() in self.alert_labels
+        else:
+            label_alert = label.lower() not in self.benign_labels
         threshold_alert = confidence >= self.alert_threshold
         should_alert = bool(label_alert and threshold_alert)
         if should_alert:

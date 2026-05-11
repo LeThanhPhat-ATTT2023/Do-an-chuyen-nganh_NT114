@@ -41,6 +41,42 @@ hot_graph:
   max_packets_per_flow: 64
   max_techniques_per_node: 5
 
+preprocessor:
+  sigc:
+    enabled: true
+    score_formula: "semantic_weight * min(1, (src_out_degree + 1) / (dst_in_degree + 1)) * exp(-alpha * hop_distance)"
+    alpha: 0.4
+    min_score_to_keep_edge: 0.15
+    apply_to_edge_types:
+      - flow__contains__packet
+      - packet__next_packet__packet
+      - packet__matches_technique__technique
+
+graph_store:
+  enabled: true
+  root: data/graph_store_v1
+  shard_seal:
+    by_time_seconds: 3600
+    by_size_nodes: 6000
+  retention:
+    hot_window_seconds: 300
+    warm_window_days: 7
+    cold_window_days: 90
+    drop_after_days: 365
+  disk_quota_gb: 500
+  on_quota_exceeded: drop_oldest
+
+subgraph_builder:
+  dlg_ids_top_n:
+    enabled: true
+    top_n_per_seed:
+      flow__contains__packet: 24
+      packet__next_packet__packet: 4
+      packet__matches_technique__technique: 5
+      flow__matches_technique__technique: 5
+    sort_by: semantic_edge_weight
+    fallback_to_random_when_tie: true
+
 hgt:
   graph_npz: data/processed/graph_artifact_3tier_t082_k5.npz
   graph_meta_json: data/processed/graph_artifact_3tier_t082_k5.meta.json
@@ -75,9 +111,15 @@ hgt_runtime:
 
 policy:
   alert_threshold: 0.70
-  alert_labels:
-    - suspicious
-    - malicious
+  # benign_labels: bất kỳ nhãn nào KHÔNG nằm trong danh sách này và vượt threshold đều bắn alert.
+  # Đây là cách khuyến nghị khi dùng checkpoint HGT với nhãn thật (Benign, DoS, PortScan, ...).
+  benign_labels:
+    - Benign
+  # alert_labels (tuỳ chọn): chỉ bắn alert cho đúng những nhãn được liệt kê.
+  # Bỏ comment và điền nhãn cụ thể nếu muốn whitelist thay vì dùng benign_labels.
+  # alert_labels:
+  #   - DoS Hulk
+  #   - PortScan
 
 slow_path:
   enabled: true
@@ -88,6 +130,7 @@ slow_path:
   top_techniques: 5
   top_paths: 5
   max_payload_preview_bytes: 64
+  cold_source: graph_store
   cold_store: data/runtime/events.jsonl
 
 cold_store:

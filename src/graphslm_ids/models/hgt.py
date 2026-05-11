@@ -238,14 +238,11 @@ class HeteroGraphTransformer(nn.Module):
             "technique": self.input_projection["technique"](node_features["technique"].float()),
         }
 
-        tactic_count = int(node_features["tactic"].shape[0])
-        tactic_index = torch.arange(
-            tactic_count,
-            dtype=torch.long,
-            device=node_features["flow"].device,
-        )
-        if tactic_count == 0:
+        tactic_raw = node_features["tactic"].to(device=node_features["flow"].device)
+        if tactic_raw.numel() == 0:
             tactic_index = torch.zeros(0, dtype=torch.long, device=node_features["flow"].device)
+        else:
+            tactic_index = tactic_raw.long().reshape(-1)
         x_dict["tactic"] = self.tactic_embedding(tactic_index.clamp_max(max(self.num_tactics - 1, 0)))
 
         layer_attention: list[dict[EdgeKey, torch.Tensor]] = []

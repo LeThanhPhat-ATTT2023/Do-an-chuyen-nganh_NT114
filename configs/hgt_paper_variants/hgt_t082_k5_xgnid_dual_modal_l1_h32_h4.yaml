@@ -1,0 +1,67 @@
+# Source: XG-NID Dual-Modality NID with HGT + LLM, 2024-2026.
+# Inspired config: very compact 1-layer HGT with hidden_dim 32 and 4 heads.
+# The paper uses 30 epochs (with early convergence around epoch 5 in their
+# loss curves) and a batch size of 70, mainly because the dual-modality
+# (flow stats + raw packet payload bytes) inflates per-batch VRAM footprint.
+# Note: this local model does not implement the LLM-fusion XAI head, so this
+# config only mirrors the HGT backbone capacity and training schedule.
+experiment:
+  source_name: "XG-NID Dual-Modality NID (HGT backbone only)"
+  citation_hint: "XG-NID: Dual-Modality Network Intrusion Detection using a Heterogeneous Graph Neural Network and Large Language Model, 2024"
+  rationale: "Stress the HGT backbone with a very narrow 32-hidden / 1-layer / 4-head setup to verify how much capacity is actually needed for the three-tier IDS graph when the LLM-fusion head is removed."
+
+data:
+  source: graph_store
+  graph_npz: data/processed/graph_artifact_3tier_t082_k5.npz
+  graph_meta_json: data/processed/graph_artifact_3tier_t082_k5.meta.json
+  graph_store_root: data/graph_store_v1
+  read_sealed_only: true
+  packet_feature: semantic
+  add_reverse_edges: true
+  standardize_flow_features: true
+  use_semantic_edge_weights: true
+
+model:
+  hidden_dim: 32
+  num_layers: 1
+  num_heads: 4
+  dropout: 0.1
+  ffn_multiplier: 2
+
+train:
+  output_dir: outputs/hgt_paper_variants/xgnid_dual_modal_l1_h32_h4
+  epochs: 30
+  batch_mode: neighbor_sampling
+  batch_seed_flows: 70
+  grad_accum_steps: 1
+  lr: 0.001
+  weight_decay: 0.00005
+  val_ratio: 0.1
+  test_ratio: 0.1
+  patience: 15
+  class_weight: balanced
+  seed: 42
+  device: cuda
+  monitor: val_macro_f1
+  log_every: 1
+
+sampler:
+  hops: 1
+  fanouts:
+    flow__contains__packet: 20
+    packet__next_packet__packet: 4
+    packet__matches_technique__technique: 5
+    flow__matches_technique__technique: 5
+    technique__belongs_to_tactic__tactic: 1
+  reverse_fanouts:
+    rev_contains: 1
+    rev_next_packet: 1
+    rev_matches_technique: 0
+    rev_belongs_to_tactic: 0
+  always_include_all_tactics: true
+  always_include_all_techniques: true
+
+dataloader:
+  num_workers: 2
+  prefetch_factor: 2
+  pin_memory: true

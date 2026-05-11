@@ -143,3 +143,130 @@ def load_three_tier_graph_artifact(
         flow_y=flow_y,
         metadata=metadata,
     )
+
+
+def load_graph_store_artifact(
+    graph_store_root: Path,
+    packet_feature: str = "semantic",
+    add_reverse_edges: bool = True,
+    sealed_only: bool = True,
+) -> HeteroGraphArtifact:
+    """Load a graph store through the legacy full-batch artifact API."""
+    manifest_path = Path(graph_store_root) / "manifest.json"
+    if manifest_path.exists():
+        with manifest_path.open("r", encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        if manifest.get("layout") == "numpy_memmap_csr":
+            return _load_on_disk_graph_store_artifact(Path(graph_store_root), add_reverse_edges)
+
+    from graphslm_ids.runtime.graph_store import PersistentGraphStore
+
+    store = PersistentGraphStore(graph_store_root)
+    arrays, metadata = store.to_three_tier_arrays(sealed_only=sealed_only)
+
+    flow_x = np.asarray(_require_array(arrays, "flow_x"), dtype=np.float32)
+    flow_y = np.asarray(_require_array(arrays, "flow_y"), dtype=np.int64)
+    if packet_feature == "semantic":
+        packet_x = np.asarray(_require_array(arrays, "packet_semantic_x"), dtype=np.float32)
+    elif packet_feature == "payload":
+        packet_x = np.asarray(_require_array(arrays, "packet_x"), dtype=np.float32) / 255.0
+    else:
+        raise ValueError("packet_feature must be either 'semantic' or 'payload'.")
+
+    technique_x = np.asarray(_require_array(arrays, "technique_x"), dtype=np.float32)
+    technique_tactic_edge_index = np.asarray(
+        _require_array(arrays, "technique_tactic_edge_index"),
+        dtype=np.int64,
+    )
+    num_tactics = int(metadata.get("num_tactics", 0))
+    if num_tactics == 0 and technique_tactic_edge_index.shape[1] > 0:
+        num_tactics = int(technique_tactic_edge_index[1].max()) + 1
+
+    node_features = {
+        "flow": flow_x,
+        "packet": packet_x,
+        "technique": technique_x,
+        "tactic": _empty_tactic_features(num_tactics),
+    }
+
+    edge_specs: list[tuple[EdgeKey, str, str | None]] = [
+        (("flow", "contains", "packet"), "contain_edge_index", None),
+        (("packet", "next_packet", "packet"), "link_edge_index", "link_edge_attr"),
+        (
+            ("packet", "matches_technique", "technique"),
+            "packet_technique_edge_index",
+            "packet_technique_edge_attr",
+        ),
+        (
+            ("flow", "matches_technique", "technique"),
+            "flow_technique_edge_index",
+            "flow_technique_edge_attr",
+        ),
+        (
+            ("technique", "belongs_to_tactic", "tactic"),
+            "technique_tactic_edge_index",
+            "technique_tactic_edge_attr",
+        ),
+    ]
+
+    edge_index: dict[EdgeKey, np.ndarray] = {}
+    edge_attr: dict[EdgeKey, np.ndarray] = {}
+    for edge_key, edge_name, attr_name in edge_specs:
+        edge = np.asarray(_require_array(arrays, edge_name), dtype=np.int64)
+        if edge.ndim != 2 or edge.shape[0] != 2:
+            raise ValueError(f"{edge_name} must have shape (2, num_edges).")
+        edge_index[edge_key] = edge
+        edge_attr[edge_key] = _maybe_edge_attr(arrays, attr_name or "", int(edge.shape[1]))
+        if add_reverse_edges:
+            src_type, relation, dst_type = edge_key
+            reverse_key = (dst_type, f"rev_{relation}", src_type)
+            edge_index[reverse_key] = _reverse_edge_index(edge)
+            edge_attr[reverse_key] = edge_attr[edge_key].copy()
+
+    return HeteroGraphArtifact(
+        node_features=node_features,
+        edge_index=edge_index,
+        edge_attr=edge_attr,
+        flow_y=flow_y,
+        metadata=metadata,
+    )
+
+
+def _load_on_disk_graph_store_artifact(
+    graph_store_root: Path,
+    add_reverse_edges: bool,
+) -> HeteroGraphArtifact:
+    from graphslm_ids.offline_path.training.on_disk_graph_store import OnDiskHeteroGraphStore
+
+    store = OnDiskHeteroGraphStore(graph_store_root)
+    flow_ids = np.arange(store.num_flows, dtype=np.int64)
+    packet_ids = np.arange(store.node_counts["packet"], dtype=np.int64)
+    tactic_ids = np.arange(store.num_tactics, dtype=np.int64)
+
+    node_features = {
+        "flow": store.get_flow_features(flow_ids),
+        "packet": store.get_packet_features(packet_ids),
+        "technique": store.get_technique_features(),
+        "tactic": tactic_ids[:, None],
+    }
+    edge_index = {edge_key: store.get_edge_index(edge_key) for edge_key in store.edge_types}
+    edge_attr = {edge_key: store.get_edge_attr(edge_key) for edge_key in store.edge_types}
+
+    if add_reverse_edges:
+        for edge_key, edge in list(edge_index.items()):
+            if edge_key[1].startswith("rev_"):
+                continue
+            src_type, relation, dst_type = edge_key
+            reverse_key = (dst_type, f"rev_{relation}", src_type)
+            if reverse_key in edge_index:
+                continue
+            edge_index[reverse_key] = _reverse_edge_index(edge)
+            edge_attr[reverse_key] = edge_attr[edge_key].copy()
+
+    return HeteroGraphArtifact(
+        node_features=node_features,
+        edge_index=edge_index,
+        edge_attr=edge_attr,
+        flow_y=store.get_flow_labels(flow_ids),
+        metadata=store.manifest,
+    )
