@@ -14,6 +14,10 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from graphslm_ids.offline_path.preprocessing.pcap_payload_extractor import build_payload_dataset
+from graphslm_ids.offline_path.preprocessing.pcap_payload_extractor import stream_payload_dataset_to_disk
+from graphslm_ids.offline_path.preprocessing.pcap_payload_extractor import (
+    stream_payload_dataset_to_disk_parallel,
+)
 from graphslm_ids.offline_path.preprocessing.graph_csv_builder import build_graph_csv_tables
 from graphslm_ids.utils.io import ensure_dir, write_json
 
@@ -85,6 +89,38 @@ def parse_args() -> argparse.Namespace:
         help="Also save compressed payload vectors as payload_256.npz.",
     )
     parser.add_argument(
+        "--stream-to-disk",
+        action="store_true",
+        help=(
+            "Write payload_256.npy and metadata.csv in streaming mode without "
+            "holding the full dataset in RAM."
+        ),
+    )
+    parser.add_argument(
+        "--stream-mode",
+        choices=("single-pass", "two-pass"),
+        default="single-pass",
+        help=(
+            "Streaming strategy. single-pass reads PCAP once and patches the NPY "
+            "header at the end. two-pass counts first, then writes with memmap."
+        ),
+    )
+    parser.add_argument(
+        "--write-batch-size",
+        type=int,
+        default=100_000,
+        help="Rows buffered in RAM per disk write when --stream-to-disk is set.",
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=0,
+        help=(
+            "Worker processes for --stream-to-disk single-pass mode. "
+            "0 means auto=min(PCAP files, CPU cores); 1 forces sequential."
+        ),
+    )
+    parser.add_argument(
         "--export-graph-csv",
         action="store_true",
         help="Export flow_nodes.csv, packet_nodes.csv, contain_edges.csv, and link_edges.csv.",
@@ -113,6 +149,73 @@ def main() -> None:
     log_every = int(args.log_every_packets)
     if log_every <= 0:
         log_every = None
+
+    if args.stream_to_disk:
+        if args.shuffle:
+            raise SystemExit("--shuffle is not supported with --stream-to-disk.")
+        if args.save_npz:
+            raise SystemExit("--save-npz is not supported with --stream-to-disk.")
+        if args.export_graph_csv:
+            raise SystemExit("--export-graph-csv is not supported with --stream-to-disk.")
+
+        output_dir = ensure_dir(Path(args.output_dir))
+        stats_path = output_dir / "stats.json"
+        if args.stream_mode == "single-pass":
+            result = stream_payload_dataset_to_disk_parallel(
+                pcap_paths=pcap_paths,
+                output_dir=output_dir,
+                payload_length=args.payload_length,
+                max_packets_per_file=args.max_packets_per_file,
+                include_empty_payload=args.include_empty_payload,
+                log_every=log_every,
+                write_batch_size=args.write_batch_size,
+                num_workers=args.num_workers,
+            )
+        else:
+            if args.num_workers not in (0, 1):
+                raise SystemExit("--num-workers > 1 requires --stream-mode single-pass.")
+            result = stream_payload_dataset_to_disk(
+                pcap_paths=pcap_paths,
+                output_dir=output_dir,
+                payload_length=args.payload_length,
+                max_packets_per_file=args.max_packets_per_file,
+                include_empty_payload=args.include_empty_payload,
+                log_every=log_every,
+                write_batch_size=args.write_batch_size,
+            )
+        stats = {
+            "created_at_utc": datetime.now(timezone.utc).isoformat(),
+            "extraction_mode": result.extraction_mode,
+            "stream_mode": args.stream_mode,
+            "num_workers": int(result.num_workers),
+            "num_pcap_files": len(pcap_paths),
+            "num_packets": int(result.num_packets),
+            "payload_length": int(args.payload_length),
+            "write_batch_size": int(args.write_batch_size),
+            "label_counts": result.label_counts,
+            "protocol_counts": result.protocol_counts,
+            "output_files": {
+                "payload_npy": str(result.payload_path),
+                "metadata_csv": str(result.metadata_path),
+            },
+            "graph_csv": {
+                "enabled": False,
+                "reason": "--export-graph-csv is not supported with --stream-to-disk",
+                "flow_timeout_seconds": float(args.graph_flow_timeout_seconds),
+                "max_packets_per_flow": int(args.graph_max_packets_per_flow),
+                "output_files": {},
+                "counts": {},
+            },
+        }
+        write_json(stats_path, stats)
+
+        print(f"[OK] PCAP files: {len(pcap_paths)}")
+        print(f"[OK] Worker processes: {result.num_workers}")
+        print(f"[OK] Packets extracted: {result.num_packets}")
+        print(f"[OK] Payload matrix saved: {result.payload_path}")
+        print(f"[OK] Metadata saved: {result.metadata_path}")
+        print(f"[OK] Stats saved: {stats_path}")
+        return
 
     payload_matrix, metadata = build_payload_dataset(
         pcap_paths=pcap_paths,

@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from collections import Counter
+import csv
 from dataclasses import dataclass
+import os
 from pathlib import Path
 import re
+import shutil
 import sys
-from typing import Iterable
+import tempfile
+from typing import Iterable, Iterator
 
 import numpy as np
 import pandas as pd
@@ -28,16 +34,87 @@ class PacketRecord:
     payload_256: np.ndarray
 
 
+METADATA_COLUMNS: tuple[str, ...] = (
+    "pcap_file",
+    "packet_index",
+    "timestamp",
+    "label",
+    "src_ip",
+    "dst_ip",
+    "src_port",
+    "dst_port",
+    "protocol",
+    "payload_len_raw",
+)
+
+
+@dataclass
+class PayloadDatasetDiskResult:
+    payload_path: Path
+    metadata_path: Path
+    num_packets: int
+    label_counts: dict[str, int]
+    protocol_counts: dict[str, int]
+    extraction_mode: str = "stream_to_disk"
+    num_workers: int = 1
+
+
+@dataclass(frozen=True)
+class _PayloadPartTask:
+    shard_index: int
+    total_shards: int
+    pcap_path: Path
+    part_dir: Path
+    payload_length: int
+    max_packets_per_file: int | None
+    include_empty_payload: bool
+    log_every: int | None
+    write_batch_size: int
+
+
+@dataclass(frozen=True)
+class _PayloadPartResult:
+    shard_index: int
+    pcap_path: str
+    payload_path: Path
+    metadata_path: Path
+    num_packets: int
+    label_counts: dict[str, int]
+    protocol_counts: dict[str, int]
+
+
 # Generic container folder names that are NOT traffic-class labels.
-_CONTAINER_DIRS: frozenset[str] = frozenset({"raw", "data", "pcap", "pcaps", "dataset"})
+_CONTAINER_DIRS: frozenset[str] = frozenset({"", "raw", "data", "pcap", "pcaps", "dataset"})
 
 # Remap folder names that need cleanup (folder → canonical label).
 _LABEL_NORMALIZE: dict[str, str] = {
     "Benign_Final": "Benign",
 }
 
-# Strip trailing " - N" or "-N" numbering appended to multi-file stems.
-_SUFFIX_RE = re.compile(r"\s*-\s*\d+$")
+# Strip trailing " - N" / "-N" numbering and dangling hyphens appended to stems.
+_SUFFIX_RE = re.compile(r"(?:\s*-\s*\d+|-+)$")
+
+# Keep the NPY data offset fixed so single-pass extraction can write rows first
+# and patch the final row count into the header after the PCAP stream ends.
+_NPY_PREAMBLE_LEN = 12
+_NPY_HEADER_LEN = 4084
+
+
+def _write_fixed_npy_header(handle, row_count: int, payload_length: int) -> None:
+    if row_count < 0:
+        raise ValueError("row_count must be >= 0")
+    header = (
+        "{'descr': '|u1', 'fortran_order': False, "
+        f"'shape': ({int(row_count)}, {int(payload_length)}), }}"
+    )
+    header_bytes = header.encode("latin1")
+    if len(header_bytes) + 1 > _NPY_HEADER_LEN:
+        raise ValueError(f"NPY header too long for row_count={row_count}")
+    padded = header_bytes + b" " * (_NPY_HEADER_LEN - len(header_bytes) - 1) + b"\n"
+    handle.write(b"\x93NUMPY")
+    handle.write(bytes([2, 0]))
+    handle.write(_NPY_HEADER_LEN.to_bytes(4, "little"))
+    handle.write(padded)
 
 
 def infer_label_from_path(pcap_path: Path) -> str:
@@ -83,24 +160,38 @@ def truncate_and_pad_payload(payload: bytes, payload_length: int = 256) -> np.nd
     return fixed
 
 
-def extract_packet_records(
+def _iter_packet_rows(
     pcap_path: Path,
-    payload_length: int = 256,
-    max_packets: int | None = None,
-    include_empty_payload: bool = False,
-    log_every: int | None = None,
-) -> list[PacketRecord]:
-    """Extract packet metadata and fixed-size payload vectors from a PCAP file."""
+    payload_length: int | None,
+    max_packets: int | None,
+    include_empty_payload: bool,
+    log_every: int | None,
+    progress_label: str | None = None,
+) -> Iterator[tuple[dict[str, object], np.ndarray | None]]:
     label = infer_label_from_path(pcap_path)
-    records: list[PacketRecord] = []
     extracted_count = 0
+
+    def emit_progress(seen_count: int) -> None:
+        if not log_every or log_every <= 0 or seen_count % log_every != 0:
+            return
+        progress = "[PROGRESS]"
+        if progress_label:
+            progress = f"{progress}[{progress_label}]"
+        print(
+            f"{progress} {pcap_path.name}: seen {seen_count} packets, "
+            f"extracted {extracted_count}",
+            file=sys.stderr,
+            flush=True,
+        )
 
     with PcapReader(str(pcap_path)) as reader:
         for packet_index, packet in enumerate(reader):
             if max_packets is not None and packet_index >= max_packets:
                 break
 
+            seen_count = packet_index + 1
             if IP not in packet:
+                emit_progress(seen_count)
                 continue
 
             ip_layer = packet[IP]
@@ -119,32 +210,66 @@ def extract_packet_records(
 
             raw_payload = bytes(packet[Raw].load) if Raw in packet else b""
             if not include_empty_payload and len(raw_payload) == 0:
+                emit_progress(seen_count)
                 continue
 
-            records.append(
-                PacketRecord(
-                    pcap_file=str(pcap_path),
-                    packet_index=packet_index,
-                    timestamp=float(getattr(packet, "time", 0.0)),
-                    label=label,
-                    src_ip=str(ip_layer.src),
-                    dst_ip=str(ip_layer.dst),
-                    src_port=src_port,
-                    dst_port=dst_port,
-                    protocol=protocol,
-                    payload_len_raw=len(raw_payload),
-                    payload_256=truncate_and_pad_payload(raw_payload, payload_length=payload_length),
-                )
+            payload_256 = (
+                truncate_and_pad_payload(raw_payload, payload_length=payload_length)
+                if payload_length is not None
+                else None
             )
             extracted_count += 1
+            emit_progress(seen_count)
+            yield (
+                {
+                    "pcap_file": str(pcap_path),
+                    "packet_index": packet_index,
+                    "timestamp": float(getattr(packet, "time", 0.0)),
+                    "label": label,
+                    "src_ip": str(ip_layer.src),
+                    "dst_ip": str(ip_layer.dst),
+                    "src_port": src_port,
+                    "dst_port": dst_port,
+                    "protocol": protocol,
+                    "payload_len_raw": len(raw_payload),
+                },
+                payload_256,
+            )
 
-            if log_every and log_every > 0 and (packet_index + 1) % log_every == 0:
-                print(
-                    f"[PROGRESS] {pcap_path.name}: seen {packet_index + 1} packets, "
-                    f"extracted {extracted_count}",
-                    file=sys.stderr,
-                    flush=True,
-                )
+
+def extract_packet_records(
+    pcap_path: Path,
+    payload_length: int = 256,
+    max_packets: int | None = None,
+    include_empty_payload: bool = False,
+    log_every: int | None = None,
+) -> list[PacketRecord]:
+    """Extract packet metadata and fixed-size payload vectors from a PCAP file."""
+    records: list[PacketRecord] = []
+    for metadata_row, payload_256 in _iter_packet_rows(
+        pcap_path=pcap_path,
+        payload_length=payload_length,
+        max_packets=max_packets,
+        include_empty_payload=include_empty_payload,
+        log_every=log_every,
+    ):
+        if payload_256 is None:
+            raise RuntimeError("payload vector missing during packet extraction")
+        records.append(
+            PacketRecord(
+                pcap_file=str(metadata_row["pcap_file"]),
+                packet_index=int(metadata_row["packet_index"]),
+                timestamp=float(metadata_row["timestamp"]),
+                label=str(metadata_row["label"]),
+                src_ip=str(metadata_row["src_ip"]),
+                dst_ip=str(metadata_row["dst_ip"]),
+                src_port=int(metadata_row["src_port"]),
+                dst_port=int(metadata_row["dst_port"]),
+                protocol=str(metadata_row["protocol"]),
+                payload_len_raw=int(metadata_row["payload_len_raw"]),
+                payload_256=payload_256,
+            )
+        )
 
     return records
 
@@ -193,3 +318,405 @@ def build_payload_dataset(
 
     metadata = pd.DataFrame(metadata_rows)
     return payload_matrix, metadata
+
+
+def count_payload_dataset_rows(
+    pcap_paths: Iterable[Path],
+    max_packets_per_file: int | None = None,
+    include_empty_payload: bool = False,
+    log_every: int | None = None,
+) -> tuple[int, dict[str, int], dict[str, int]]:
+    """Count extractable packet rows without materializing payload vectors."""
+    total_rows = 0
+    label_counts: Counter[str] = Counter()
+    protocol_counts: Counter[str] = Counter()
+
+    for pcap_path in pcap_paths:
+        for metadata_row, _ in _iter_packet_rows(
+            pcap_path=pcap_path,
+            payload_length=None,
+            max_packets=max_packets_per_file,
+            include_empty_payload=include_empty_payload,
+            log_every=log_every,
+            progress_label="count",
+        ):
+            total_rows += 1
+            label_counts[str(metadata_row["label"])] += 1
+            protocol_counts[str(metadata_row["protocol"])] += 1
+
+    return total_rows, dict(label_counts), dict(protocol_counts)
+
+
+def stream_payload_dataset_to_disk(
+    pcap_paths: Iterable[Path],
+    output_dir: Path,
+    payload_length: int = 256,
+    max_packets_per_file: int | None = None,
+    include_empty_payload: bool = False,
+    log_every: int | None = None,
+    write_batch_size: int = 100_000,
+) -> PayloadDatasetDiskResult:
+    """Build payload_256.npy and metadata.csv without holding all rows in RAM.
+
+    This performs two PCAP passes. The first pass counts rows so the NPY header
+    can store the final matrix shape. The second pass writes payload rows through
+    a numpy memmap and appends metadata rows directly to CSV.
+    """
+    if payload_length < 1:
+        raise ValueError("payload_length must be >= 1")
+    if write_batch_size < 1:
+        raise ValueError("write_batch_size must be >= 1")
+
+    pcap_list = list(pcap_paths)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    payload_path = output_dir / "payload_256.npy"
+    metadata_path = output_dir / "metadata.csv"
+
+    total_rows, label_counts, protocol_counts = count_payload_dataset_rows(
+        pcap_paths=pcap_list,
+        max_packets_per_file=max_packets_per_file,
+        include_empty_payload=include_empty_payload,
+        log_every=log_every,
+    )
+
+    payload_matrix = np.lib.format.open_memmap(
+        str(payload_path),
+        mode="w+",
+        dtype=np.uint8,
+        shape=(total_rows, payload_length),
+    )
+
+    row_offset = 0
+    payload_batch: list[np.ndarray] = []
+    metadata_batch: list[dict[str, object]] = []
+
+    def flush_batch() -> None:
+        nonlocal row_offset
+        if not payload_batch:
+            return
+        batch_array = np.asarray(payload_batch, dtype=np.uint8)
+        batch_end = row_offset + int(batch_array.shape[0])
+        payload_matrix[row_offset:batch_end] = batch_array
+        row_offset = batch_end
+        writer.writerows(metadata_batch)
+        payload_batch.clear()
+        metadata_batch.clear()
+
+    with metadata_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(METADATA_COLUMNS))
+        writer.writeheader()
+
+        for pcap_path in pcap_list:
+            for metadata_row, payload_256 in _iter_packet_rows(
+                pcap_path=pcap_path,
+                payload_length=payload_length,
+                max_packets=max_packets_per_file,
+                include_empty_payload=include_empty_payload,
+                log_every=log_every,
+                progress_label="write",
+            ):
+                if payload_256 is None:
+                    raise RuntimeError("payload vector missing during streaming write")
+                payload_batch.append(payload_256)
+                metadata_batch.append(metadata_row)
+
+                if len(payload_batch) >= write_batch_size:
+                    flush_batch()
+
+        flush_batch()
+
+    if row_offset != total_rows:
+        raise RuntimeError(f"streamed row count mismatch: wrote {row_offset}, expected {total_rows}")
+
+    payload_matrix.flush()
+    return PayloadDatasetDiskResult(
+        payload_path=payload_path,
+        metadata_path=metadata_path,
+        num_packets=total_rows,
+        label_counts=label_counts,
+        protocol_counts=protocol_counts,
+        extraction_mode="stream_to_disk_two_pass",
+    )
+
+
+def stream_payload_dataset_to_disk_single_pass(
+    pcap_paths: Iterable[Path],
+    output_dir: Path,
+    payload_length: int = 256,
+    max_packets_per_file: int | None = None,
+    include_empty_payload: bool = False,
+    log_every: int | None = None,
+    write_batch_size: int = 100_000,
+) -> PayloadDatasetDiskResult:
+    """Build payload_256.npy and metadata.csv in one PCAP pass.
+
+    The payload file is written with a fixed-size NPY header first. Payload rows
+    are appended as raw uint8 bytes, then the header is patched with the final
+    row count. This avoids the count pass used by numpy's open_memmap path.
+    """
+    if payload_length < 1:
+        raise ValueError("payload_length must be >= 1")
+    if write_batch_size < 1:
+        raise ValueError("write_batch_size must be >= 1")
+
+    pcap_list = list(pcap_paths)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    payload_path = output_dir / "payload_256.npy"
+    metadata_path = output_dir / "metadata.csv"
+
+    row_count = 0
+    label_counts: Counter[str] = Counter()
+    protocol_counts: Counter[str] = Counter()
+    payload_batch: list[np.ndarray] = []
+    metadata_batch: list[dict[str, object]] = []
+
+    with payload_path.open("w+b") as payload_handle, metadata_path.open(
+        "w", newline="", encoding="utf-8"
+    ) as metadata_handle:
+        _write_fixed_npy_header(payload_handle, row_count=0, payload_length=payload_length)
+        writer = csv.DictWriter(metadata_handle, fieldnames=list(METADATA_COLUMNS))
+        writer.writeheader()
+
+        def flush_batch() -> None:
+            if not payload_batch:
+                return
+            batch_array = np.asarray(payload_batch, dtype=np.uint8)
+            batch_array.tofile(payload_handle)
+            writer.writerows(metadata_batch)
+            payload_batch.clear()
+            metadata_batch.clear()
+
+        for pcap_path in pcap_list:
+            for metadata_row, payload_256 in _iter_packet_rows(
+                pcap_path=pcap_path,
+                payload_length=payload_length,
+                max_packets=max_packets_per_file,
+                include_empty_payload=include_empty_payload,
+                log_every=log_every,
+                progress_label="write",
+            ):
+                if payload_256 is None:
+                    raise RuntimeError("payload vector missing during streaming write")
+
+                payload_batch.append(payload_256)
+                metadata_batch.append(metadata_row)
+                row_count += 1
+                label_counts[str(metadata_row["label"])] += 1
+                protocol_counts[str(metadata_row["protocol"])] += 1
+
+                if len(payload_batch) >= write_batch_size:
+                    flush_batch()
+
+        flush_batch()
+        payload_handle.flush()
+        os.fsync(payload_handle.fileno())
+        payload_handle.seek(0)
+        _write_fixed_npy_header(payload_handle, row_count=row_count, payload_length=payload_length)
+        payload_handle.truncate(_NPY_PREAMBLE_LEN + _NPY_HEADER_LEN + row_count * payload_length)
+        payload_handle.flush()
+        os.fsync(payload_handle.fileno())
+
+    return PayloadDatasetDiskResult(
+        payload_path=payload_path,
+        metadata_path=metadata_path,
+        num_packets=row_count,
+        label_counts=dict(label_counts),
+        protocol_counts=dict(protocol_counts),
+        extraction_mode="stream_to_disk_single_pass",
+    )
+
+
+def _stream_payload_part(task: _PayloadPartTask) -> _PayloadPartResult:
+    payload_path = task.part_dir / f"payload_part_{task.shard_index:06d}.bin"
+    metadata_path = task.part_dir / f"metadata_part_{task.shard_index:06d}.csv"
+
+    row_count = 0
+    label_counts: Counter[str] = Counter()
+    protocol_counts: Counter[str] = Counter()
+    payload_batch: list[np.ndarray] = []
+    metadata_batch: list[dict[str, object]] = []
+    progress_label = f"worker {task.shard_index + 1}/{task.total_shards}"
+
+    with payload_path.open("wb") as payload_handle, metadata_path.open(
+        "w", newline="", encoding="utf-8"
+    ) as metadata_handle:
+        writer = csv.DictWriter(metadata_handle, fieldnames=list(METADATA_COLUMNS))
+        writer.writeheader()
+
+        def flush_batch() -> None:
+            if not payload_batch:
+                return
+            batch_array = np.asarray(payload_batch, dtype=np.uint8)
+            batch_array.tofile(payload_handle)
+            writer.writerows(metadata_batch)
+            payload_batch.clear()
+            metadata_batch.clear()
+
+        for metadata_row, payload_256 in _iter_packet_rows(
+            pcap_path=task.pcap_path,
+            payload_length=task.payload_length,
+            max_packets=task.max_packets_per_file,
+            include_empty_payload=task.include_empty_payload,
+            log_every=task.log_every,
+            progress_label=progress_label,
+        ):
+            if payload_256 is None:
+                raise RuntimeError("payload vector missing during parallel streaming write")
+
+            payload_batch.append(payload_256)
+            metadata_batch.append(metadata_row)
+            row_count += 1
+            label_counts[str(metadata_row["label"])] += 1
+            protocol_counts[str(metadata_row["protocol"])] += 1
+
+            if len(payload_batch) >= task.write_batch_size:
+                flush_batch()
+
+        flush_batch()
+        payload_handle.flush()
+        os.fsync(payload_handle.fileno())
+        metadata_handle.flush()
+        os.fsync(metadata_handle.fileno())
+
+    return _PayloadPartResult(
+        shard_index=task.shard_index,
+        pcap_path=str(task.pcap_path),
+        payload_path=payload_path,
+        metadata_path=metadata_path,
+        num_packets=row_count,
+        label_counts=dict(label_counts),
+        protocol_counts=dict(protocol_counts),
+    )
+
+
+def _resolve_worker_count(num_workers: int | None, pcap_count: int) -> int:
+    if pcap_count < 1:
+        return 1
+    if num_workers is None or num_workers <= 0:
+        return max(1, min(pcap_count, os.cpu_count() or 1))
+    return max(1, min(int(num_workers), pcap_count))
+
+
+def _append_metadata_rows(part_path: Path, output_handle) -> None:
+    expected_header = ",".join(METADATA_COLUMNS)
+    with part_path.open("r", newline="", encoding="utf-8") as part_handle:
+        header = part_handle.readline().strip()
+        if header != expected_header:
+            raise RuntimeError(f"metadata part has unexpected header: {part_path}")
+        shutil.copyfileobj(part_handle, output_handle, length=1024 * 1024)
+
+
+def stream_payload_dataset_to_disk_parallel(
+    pcap_paths: Iterable[Path],
+    output_dir: Path,
+    payload_length: int = 256,
+    max_packets_per_file: int | None = None,
+    include_empty_payload: bool = False,
+    log_every: int | None = None,
+    write_batch_size: int = 100_000,
+    num_workers: int | None = None,
+) -> PayloadDatasetDiskResult:
+    """Build payload_256.npy and metadata.csv with one worker process per PCAP shard.
+
+    Each worker parses one PCAP into temporary payload/metadata parts. The parent
+    merges parts in the sorted input order so rows stay deterministic.
+    """
+    if payload_length < 1:
+        raise ValueError("payload_length must be >= 1")
+    if write_batch_size < 1:
+        raise ValueError("write_batch_size must be >= 1")
+
+    pcap_list = list(pcap_paths)
+    worker_count = _resolve_worker_count(num_workers=num_workers, pcap_count=len(pcap_list))
+    if worker_count <= 1:
+        return stream_payload_dataset_to_disk_single_pass(
+            pcap_paths=pcap_list,
+            output_dir=output_dir,
+            payload_length=payload_length,
+            max_packets_per_file=max_packets_per_file,
+            include_empty_payload=include_empty_payload,
+            log_every=log_every,
+            write_batch_size=write_batch_size,
+        )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    payload_path = output_dir / "payload_256.npy"
+    metadata_path = output_dir / "metadata.csv"
+    parts_dir = Path(tempfile.mkdtemp(prefix="_payload_parts_", dir=output_dir))
+    results_by_index: dict[int, _PayloadPartResult] = {}
+
+    try:
+        tasks = [
+            _PayloadPartTask(
+                shard_index=idx,
+                total_shards=len(pcap_list),
+                pcap_path=pcap_path,
+                part_dir=parts_dir,
+                payload_length=payload_length,
+                max_packets_per_file=max_packets_per_file,
+                include_empty_payload=include_empty_payload,
+                log_every=log_every,
+                write_batch_size=write_batch_size,
+            )
+            for idx, pcap_path in enumerate(pcap_list)
+        ]
+
+        with ProcessPoolExecutor(max_workers=worker_count) as executor:
+            future_to_task = {executor.submit(_stream_payload_part, task): task for task in tasks}
+            for future in as_completed(future_to_task):
+                task = future_to_task[future]
+                result = future.result()
+                results_by_index[result.shard_index] = result
+                print(
+                    f"[OK][worker {task.shard_index + 1}/{len(pcap_list)}] "
+                    f"{task.pcap_path.name}: extracted {result.num_packets}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+        ordered_results = [results_by_index[idx] for idx in range(len(pcap_list))]
+        total_rows = sum(result.num_packets for result in ordered_results)
+        label_counts: Counter[str] = Counter()
+        protocol_counts: Counter[str] = Counter()
+        for result in ordered_results:
+            label_counts.update(result.label_counts)
+            protocol_counts.update(result.protocol_counts)
+            expected_bytes = int(result.num_packets) * int(payload_length)
+            actual_bytes = result.payload_path.stat().st_size
+            if actual_bytes != expected_bytes:
+                raise RuntimeError(
+                    f"payload part size mismatch for {result.payload_path}: "
+                    f"{actual_bytes} != {expected_bytes}"
+                )
+
+        with payload_path.open("w+b") as payload_handle:
+            _write_fixed_npy_header(payload_handle, row_count=total_rows, payload_length=payload_length)
+            for result in ordered_results:
+                with result.payload_path.open("rb") as part_handle:
+                    shutil.copyfileobj(part_handle, payload_handle, length=16 * 1024 * 1024)
+            payload_handle.truncate(_NPY_PREAMBLE_LEN + _NPY_HEADER_LEN + total_rows * payload_length)
+            payload_handle.flush()
+            os.fsync(payload_handle.fileno())
+
+        with metadata_path.open("w", newline="", encoding="utf-8") as metadata_handle:
+            writer = csv.DictWriter(metadata_handle, fieldnames=list(METADATA_COLUMNS))
+            writer.writeheader()
+            for result in ordered_results:
+                _append_metadata_rows(result.metadata_path, metadata_handle)
+            metadata_handle.flush()
+            os.fsync(metadata_handle.fileno())
+
+    except BaseException:
+        shutil.rmtree(parts_dir, ignore_errors=True)
+        raise
+
+    shutil.rmtree(parts_dir, ignore_errors=True)
+    return PayloadDatasetDiskResult(
+        payload_path=payload_path,
+        metadata_path=metadata_path,
+        num_packets=total_rows,
+        label_counts=dict(label_counts),
+        protocol_counts=dict(protocol_counts),
+        extraction_mode="stream_to_disk_parallel_single_pass",
+        num_workers=worker_count,
+    )
