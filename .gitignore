@@ -30,6 +30,9 @@ logs/
 # Large generated arrays
 *.npy
 
+# Pre-trained models (large binary, không commit vào git)
+/models/
+
 # Ignore data folder content except placeholders
 /data/raw/*
 /data/interim/*

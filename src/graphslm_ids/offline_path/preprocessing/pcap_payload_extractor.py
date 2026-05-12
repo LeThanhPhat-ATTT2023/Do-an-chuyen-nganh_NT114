@@ -18,6 +18,30 @@ from scapy.layers.inet import IP, TCP, UDP
 from scapy.packet import Raw
 from scapy.utils import PcapReader
 
+import socket as _socket
+
+try:
+    import dpkt as _dpkt
+    import dpkt.pcap as _dpkt_pcap
+    import dpkt.ethernet as _dpkt_eth
+    import dpkt.ip as _dpkt_ip
+    import dpkt.tcp as _dpkt_tcp
+    import dpkt.udp as _dpkt_udp
+    _DPKT_AVAILABLE = True
+    try:
+        import dpkt.pcapng as _dpkt_pcapng
+        _DPKT_HAS_PCAPNG = True
+    except ImportError:
+        _DPKT_HAS_PCAPNG = False
+except ImportError:
+    _DPKT_AVAILABLE = False
+    _DPKT_HAS_PCAPNG = False
+
+# PCAP datalink type constants
+_DLT_EN10MB = 1    # Standard Ethernet
+_DLT_RAW = 101     # Raw IPv4 (Linux/BSD)
+_DLT_RAW2 = 228    # LINKTYPE_IPV4 (macOS)
+
 
 @dataclass
 class PacketRecord:
@@ -160,7 +184,7 @@ def truncate_and_pad_payload(payload: bytes, payload_length: int = 256) -> np.nd
     return fixed
 
 
-def _iter_packet_rows(
+def _iter_packet_rows_scapy(
     pcap_path: Path,
     payload_length: int | None,
     max_packets: int | None,
@@ -169,6 +193,7 @@ def _iter_packet_rows(
     progress_label: str | None = None,
 ) -> Iterator[tuple[dict[str, object], np.ndarray | None]]:
     label = infer_label_from_path(pcap_path)
+    pcap_file_str = str(pcap_path)
     extracted_count = 0
 
     def emit_progress(seen_count: int) -> None:
@@ -184,7 +209,7 @@ def _iter_packet_rows(
             flush=True,
         )
 
-    with PcapReader(str(pcap_path)) as reader:
+    with PcapReader(pcap_file_str) as reader:
         for packet_index, packet in enumerate(reader):
             if max_packets is not None and packet_index >= max_packets:
                 break
@@ -222,7 +247,7 @@ def _iter_packet_rows(
             emit_progress(seen_count)
             yield (
                 {
-                    "pcap_file": str(pcap_path),
+                    "pcap_file": pcap_file_str,
                     "packet_index": packet_index,
                     "timestamp": float(getattr(packet, "time", 0.0)),
                     "label": label,
@@ -235,6 +260,157 @@ def _iter_packet_rows(
                 },
                 payload_256,
             )
+
+
+def _iter_packet_rows_dpkt(
+    pcap_path: Path,
+    payload_length: int | None,
+    max_packets: int | None,
+    include_empty_payload: bool,
+    log_every: int | None,
+    progress_label: str | None = None,
+) -> Iterator[tuple[dict[str, object], np.ndarray | None]]:
+    """dpkt-based packet parser — 3–10x faster than Scapy for .pcap files.
+
+    Falls back to Scapy only when dpkt cannot open the file at all (e.g., a .pcap
+    file that is actually in pcapng format or is corrupt). If dpkt opens the file
+    successfully, malformed individual packets are silently skipped rather than
+    causing a fallback, so the row counts from dpkt and Scapy may differ slightly
+    for corrupt captures.
+    """
+    label = infer_label_from_path(pcap_path)
+    pcap_file_str = str(pcap_path)
+    extracted_count = 0
+    pl = payload_length if payload_length and payload_length > 0 else 256
+
+    def _log(seen_count: int) -> None:
+        if not log_every or log_every <= 0 or seen_count % log_every != 0:
+            return
+        tag = "[PROGRESS]" + (f"[{progress_label}]" if progress_label else "")
+        print(
+            f"{tag} {pcap_path.name}: seen {seen_count} packets, "
+            f"extracted {extracted_count}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    dpkt_opened = False
+    try:
+        with open(pcap_path, "rb") as f:
+            suffix = pcap_path.suffix.lower()
+            if suffix == ".pcapng" and _DPKT_HAS_PCAPNG:
+                pcap_iter = _dpkt_pcapng.Scanner(f)
+                dlt = _DLT_EN10MB
+            else:
+                reader = _dpkt_pcap.Reader(f)
+                dlt = reader.datalink()
+                pcap_iter = reader
+
+            dpkt_opened = True
+
+            for packet_index, (ts, buf) in enumerate(pcap_iter):
+                if max_packets is not None and packet_index >= max_packets:
+                    break
+
+                seen_count = packet_index + 1
+                _log(seen_count)
+
+                try:
+                    if dlt == _DLT_EN10MB:
+                        eth = _dpkt_eth.Ethernet(buf)
+                        ip = eth.data
+                    elif dlt in (_DLT_RAW, _DLT_RAW2):
+                        ip = _dpkt_ip.IP(buf)
+                    else:
+                        continue
+                    if not isinstance(ip, _dpkt_ip.IP):
+                        continue
+                except Exception:
+                    continue
+
+                transport = ip.data
+                src_port = -1
+                dst_port = -1
+                protocol = "OTHER"
+                raw_payload = b""
+
+                if isinstance(transport, _dpkt_tcp.TCP):
+                    protocol = "TCP"
+                    src_port = transport.sport
+                    dst_port = transport.dport
+                    raw_payload = bytes(transport.data)
+                elif isinstance(transport, _dpkt_udp.UDP):
+                    protocol = "UDP"
+                    src_port = transport.sport
+                    dst_port = transport.dport
+                    raw_payload = bytes(transport.data)
+
+                if not include_empty_payload and not raw_payload:
+                    continue
+
+                if payload_length is not None:
+                    vec = np.zeros(pl, dtype=np.uint8)
+                    if raw_payload:
+                        n = min(len(raw_payload), pl)
+                        vec[:n] = np.frombuffer(raw_payload[:n], dtype=np.uint8)
+                else:
+                    vec = None
+
+                extracted_count += 1
+                yield (
+                    {
+                        "pcap_file": pcap_file_str,
+                        "packet_index": packet_index,
+                        "timestamp": float(ts),
+                        "label": label,
+                        "src_ip": _socket.inet_ntoa(ip.src),
+                        "dst_ip": _socket.inet_ntoa(ip.dst),
+                        "src_port": src_port,
+                        "dst_port": dst_port,
+                        "protocol": protocol,
+                        "payload_len_raw": len(raw_payload),
+                    },
+                    vec,
+                )
+    except Exception as exc:
+        if not dpkt_opened:
+            print(
+                f"[WARN] dpkt could not open {pcap_path.name}: {exc!r} — retrying with Scapy",
+                file=sys.stderr,
+                flush=True,
+            )
+            yield from _iter_packet_rows_scapy(
+                pcap_path, payload_length, max_packets, include_empty_payload, log_every, progress_label
+            )
+        else:
+            print(
+                f"[WARN] dpkt error mid-stream in {pcap_path.name}: {exc!r} (partial extract)",
+                file=sys.stderr,
+                flush=True,
+            )
+
+
+def _iter_packet_rows(
+    pcap_path: Path,
+    payload_length: int | None,
+    max_packets: int | None,
+    include_empty_payload: bool,
+    log_every: int | None,
+    progress_label: str | None = None,
+) -> Iterator[tuple[dict[str, object], np.ndarray | None]]:
+    """Dispatch to dpkt (fast) or Scapy (fallback) based on availability and file type."""
+    suffix = pcap_path.suffix.lower()
+    use_dpkt = _DPKT_AVAILABLE and (
+        suffix == ".pcap" or (suffix == ".pcapng" and _DPKT_HAS_PCAPNG)
+    )
+    if use_dpkt:
+        yield from _iter_packet_rows_dpkt(
+            pcap_path, payload_length, max_packets, include_empty_payload, log_every, progress_label
+        )
+    else:
+        yield from _iter_packet_rows_scapy(
+            pcap_path, payload_length, max_packets, include_empty_payload, log_every, progress_label
+        )
 
 
 def extract_packet_records(
