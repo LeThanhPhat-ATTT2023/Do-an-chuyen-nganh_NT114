@@ -12,21 +12,21 @@ class Student1DCNN(nn.Module):
         self.features = nn.Sequential(
             nn.Conv1d(1, 32, kernel_size=7, padding=3),
             nn.BatchNorm1d(32),
-            nn.ReLU(),
+            nn.ReLU(inplace=True),
             nn.MaxPool1d(kernel_size=2),
             nn.Conv1d(32, 64, kernel_size=5, padding=2),
             nn.BatchNorm1d(64),
-            nn.ReLU(),
+            nn.ReLU(inplace=True),
             nn.MaxPool1d(kernel_size=2),
             nn.Conv1d(64, 128, kernel_size=3, padding=1),
             nn.BatchNorm1d(128),
-            nn.ReLU(),
+            nn.ReLU(inplace=True),
             nn.AdaptiveMaxPool1d(16),
         )
         self.head = nn.Sequential(
             nn.Flatten(),
             nn.Linear(128 * 16, 512),
-            nn.ReLU(),
+            nn.ReLU(inplace=True),
             nn.Dropout(p=dropout),
             nn.Linear(512, embedding_dim),
         )

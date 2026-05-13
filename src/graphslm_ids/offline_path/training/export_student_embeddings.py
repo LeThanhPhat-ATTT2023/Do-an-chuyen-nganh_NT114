@@ -5,9 +5,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 import sys
 
+import os
+
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
@@ -17,6 +20,20 @@ if str(SRC_DIR) not in sys.path:
 
 from graphslm_ids.models.student_cnn import Student1DCNN
 from graphslm_ids.utils.io import ensure_dir, write_json
+
+
+class PayloadDataset(Dataset[torch.Tensor]):
+    """Wraps a mmap'd numpy array for use with multi-worker DataLoader."""
+
+    def __init__(self, matrix: np.ndarray, total_rows: int) -> None:
+        self.matrix = matrix
+        self.n = total_rows
+
+    def __len__(self) -> int:
+        return self.n
+
+    def __getitem__(self, idx: int) -> torch.Tensor:
+        return torch.tensor(self.matrix[idx], dtype=torch.float32)
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,6 +69,14 @@ def parse_args() -> argparse.Namespace:
         "--device",
         default="auto",
         help="Device to use: auto, cpu, cuda, or cuda:0 style values.",
+    )
+    parser.add_argument(
+        "--num-workers", type=int, default=-1,
+        help="DataLoader workers for CPU prefetch. -1 = auto (cpu_count // 2, max 4).",
+    )
+    parser.add_argument(
+        "--compile", action="store_true",
+        help="Apply torch.compile(mode='reduce-overhead') for faster inference. Requires PyTorch >= 2.0.",
     )
     return parser.parse_args()
 
@@ -89,6 +114,29 @@ def main() -> None:
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 
+    if args.compile:
+        try:
+            model = torch.compile(model, mode="reduce-overhead")
+            print("[torch.compile] compiled with mode='reduce-overhead'")
+        except Exception as exc:
+            print(f"[torch.compile] skipped — {exc}")
+
+    if args.num_workers < 0:
+        num_workers = max(1, min((os.cpu_count() or 1) // 2, 4))
+    else:
+        num_workers = args.num_workers
+
+    use_amp = device.type == "cuda"
+    loader = DataLoader(
+        PayloadDataset(payload_matrix, total_rows),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=(device.type == "cuda"),
+        persistent_workers=num_workers > 0,
+        prefetch_factor=2 if num_workers > 0 else None,
+    )
+
     embeddings = np.lib.format.open_memmap(
         str(output_path),
         mode="w+",
@@ -96,17 +144,17 @@ def main() -> None:
         shape=(total_rows, embedding_dim),
     )
 
+    start = 0
     with torch.no_grad():
-        for start in tqdm(range(0, total_rows, args.batch_size), desc="Export student embeddings"):
-            end = min(start + args.batch_size, total_rows)
-            batch_np = np.asarray(payload_matrix[start:end], dtype=np.float32)
-            batch_tensor = torch.from_numpy(batch_np).to(device)
-
-            output = model(batch_tensor)
-            if args.l2_normalize:
-                output = F.normalize(output, p=2, dim=1)
-
-            embeddings[start:end] = output.detach().cpu().numpy().astype(np.float32)
+        for batch in tqdm(loader, desc="Export student embeddings"):
+            batch = batch.to(device, non_blocking=True)
+            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+                output = model(batch)
+                if args.l2_normalize:
+                    output = F.normalize(output, p=2, dim=1)
+            end = start + len(batch)
+            embeddings[start:end] = output.float().detach().cpu().numpy().astype(np.float32)
+            start = end
 
     embeddings.flush()
 
@@ -121,8 +169,11 @@ def main() -> None:
         "rows": int(total_rows),
         "embedding_dim": int(embedding_dim),
         "batch_size": int(args.batch_size),
+        "num_workers": int(num_workers),
         "dropout": float(args.dropout),
         "l2_normalize": bool(args.l2_normalize),
+        "amp": bool(use_amp),
+        "compile": bool(args.compile),
         "checkpoint_epoch": int(checkpoint_epoch) if checkpoint_epoch is not None else None,
         "checkpoint_val_loss": float(checkpoint_val_loss)
         if checkpoint_val_loss is not None
