@@ -52,6 +52,7 @@ def load_three_tier_graph_artifact(
     graph_meta_json: Path | None = None,
     packet_feature: str = "semantic",
     add_reverse_edges: bool = True,
+    packet_semantic_npy: Path | None = None,
 ) -> HeteroGraphArtifact:
     """Load the three-tier graph NPZ into node/edge dictionaries for HGT training."""
     graph_npz = Path(graph_npz)
@@ -59,21 +60,31 @@ def load_three_tier_graph_artifact(
         graph_meta_json = graph_npz.with_suffix(".meta.json")
     graph_meta_json = Path(graph_meta_json)
 
-    with np.load(graph_npz, allow_pickle=False) as loaded:
-        arrays = {key: loaded[key] for key in loaded.files}
-
-    # Support memory-efficient build: packet_semantic_x saved as a separate mmap .npy
-    # alongside the NPZ (named <stem>_packet_semantic_x.npy) to avoid loading ~59 GB
-    # through the zip-compression layer.
-    if "packet_semantic_x" not in arrays:
-        sidecar = graph_npz.with_name(graph_npz.stem + "_packet_semantic_x.npy")
-        if sidecar.exists():
-            arrays["packet_semantic_x"] = np.load(str(sidecar), mmap_mode="r")
-
+    # Load metadata first so packet_semantic_x_npy path recorded at build-time is available.
     metadata: dict[str, Any] = {}
     if graph_meta_json.exists():
         with graph_meta_json.open("r", encoding="utf-8") as handle:
             metadata = json.load(handle)
+
+    with np.load(graph_npz, allow_pickle=False) as loaded:
+        arrays = {key: loaded[key] for key in loaded.files}
+
+    # packet_semantic_x may be stored as a separate mmap .npy sidecar (not inside the
+    # NPZ zip) to avoid the ~59 GB decompression cost.  Try several candidate paths:
+    # 1. explicit caller-supplied path, 2. path recorded in meta.json at build time,
+    # 3. conventional sidecar next to NPZ with stem suffix "_packet_semantic_x.npy".
+    if "packet_semantic_x" not in arrays:
+        sidecar_candidates: list[Path] = []
+        if packet_semantic_npy is not None:
+            sidecar_candidates.append(Path(packet_semantic_npy))
+        meta_sidecar = metadata.get("packet_semantic_x_npy")
+        if meta_sidecar:
+            sidecar_candidates.append(Path(meta_sidecar))
+        sidecar_candidates.append(graph_npz.with_name(graph_npz.stem + "_packet_semantic_x.npy"))
+        for candidate in sidecar_candidates:
+            if candidate.exists():
+                arrays["packet_semantic_x"] = np.load(str(candidate), mmap_mode="r")
+                break
 
     flow_x = np.asarray(_require_array(arrays, "flow_x"), dtype=np.float32)
     flow_y = np.asarray(_require_array(arrays, "flow_y"), dtype=np.int64)

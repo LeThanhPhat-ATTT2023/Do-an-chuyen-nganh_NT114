@@ -217,6 +217,7 @@ def convert_npz_to_on_disk_graph_store(
     val_ratio: float = 0.1,
     test_ratio: float = 0.1,
     seed: int = 42,
+    packet_semantic_npy: str | Path | None = None,
 ) -> dict[str, Any]:
     """Convert the legacy NPZ artifact into the mmap + CSR graph store layout."""
 
@@ -225,6 +226,7 @@ def convert_npz_to_on_disk_graph_store(
         graph_meta_json=Path(graph_meta_json) if graph_meta_json is not None else None,
         packet_feature=packet_feature,
         add_reverse_edges=add_reverse_edges,
+        packet_semantic_npy=Path(packet_semantic_npy) if packet_semantic_npy is not None else None,
     )
     root = Path(output_root)
     _ensure_store_dirs(root)
@@ -429,6 +431,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--test-ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--packet-semantic-npy",
+        default=None,
+        help="Explicit path to packet_semantic_x.npy sidecar (auto-detected if absent).",
+    )
     return parser.parse_args()
 
 
@@ -443,6 +450,7 @@ def main() -> None:
         val_ratio=args.val_ratio,
         test_ratio=args.test_ratio,
         seed=args.seed,
+        packet_semantic_npy=args.packet_semantic_npy,
     )
     print(f"[OK] Graph store: {args.output_root}")
     print(
