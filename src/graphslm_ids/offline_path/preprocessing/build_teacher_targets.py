@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 from pathlib import Path
+import shutil
 import sys
 
 import numpy as np
@@ -114,6 +115,12 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="L2 normalize embeddings for cosine similarity usage.",
     )
+    parser.add_argument(
+        "--save-dtype",
+        default="float32",
+        choices=["float32", "float16"],
+        help="Dtype for saved embeddings. float16 halves disk usage with negligible cosine-similarity loss.",
+    )
     return parser.parse_args()
 
 
@@ -162,10 +169,30 @@ def main() -> None:
         teacher = torch.nn.DataParallel(teacher)
 
     hidden_size = int(backbone.config.hidden_size)
+    save_dtype = np.dtype(args.save_dtype)
+
+    required_bytes = total_rows * hidden_size * save_dtype.itemsize
+    disk = shutil.disk_usage(output_path.parent)
+    print(
+        f"[Disk] Required: {required_bytes / 1e9:.2f} GB | "
+        f"Free: {disk.free / 1e9:.2f} GB | "
+        f"dtype={save_dtype}"
+    )
+    if required_bytes > disk.free * 0.95:
+        safe_rows = int(disk.free * 0.90 / hidden_size / save_dtype.itemsize)
+        raise RuntimeError(
+            f"Not enough disk space: need {required_bytes / 1e9:.1f} GB, "
+            f"only {disk.free / 1e9:.1f} GB free.\n"
+            f"Options:\n"
+            f"  --max-rows {safe_rows:,}   (use a subset)\n"
+            f"  --save-dtype float16       (half the size)\n"
+            f"  Both together for maximum fit."
+        )
+
     teacher_targets = np.lib.format.open_memmap(
         str(output_path),
         mode="w+",
-        dtype=np.float32,
+        dtype=save_dtype,
         shape=(total_rows, hidden_size),
     )
 
@@ -198,7 +225,7 @@ def main() -> None:
 
             pooled = teacher(input_ids, attention_mask)
 
-            teacher_targets[start:end] = pooled.detach().cpu().numpy().astype(np.float32)
+            teacher_targets[start:end] = pooled.detach().cpu().numpy().astype(save_dtype)
 
     teacher_targets.flush()
 
@@ -216,6 +243,7 @@ def main() -> None:
         "max_length": args.max_length,
         "drop_padding": bool(args.drop_padding),
         "l2_normalize": bool(args.l2_normalize),
+        "save_dtype": str(save_dtype),
         "output_path": str(output_path),
     }
     write_json(output_path.with_suffix(".meta.json"), meta)
