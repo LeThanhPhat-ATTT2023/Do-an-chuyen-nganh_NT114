@@ -66,7 +66,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "patience": 30,
         "class_weight": "balanced",
         "seed": 42,
-        "device": "cpu",
+        "device": "auto",
+        "multi_gpu": True,
         "monitor": "val_macro_f1",
         "log_every": 1,
         "amp": False,
@@ -124,6 +125,10 @@ def parse_args() -> argparse.Namespace:
         help="Trade extra compute for lower activation memory during HGT training.",
     )
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--multi-gpu", dest="multi_gpu", action="store_true", default=None,
+                        help="Use all available CUDA GPUs (neighbor_sampling mode only).")
+    parser.add_argument("--no-multi-gpu", dest="multi_gpu", action="store_false",
+                        help="Disable multi-GPU and force single GPU/CPU.")
     return parser.parse_args()
 
 
@@ -181,6 +186,8 @@ def apply_cli_overrides(config: dict[str, Any], args: argparse.Namespace) -> dic
         config["train"]["activation_checkpointing"] = True
     if args.seed is not None:
         config["train"]["seed"] = args.seed
+    if args.multi_gpu is not None:
+        config["train"]["multi_gpu"] = args.multi_gpu
     return config
 
 
@@ -196,6 +203,96 @@ def resolve_device(name: str) -> torch.device:
     if name == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(name)
+
+
+def get_training_devices(primary: torch.device, multi_gpu: bool) -> list[torch.device]:
+    """Return all available CUDA devices when multi_gpu=True, else just the primary device."""
+    if primary.type != "cuda" or not multi_gpu:
+        return [primary]
+    n = torch.cuda.device_count()
+    if n <= 1:
+        return [primary]
+    return [torch.device("cuda", i) for i in range(n)]
+
+
+def _multi_gpu_train_step(
+    model: HeteroGraphTransformer,
+    batch_group: list[MiniBatchSubgraph],
+    devices: list[torch.device],
+    edge_types: list[tuple[str, str, str]],
+    weight: torch.Tensor | None,
+    scaler: torch.amp.GradScaler,
+    use_semantic_edge_weights: bool,
+    grad_accum_steps: int,
+) -> tuple[float, int, list[np.ndarray], list[np.ndarray], dict[str, list[int]], dict[str, list[int]]]:
+    """Forward-backward across multiple GPUs using parallel_apply, then sync gradients to primary model."""
+    import torch.nn.parallel as P
+
+    n = min(len(batch_group), len(devices))
+    primary = devices[0]
+    device_ids = [d.index for d in devices[:n]]
+
+    replicas = P.replicate(model, device_ids, detach=False)
+
+    inputs_args: list[tuple] = []
+    inputs_kwargs: list[dict[str, Any]] = []
+    masks: list[torch.Tensor] = []
+    all_labels: list[torch.Tensor] = []
+
+    for batch, device in zip(batch_group[:n], devices[:n]):
+        nf, ei, ew, sm, sl = to_torch_batch(batch, edge_types, device, use_semantic_edge_weights)
+        inputs_args.append((nf, ei))
+        inputs_kwargs.append({"edge_weight_dict": ew})
+        masks.append(sm)
+        all_labels.append(sl)
+
+    all_logits = P.parallel_apply(replicas, inputs_args, inputs_kwargs)
+
+    preds: list[np.ndarray] = []
+    labels_out: list[np.ndarray] = []
+    gpu_losses: list[torch.Tensor] = []
+    loss_sum_f = 0.0
+    examples = 0
+
+    for logits, sm, sl, device in zip(all_logits, masks, all_labels, devices[:n]):
+        seed_logits = logits[sm].float()
+        w = weight.to(device) if weight is not None else None
+        loss = F.cross_entropy(seed_logits, sl, weight=w)
+        gpu_losses.append(loss)
+        preds.append(seed_logits.detach().argmax(dim=1).cpu().numpy())
+        labels_out.append(sl.detach().cpu().numpy())
+        batch_n = int(sl.numel())
+        loss_sum_f += float(loss.item()) * batch_n
+        examples += batch_n
+
+    # Gather losses to primary device, scale by 1/(n_gpus * grad_accum), backward
+    avg_loss = sum(lv.to(primary) for lv in gpu_losses) / (n * grad_accum_steps)
+    scaler.scale(avg_loss).backward()
+
+    # Aggregate replica gradients to the original model's parameters
+    replica_params = [list(r.parameters()) for r in replicas]
+    for param_idx, p_model in enumerate(model.parameters()):
+        grad_agg: torch.Tensor | None = None
+        for rp_list in replica_params:
+            p_r = rp_list[param_idx]
+            if p_r.grad is not None:
+                g = p_r.grad.to(primary)
+                grad_agg = g if grad_agg is None else grad_agg.add_(g)
+        if grad_agg is not None:
+            if p_model.grad is None:
+                p_model.grad = grad_agg
+            else:
+                p_model.grad.add_(grad_agg)
+
+    node_stats: dict[str, list[int]] = {}
+    edge_stats: dict[str, list[int]] = {}
+    for batch in batch_group[:n]:
+        for nt, cnt in batch.stats.get("nodes", {}).items():
+            node_stats.setdefault(nt, []).append(int(cnt))
+        for et, cnt in batch.stats.get("edges", {}).items():
+            edge_stats.setdefault(et, []).append(int(cnt))
+
+    return loss_sum_f, examples, preds, labels_out, node_stats, edge_stats
 
 
 def stratified_split(
@@ -582,6 +679,12 @@ def evaluate_neighbor_sampling(
 
 
 def train_neighbor_sampling(config: dict[str, Any], seed: int, device: torch.device) -> None:
+    multi_gpu = bool(config["train"].get("multi_gpu", True))
+    devices = get_training_devices(device, multi_gpu)
+    n_gpus = len(devices)
+    if n_gpus > 1:
+        print(f"[Multi-GPU] Using {n_gpus} GPUs: {', '.join(str(d) for d in devices)}")
+
     backend = load_neighbor_backend(config)
     all_flow_ids = np.arange(int(backend.num_flows), dtype=np.int64)
     labels_np = backend.get_flow_labels(all_flow_ids)
@@ -674,35 +777,60 @@ def train_neighbor_sampling(config: dict[str, Any], seed: int, device: torch.dev
         sampled_nodes: dict[str, list[int]] = {"flow": [], "packet": [], "technique": [], "tactic": []}
         sampled_edges: dict[str, list[int]] = {}
 
-        for step, batch in enumerate(train_loader):
-            node_features, edge_index, edge_weight, seed_mask, seed_labels = to_torch_batch(
-                batch,
-                edge_types,
-                device,
-                use_semantic_edge_weights,
-            )
-            with torch.amp.autocast("cuda", enabled=use_amp):
-                logits = model(node_features, edge_index, edge_weight_dict=edge_weight)
-                seed_logits = logits[seed_mask]
-                loss = F.cross_entropy(seed_logits, seed_labels, weight=weight)
-                scaled_loss = loss / grad_accum_steps
-            scaler.scale(scaled_loss).backward()
+        train_iter = iter(train_loader)
+        step = 0
+        while True:
+            # Collect one batch per GPU to maximise parallelism
+            batch_group: list[MiniBatchSubgraph] = []
+            for _ in range(n_gpus):
+                try:
+                    batch_group.append(next(train_iter))
+                except StopIteration:
+                    break
+            if not batch_group:
+                break
+
+            if n_gpus > 1 and len(batch_group) > 1:
+                ls, ex, bp, bl, ns, es = _multi_gpu_train_step(
+                    model, batch_group, devices, edge_types, weight,
+                    scaler, use_semantic_edge_weights, grad_accum_steps,
+                )
+                loss_sum += ls
+                examples += ex
+                preds.extend(bp)
+                labels.extend(bl)
+                for nt, cnts in ns.items():
+                    sampled_nodes.setdefault(nt, []).extend(cnts)
+                for et, cnts in es.items():
+                    sampled_edges.setdefault(et, []).extend(cnts)
+            else:
+                batch = batch_group[0]
+                node_features, edge_index, edge_weight, seed_mask, seed_labels = to_torch_batch(
+                    batch, edge_types, device, use_semantic_edge_weights,
+                )
+                with torch.amp.autocast("cuda", enabled=use_amp):
+                    logits = model(node_features, edge_index, edge_weight_dict=edge_weight)
+                    seed_logits = logits[seed_mask]
+                    loss = F.cross_entropy(seed_logits, seed_labels, weight=weight)
+                    scaled_loss = loss / grad_accum_steps
+                scaler.scale(scaled_loss).backward()
+                batch_count = int(seed_labels.numel())
+                loss_sum += float(loss.detach().item()) * batch_count
+                examples += batch_count
+                preds.append(seed_logits.detach().float().argmax(dim=1).cpu().numpy())
+                labels.append(seed_labels.detach().cpu().numpy())
+                for node_type, count in batch.stats.get("nodes", {}).items():
+                    sampled_nodes.setdefault(node_type, []).append(int(count))
+                for edge_name, count in batch.stats.get("edges", {}).items():
+                    sampled_edges.setdefault(edge_name, []).append(int(count))
+
             pending_step = True
             if (step + 1) % grad_accum_steps == 0:
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
                 pending_step = False
-
-            batch_count = int(seed_labels.numel())
-            loss_sum += float(loss.detach().item()) * batch_count
-            examples += batch_count
-            preds.append(seed_logits.detach().float().argmax(dim=1).cpu().numpy())
-            labels.append(seed_labels.detach().cpu().numpy())
-            for node_type, count in batch.stats.get("nodes", {}).items():
-                sampled_nodes.setdefault(node_type, []).append(int(count))
-            for edge_name, count in batch.stats.get("edges", {}).items():
-                sampled_edges.setdefault(edge_name, []).append(int(count))
+            step += 1
 
         if pending_step:
             scaler.step(optimizer)
@@ -799,10 +927,11 @@ def train_neighbor_sampling(config: dict[str, Any], seed: int, device: torch.dev
             break
 
     best_payload = load_checkpoint(best_checkpoint, device)
+    device_str = str(device) + (f" x{n_gpus}" if n_gpus > 1 else "")
     summary = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "config": config,
-        "device": str(device),
+        "device": device_str,
         "best_checkpoint": str(best_checkpoint),
         "best_epoch": int(best_epoch),
         "best_score": float(best_score),
