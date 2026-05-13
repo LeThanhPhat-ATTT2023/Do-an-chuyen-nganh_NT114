@@ -52,6 +52,23 @@ def mean_pool(last_hidden_state: torch.Tensor, attention_mask: torch.Tensor) -> 
     return summed / denom
 
 
+class _TeacherForwardWrapper(torch.nn.Module):
+    """Thin wrapper so DataParallel can scatter positional tensor args correctly.
+
+    DataParallel only scatters positional tensor args along dim 0.  Calling
+    model(**dict) with a kwarg dict bypasses scattering, so we expose
+    input_ids and attention_mask as explicit positional args and return only
+    last_hidden_state so DataParallel can gather it directly.
+    """
+
+    def __init__(self, backbone: torch.nn.Module) -> None:
+        super().__init__()
+        self.backbone = backbone
+
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        return self.backbone(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Create teacher embedding targets from payload vectors using a transformer encoder."
@@ -122,11 +139,20 @@ def main() -> None:
     else:
         device = torch.device(args.device)
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    model = AutoModel.from_pretrained(args.model_name).to(device)
-    model.eval()
+    n_gpus = torch.cuda.device_count() if device.type == "cuda" else 0
+    # Scale total batch size by GPU count so each GPU processes args.batch_size tokens.
+    effective_batch = args.batch_size * max(1, n_gpus)
 
-    hidden_size = int(model.config.hidden_size)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    backbone = AutoModel.from_pretrained(args.model_name).to(device)
+    backbone.eval()
+
+    teacher: torch.nn.Module = _TeacherForwardWrapper(backbone)
+    if n_gpus > 1:
+        print(f"[Multi-GPU] Teacher encoding using {n_gpus} GPUs via DataParallel (batch {effective_batch}).")
+        teacher = torch.nn.DataParallel(teacher)
+
+    hidden_size = int(backbone.config.hidden_size)
     teacher_targets = np.lib.format.open_memmap(
         str(output_path),
         mode="w+",
@@ -135,8 +161,8 @@ def main() -> None:
     )
 
     with torch.no_grad():
-        for start in tqdm(range(0, total_rows, args.batch_size), desc="Encoding batches"):
-            end = min(start + args.batch_size, total_rows)
+        for start in tqdm(range(0, total_rows, effective_batch), desc="Encoding batches"):
+            end = min(start + effective_batch, total_rows)
             batch_rows = np.asarray(payload_matrix[start:end], dtype=np.uint8)
             if payload_lengths is not None:
                 batch_lengths = payload_lengths[start:end]
@@ -158,10 +184,11 @@ def main() -> None:
                 max_length=args.max_length,
                 return_tensors="pt",
             )
-            encoded = {key: value.to(device) for key, value in encoded.items()}
+            input_ids = encoded["input_ids"].to(device)
+            attention_mask = encoded["attention_mask"].to(device)
 
-            outputs = model(**encoded)
-            pooled = mean_pool(outputs.last_hidden_state, encoded["attention_mask"])
+            last_hidden = teacher(input_ids, attention_mask)
+            pooled = mean_pool(last_hidden, attention_mask)
             if args.l2_normalize:
                 pooled = F.normalize(pooled, p=2, dim=1)
 
@@ -176,7 +203,10 @@ def main() -> None:
         "teacher_model": args.model_name,
         "rows": total_rows,
         "embedding_dim": hidden_size,
-        "batch_size": args.batch_size,
+        "batch_size_per_gpu": args.batch_size,
+        "effective_batch_size": effective_batch,
+        "num_gpus": max(1, n_gpus),
+        "device": str(device),
         "max_length": args.max_length,
         "drop_padding": bool(args.drop_padding),
         "l2_normalize": bool(args.l2_normalize),

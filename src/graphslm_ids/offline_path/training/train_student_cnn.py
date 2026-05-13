@@ -66,7 +66,7 @@ def distillation_loss(
 
 
 def run_epoch(
-    model: Student1DCNN,
+    model: torch.nn.Module,
     loader: DataLoader,
     device: torch.device,
     optimizer: torch.optim.Optimizer | None,
@@ -164,7 +164,11 @@ def main() -> None:
         pin_memory=torch.cuda.is_available(),
     )
 
-    model = Student1DCNN(embedding_dim=dataset.embedding_dim, dropout=args.dropout).to(device)
+    model: torch.nn.Module = Student1DCNN(embedding_dim=dataset.embedding_dim, dropout=args.dropout).to(device)
+    n_gpus = torch.cuda.device_count() if device.type == "cuda" else 0
+    if n_gpus > 1:
+        print(f"[Multi-GPU] Student CNN using {n_gpus} GPUs via DataParallel.")
+        model = torch.nn.DataParallel(model)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     output_dir = ensure_dir(Path(args.output_dir))
@@ -199,9 +203,10 @@ def main() -> None:
         if entry["val_loss"] < best_val:
             best_val = entry["val_loss"]
             epochs_without_improvement = 0
+            raw_model = model.module if isinstance(model, torch.nn.DataParallel) else model
             torch.save(
                 {
-                    "model_state_dict": model.state_dict(),
+                    "model_state_dict": raw_model.state_dict(),
                     "embedding_dim": dataset.embedding_dim,
                     "epoch": epoch,
                     "val_loss": best_val,
@@ -218,7 +223,7 @@ def main() -> None:
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "payload_npy": args.payload_npy,
         "teacher_npy": args.teacher_npy,
-        "device": str(device),
+        "device": str(device) + (f" x{n_gpus}" if n_gpus > 1 else ""),
         "samples_total": total_samples,
         "samples_train": train_size,
         "samples_val": val_size,
