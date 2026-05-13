@@ -32,8 +32,19 @@ class DistillationDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
             raise ValueError("Payload matrix must be 2D.")
         if self.teacher.ndim != 2:
             raise ValueError("Teacher matrix must be 2D.")
-        if self.payload.shape[0] != self.teacher.shape[0]:
-            raise ValueError("Payload and teacher rows must match.")
+        if self.payload.shape[0] > self.teacher.shape[0]:
+            # Teacher was built with --max-rows; truncate payload to match.
+            import warnings
+            warnings.warn(
+                f"Payload rows ({self.payload.shape[0]:,}) > teacher rows ({self.teacher.shape[0]:,}). "
+                f"Truncating payload to {self.teacher.shape[0]:,} rows."
+            )
+            self.payload = self.payload[: self.teacher.shape[0]]
+        elif self.payload.shape[0] < self.teacher.shape[0]:
+            raise ValueError(
+                f"Teacher rows ({self.teacher.shape[0]:,}) > payload rows ({self.payload.shape[0]:,}). "
+                "Teacher must be rebuilt from the same payload."
+            )
 
         self.embedding_dim = int(self.teacher.shape[1])
 
