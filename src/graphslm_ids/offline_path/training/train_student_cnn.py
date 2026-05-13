@@ -238,6 +238,10 @@ def parse_args() -> argparse.Namespace:
         "--compile", action="store_true",
         help="Apply torch.compile(mode='reduce-overhead'). Requires PyTorch >= 2.0.",
     )
+    p.add_argument(
+        "--device", default="auto",
+        help="Device override: auto, cpu, cuda, cuda:0, etc. In DDP mode this is ignored.",
+    )
     return p.parse_args()
 
 
@@ -259,7 +263,13 @@ def main() -> None:
     rank, local_rank, world_size = setup_distributed()
     is_ddp = world_size > 1
 
-    device  = torch.device(f"cuda:{local_rank}") if torch.cuda.is_available() else torch.device("cpu")
+    # DDP always pins each rank to its local GPU; --device is ignored in that case.
+    if is_ddp:
+        device = torch.device(f"cuda:{local_rank}")
+    elif args.device == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(args.device)
     use_amp = device.type == "cuda"
 
     # All ranks use the same seed so the train/val split is identical everywhere.
