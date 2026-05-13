@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 from datetime import datetime, timezone
+import os
 from pathlib import Path
 import sys
 
@@ -58,7 +59,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument(
+        "--num-workers", type=int, default=-1,
+        help="DataLoader workers. -1 = auto (cpu_count // 2, max 4).",
+    )
     parser.add_argument("--device", default="auto")
     return parser.parse_args()
 
@@ -140,67 +144,79 @@ def evaluate_split(
     model: Student1DCNN,
     dataset: DistillationDataset,
     indices: list[int],
-    labels: list[str],
+    label_ids: np.ndarray,
+    unique_labels: np.ndarray,
     device: torch.device,
     batch_size: int,
     num_workers: int,
     split_name: str,
 ) -> tuple[dict[str, float | int], dict[str, dict[str, float | int]]]:
+    use_amp = device.type == "cuda"
     loader = DataLoader(
         Subset(dataset, indices),
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
+        persistent_workers=num_workers > 0,
+        prefetch_factor=2 if num_workers > 0 else None,
     )
 
-    total_count = 0
-    mse_sum = 0.0
-    cosine_sim_sum = 0.0
-    cosine_dist_sum = 0.0
+    n_labels = len(unique_labels)
+    count_acc     = np.zeros(n_labels, dtype=np.int64)
+    mse_acc       = np.zeros(n_labels, dtype=np.float64)
+    cosine_sim_acc  = np.zeros(n_labels, dtype=np.float64)
+    cosine_dist_acc = np.zeros(n_labels, dtype=np.float64)
 
-    per_label_raw: dict[str, dict[str, float | int]] = {}
+    total_count   = 0
+    mse_sum       = 0.0
+    cosine_sim_sum  = 0.0
+    cosine_dist_sum = 0.0
 
     model.eval()
     iterator = tqdm(loader, desc=f"eval-{split_name}", leave=False)
     with torch.no_grad():
         for payload, teacher, sample_idx in iterator:
-            payload = payload.to(device)
-            teacher = teacher.to(device)
+            payload = payload.to(device, non_blocking=True)
+            teacher = teacher.to(device, non_blocking=True)
 
-            output = model(payload)
+            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+                output = model(payload)
 
-            mse_item = F.mse_loss(output, teacher, reduction="none").mean(dim=1)
-            cosine_sim_item = F.cosine_similarity(output, teacher, dim=1)
+            # Compute metrics in full precision for numerical accuracy.
+            out_f = output.float()
+            tch_f = teacher.float()
+            mse_item       = F.mse_loss(out_f, tch_f, reduction="none").mean(dim=1)
+            cosine_sim_item  = F.cosine_similarity(out_f, tch_f, dim=1)
             cosine_dist_item = 1.0 - cosine_sim_item
 
-            batch_size_actual = int(payload.shape[0])
-            total_count += batch_size_actual
-            mse_sum += float(mse_item.sum().item())
-            cosine_sim_sum += float(cosine_sim_item.sum().item())
-            cosine_dist_sum += float(cosine_dist_item.sum().item())
+            mse_np       = mse_item.cpu().numpy().astype(np.float64)
+            cosine_sim_np  = cosine_sim_item.cpu().numpy().astype(np.float64)
+            cosine_dist_np = cosine_dist_item.cpu().numpy().astype(np.float64)
+            idx_np = sample_idx.numpy()
 
-            mse_values = mse_item.cpu().tolist()
-            cosine_sim_values = cosine_sim_item.cpu().tolist()
-            cosine_dist_values = cosine_dist_item.cpu().tolist()
-            sample_indices = sample_idx.cpu().tolist()
+            total_count     += len(idx_np)
+            mse_sum         += float(mse_np.sum())
+            cosine_sim_sum  += float(cosine_sim_np.sum())
+            cosine_dist_sum += float(cosine_dist_np.sum())
 
-            for i, dataset_idx in enumerate(sample_indices):
-                label = labels[int(dataset_idx)]
-                bucket = per_label_raw.setdefault(
-                    label,
-                    {
-                        "count": 0,
-                        "mse_sum": 0.0,
-                        "cosine_sim_sum": 0.0,
-                        "cosine_dist_sum": 0.0,
-                    },
-                )
+            batch_lids = label_ids[idx_np]
+            np.add.at(count_acc,      batch_lids, 1)
+            np.add.at(mse_acc,        batch_lids, mse_np)
+            np.add.at(cosine_sim_acc,  batch_lids, cosine_sim_np)
+            np.add.at(cosine_dist_acc, batch_lids, cosine_dist_np)
 
-                bucket["count"] = int(bucket["count"]) + 1
-                bucket["mse_sum"] = float(bucket["mse_sum"]) + float(mse_values[i])
-                bucket["cosine_sim_sum"] = float(bucket["cosine_sim_sum"]) + float(cosine_sim_values[i])
-                bucket["cosine_dist_sum"] = float(bucket["cosine_dist_sum"]) + float(cosine_dist_values[i])
+    # Rebuild per_label_raw dict (format expected by finalize_per_label).
+    per_label_raw: dict[str, dict[str, float | int]] = {}
+    for lid, lbl in enumerate(unique_labels):
+        c = int(count_acc[lid])
+        if c > 0:
+            per_label_raw[str(lbl)] = {
+                "count":           c,
+                "mse_sum":         float(mse_acc[lid]),
+                "cosine_sim_sum":  float(cosine_sim_acc[lid]),
+                "cosine_dist_sum": float(cosine_dist_acc[lid]),
+            }
 
     return finalize_overall(total_count, mse_sum, cosine_sim_sum, cosine_dist_sum), finalize_per_label(per_label_raw)
 
@@ -213,10 +229,20 @@ def main() -> None:
     else:
         device = torch.device(args.device)
 
+    if args.num_workers < 0:
+        num_workers = max(1, min((os.cpu_count() or 1) // 2, 4))
+    else:
+        num_workers = args.num_workers
+
     dataset = DistillationDataset(Path(args.payload_npy), Path(args.teacher_npy))
     labels = load_labels(Path(args.metadata_csv))
     if len(labels) != len(dataset):
         raise ValueError("metadata.csv row count must match payload/teacher row count.")
+
+    # Pre-encode labels as integer IDs once — avoids repeated string lookups
+    # inside evaluate_split and enables fast numpy scatter-add aggregation.
+    label_arr = np.array(labels)
+    unique_labels, label_ids = np.unique(label_arr, return_inverse=True)
 
     total_samples = len(dataset)
     if total_samples < 2:
@@ -243,36 +269,14 @@ def main() -> None:
     model = Student1DCNN(embedding_dim=embedding_dim, dropout=args.dropout).to(device)
     model.load_state_dict(model_state)
 
-    all_overall, all_per_label = evaluate_split(
-        model,
-        dataset,
-        all_indices,
-        labels,
-        device,
-        args.batch_size,
-        args.num_workers,
-        split_name="all",
+    eval_kw = dict(
+        model=model, dataset=dataset,
+        label_ids=label_ids, unique_labels=unique_labels,
+        device=device, batch_size=args.batch_size, num_workers=num_workers,
     )
-    train_overall, train_per_label = evaluate_split(
-        model,
-        dataset,
-        train_indices,
-        labels,
-        device,
-        args.batch_size,
-        args.num_workers,
-        split_name="train",
-    )
-    val_overall, val_per_label = evaluate_split(
-        model,
-        dataset,
-        val_indices,
-        labels,
-        device,
-        args.batch_size,
-        args.num_workers,
-        split_name="val",
-    )
+    all_overall,   all_per_label   = evaluate_split(indices=all_indices,   split_name="all",   **eval_kw)
+    train_overall, train_per_label = evaluate_split(indices=train_indices, split_name="train", **eval_kw)
+    val_overall,   val_per_label   = evaluate_split(indices=val_indices,   split_name="val",   **eval_kw)
 
     output_path = Path(args.output_path)
     ensure_dir(output_path.parent)

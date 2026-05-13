@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import random
 import sys
+import threading
 
 import numpy as np
 import torch
@@ -37,6 +38,34 @@ if str(SRC_DIR) not in sys.path:
 
 from graphslm_ids.models.student_cnn import Student1DCNN
 from graphslm_ids.utils.io import ensure_dir, write_json
+
+
+# ── async checkpoint ──────────────────────────────────────────────────────────
+
+_ckpt_save_thread: threading.Thread | None = None
+
+
+def _save_checkpoint_bg(state: dict, path: Path) -> None:
+    """Save checkpoint in background thread; joins previous save first.
+
+    Callers must CPU-clone all tensors in *state* before calling this function,
+    otherwise the background write races with the optimizer modifying shared
+    CUDA storage.
+    """
+    global _ckpt_save_thread
+    if _ckpt_save_thread is not None:
+        _ckpt_save_thread.join()
+    _ckpt_save_thread = threading.Thread(
+        target=torch.save, args=(state, path), daemon=True
+    )
+    _ckpt_save_thread.start()
+
+
+def _join_checkpoint_bg() -> None:
+    global _ckpt_save_thread
+    if _ckpt_save_thread is not None:
+        _ckpt_save_thread.join()
+        _ckpt_save_thread = None
 
 
 # ── distributed ───────────────────────────────────────────────────────────────
@@ -258,7 +287,7 @@ def main() -> None:
         pin_memory        = use_amp,
         num_workers       = num_workers,
         persistent_workers= num_workers > 0,
-        prefetch_factor   = 2 if num_workers > 0 else None,
+        prefetch_factor   = (4 if use_amp else 2) if num_workers > 0 else None,
     )
 
     if is_ddp:
@@ -373,15 +402,17 @@ def main() -> None:
                 save_model = raw_model
                 if hasattr(save_model, "_orig_mod"):   # unwrap torch.compile
                     save_model = save_model._orig_mod
-                torch.save(
-                    {
-                        "model_state_dict": save_model.state_dict(),
-                        "embedding_dim":    dataset.embedding_dim,
-                        "epoch":            epoch,
-                        "val_loss":         best_val,
+                # CPU-clone tensors before handing off to background thread so
+                # the optimizer cannot race-modify shared CUDA storage.
+                ckpt = {
+                    "model_state_dict": {
+                        k: v.clone().cpu() for k, v in save_model.state_dict().items()
                     },
-                    best_ckpt_path,
-                )
+                    "embedding_dim":    dataset.embedding_dim,
+                    "epoch":            epoch,
+                    "val_loss":         best_val,
+                }
+                _save_checkpoint_bg(ckpt, best_ckpt_path)
             else:
                 epochs_no_improve += 1
 
@@ -418,6 +449,7 @@ def main() -> None:
         print(f"[OK] checkpoint  → {best_ckpt_path}")
         print(f"[OK] summary     → {output_dir / 'training_summary.json'}")
 
+    _join_checkpoint_bg()
     teardown_distributed()
 
 
