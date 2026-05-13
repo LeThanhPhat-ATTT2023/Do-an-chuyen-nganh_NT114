@@ -62,6 +62,14 @@ def load_three_tier_graph_artifact(
     with np.load(graph_npz, allow_pickle=False) as loaded:
         arrays = {key: loaded[key] for key in loaded.files}
 
+    # Support memory-efficient build: packet_semantic_x saved as a separate mmap .npy
+    # alongside the NPZ (named <stem>_packet_semantic_x.npy) to avoid loading ~59 GB
+    # through the zip-compression layer.
+    if "packet_semantic_x" not in arrays:
+        sidecar = graph_npz.with_name(graph_npz.stem + "_packet_semantic_x.npy")
+        if sidecar.exists():
+            arrays["packet_semantic_x"] = np.load(str(sidecar), mmap_mode="r")
+
     metadata: dict[str, Any] = {}
     if graph_meta_json.exists():
         with graph_meta_json.open("r", encoding="utf-8") as handle:
