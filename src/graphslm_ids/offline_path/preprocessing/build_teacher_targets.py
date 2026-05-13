@@ -57,16 +57,25 @@ class _TeacherForwardWrapper(torch.nn.Module):
 
     DataParallel only scatters positional tensor args along dim 0.  Calling
     model(**dict) with a kwarg dict bypasses scattering, so we expose
-    input_ids and attention_mask as explicit positional args and return only
-    last_hidden_state so DataParallel can gather it directly.
+    input_ids and attention_mask as explicit positional args.
+
+    Mean-pooling and L2-normalisation are done INSIDE the forward so that
+    DataParallel only needs to gather a (shard, hidden_size) tensor instead of
+    (shard, seq_len, hidden_size), cutting inter-GPU transfer by ~seq_len times.
     """
 
-    def __init__(self, backbone: torch.nn.Module) -> None:
+    def __init__(self, backbone: torch.nn.Module, l2_normalize: bool = True) -> None:
         super().__init__()
         self.backbone = backbone
+        self.l2_normalize = l2_normalize
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        return self.backbone(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        last_hidden = self.backbone(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        mask = attention_mask.unsqueeze(-1).expand(last_hidden.size()).float()
+        pooled = (last_hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
+        if self.l2_normalize:
+            pooled = F.normalize(pooled, p=2, dim=1)
+        return pooled
 
 
 def parse_args() -> argparse.Namespace:
@@ -147,7 +156,7 @@ def main() -> None:
     backbone = AutoModel.from_pretrained(args.model_name).to(device)
     backbone.eval()
 
-    teacher: torch.nn.Module = _TeacherForwardWrapper(backbone)
+    teacher: torch.nn.Module = _TeacherForwardWrapper(backbone, l2_normalize=args.l2_normalize)
     if n_gpus > 1:
         print(f"[Multi-GPU] Teacher encoding using {n_gpus} GPUs via DataParallel (batch {effective_batch}).")
         teacher = torch.nn.DataParallel(teacher)
@@ -187,10 +196,7 @@ def main() -> None:
             input_ids = encoded["input_ids"].to(device)
             attention_mask = encoded["attention_mask"].to(device)
 
-            last_hidden = teacher(input_ids, attention_mask)
-            pooled = mean_pool(last_hidden, attention_mask)
-            if args.l2_normalize:
-                pooled = F.normalize(pooled, p=2, dim=1)
+            pooled = teacher(input_ids, attention_mask)
 
             teacher_targets[start:end] = pooled.detach().cpu().numpy().astype(np.float32)
 
