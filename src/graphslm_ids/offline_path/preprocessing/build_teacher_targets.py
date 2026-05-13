@@ -189,15 +189,19 @@ def main() -> None:
             f"  Both together for maximum fit."
         )
 
+    print(f"[Memmap] Creating {output_path} ({required_bytes / 1e9:.2f} GB)...", flush=True)
     teacher_targets = np.lib.format.open_memmap(
         str(output_path),
         mode="w+",
         dtype=save_dtype,
         shape=(total_rows, hidden_size),
     )
+    print(f"[Memmap] Done. Starting encoding {total_rows:,} rows...", flush=True)
 
+    n_batches = (total_rows + effective_batch - 1) // effective_batch
     with torch.no_grad():
-        for start in tqdm(range(0, total_rows, effective_batch), desc="Encoding batches"):
+        for start in tqdm(range(0, total_rows, effective_batch), desc="Encoding batches",
+                          total=n_batches, file=sys.stdout, dynamic_ncols=True):
             end = min(start + effective_batch, total_rows)
             batch_rows = np.asarray(payload_matrix[start:end], dtype=np.uint8)
             if payload_lengths is not None:
