@@ -94,7 +94,8 @@ def _normalize_rows(x: np.ndarray) -> np.ndarray:
 # ── batched similarity (GPU → CPU fallback) ───────────────────────────────────
 
 def _compute_sim_edges_and_flow_sums(
-    packet_emb: np.ndarray,          # (N_pkt, D)  L2-normalised float32
+    student_emb: np.ndarray,         # (N_payload, D) mmap — full student embedding matrix
+    packet_payload_idx: np.ndarray,  # (N_pkt,) indices into student_emb (graph packet order)
     mitre_emb: np.ndarray,           # (N_tech, D) L2-normalised float32
     contain_flow: np.ndarray,        # (E,) flow graph-indices  (contain_edge_index[0])
     contain_pkt: np.ndarray,         # (E,) packet graph-indices (contain_edge_index[1])
@@ -103,15 +104,19 @@ def _compute_sim_edges_and_flow_sums(
     threshold: float,
     device: torch.device,
     batch_size: int,
+    packet_semantic_out: np.ndarray, # (N_pkt, D) mmap — written in-place (avoids RAM spike)
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Single batched pass that produces:
-    - packet→technique edge arrays  (src, dst, score)
-    - flow-level similarity sums    (N_flows, N_tech) and counts (N_flows,)
+    """Stream packet embeddings from mmap in batches — never materialises the full
+    N_pkt × D array in RAM.  Each batch:
+      1. Reads student_emb[packet_payload_idx[start:end]] from disk via mmap.
+      2. Writes raw floats to packet_semantic_out (disk-backed).
+      3. L2-normalises in-place for cosine similarity.
+      4. Computes top-k packet→technique edges and accumulates flow sums.
 
-    GPU memory is kept bounded to ~batch_size × D × 4 bytes per step.
+    GPU memory stays bounded to ~batch_size × D × 4 bytes per step.
     Falls back to CPU automatically on CUDA OOM.
     """
-    N_pkt  = packet_emb.shape[0]
+    N_pkt  = len(packet_payload_idx)
     N_tech = mitre_emb.shape[0]
     k      = min(packet_top_k, N_tech)
 
@@ -134,8 +139,22 @@ def _compute_sim_edges_and_flow_sums(
     flow_tech_count = np.zeros(num_flows,            dtype=np.float32)
 
     for start in tqdm(range(0, N_pkt, batch_size), desc="similarity", unit="batch", leave=False):
-        end   = min(start + batch_size, N_pkt)
-        batch = torch.from_numpy(np.ascontiguousarray(packet_emb[start:end])).to(device)
+        end     = min(start + batch_size, N_pkt)
+        row_idx = packet_payload_idx[start:end]
+
+        # Read only this batch from the mmap — O(batch) RAM, not O(N_pkt)
+        batch_raw = np.ascontiguousarray(student_emb[row_idx], dtype=np.float32)
+
+        # Persist raw embedding to the disk-backed output (zero additional RAM)
+        packet_semantic_out[start:end] = batch_raw
+
+        # L2-normalise per-batch for cosine similarity
+        norms      = np.linalg.norm(batch_raw, axis=1, keepdims=True)
+        batch_norm = batch_raw / np.maximum(norms, 1e-12)
+        del batch_raw
+
+        batch = torch.from_numpy(batch_norm).to(device)
+        del batch_norm
 
         # matrix multiply with OOM fallback to CPU
         try:
@@ -186,26 +205,45 @@ def _select_flow_edges(
     flow_top_k:      int,
     threshold:       float,
     device:          torch.device,
+    chunk_size:      int = 50_000,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Compute flow→technique top-k edges from accumulated sums."""
-    count_safe = np.maximum(flow_tech_count[:, np.newaxis], 1.0)
-    avg = (flow_tech_sum / count_safe).astype(np.float32)
+    """Compute flow→technique top-k edges from accumulated sums.
 
-    N_flows, N_tech = avg.shape
+    Processes rows in chunks to avoid materialising the full (N_flows, N_tech)
+    float32 matrix, which can exceed available RAM for large datasets.
+    """
+    N_flows, N_tech = flow_tech_sum.shape
     k = min(flow_top_k, N_tech)
 
-    avg_t = torch.from_numpy(avg).to(device)
-    topk_scores, topk_idx = torch.topk(avg_t, k=k, dim=1, largest=True, sorted=False)
-    above   = topk_scores >= threshold
-    row_ids = torch.arange(N_flows, device=avg_t.device).unsqueeze(1).expand_as(topk_scores)
+    src_chunks:   list[np.ndarray] = []
+    dst_chunks:   list[np.ndarray] = []
+    score_chunks: list[np.ndarray] = []
 
-    src   = row_ids[above].cpu().numpy().astype(np.int64)
-    dst   = topk_idx[above].cpu().numpy().astype(np.int64)
-    score = topk_scores[above].cpu().numpy().astype(np.float32)
+    for start in range(0, N_flows, chunk_size):
+        end = min(start + chunk_size, N_flows)
 
-    del avg_t, topk_scores, topk_idx
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
+        count_safe = np.maximum(flow_tech_count[start:end, np.newaxis], 1.0)
+        avg_chunk  = (flow_tech_sum[start:end] / count_safe).astype(np.float32)
+
+        avg_t = torch.from_numpy(avg_chunk).to(device)
+        topk_scores, topk_idx = torch.topk(avg_t, k=k, dim=1, largest=True, sorted=False)
+        above   = topk_scores >= threshold
+        row_ids = (
+            torch.arange(start, end, device=avg_t.device)
+            .unsqueeze(1).expand_as(topk_scores)
+        )
+
+        src_chunks.append(row_ids[above].cpu().numpy().astype(np.int64))
+        dst_chunks.append(topk_idx[above].cpu().numpy().astype(np.int64))
+        score_chunks.append(topk_scores[above].cpu().numpy().astype(np.float32))
+
+        del avg_t, topk_scores, topk_idx, avg_chunk
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    src   = np.concatenate(src_chunks)   if src_chunks   else np.empty(0, np.int64)
+    dst   = np.concatenate(dst_chunks)   if dst_chunks   else np.empty(0, np.int64)
+    score = np.concatenate(score_chunks) if score_chunks else np.empty(0, np.float32)
 
     return src, dst, score
 
@@ -266,10 +304,22 @@ def main() -> None:
 
     # ── load inputs ───────────────────────────────────────────────────────────
     print("[1/6] Loading inputs …", flush=True)
-    metadata       = pd.read_csv(metadata_csv)
-    payload_matrix = np.load(payload_npy)
+    # Optimised dtypes cut DataFrame RAM by ~50 % vs default int64/object inference
+    _cat = "category"
+    metadata = pd.read_csv(metadata_csv, dtype={
+        "pcap_file":       _cat,
+        "label":           _cat,
+        "src_ip":          _cat,
+        "dst_ip":          _cat,
+        "protocol":        _cat,
+        "packet_index":    np.int32,
+        "src_port":        np.int32,
+        "dst_port":        np.int32,
+        "payload_len_raw": np.int32,
+    })
+    payload_matrix    = np.load(payload_npy,        mmap_mode="r")
+    student_embedding = np.load(student_embedding_npy, mmap_mode="r")
 
-    student_embedding = np.asarray(np.load(student_embedding_npy), dtype=np.float32)
     if student_embedding.ndim != 2:
         raise ValueError("student embedding must be 2D")
     if student_embedding.shape[0] != payload_matrix.shape[0]:
@@ -296,14 +346,26 @@ def main() -> None:
         max_packets_per_flow=args.max_packets_per_flow,
     )
 
-    # ── select packet embeddings ──────────────────────────────────────────────
-    packet_payload_row_index = base_artifact.arrays["packet_payload_row_index"]
-    packet_embedding = student_embedding[packet_payload_row_index]
+    # Free the metadata DataFrame immediately — graph structure is built, no longer needed
+    import gc
+    del metadata
+    gc.collect()
+    print("[mem] metadata freed", flush=True)
 
-    # ── L2-normalise ──────────────────────────────────────────────────────────
-    print("[3/6] L2-normalising embeddings …", flush=True)
-    packet_emb_norm = _normalize_rows(packet_embedding)
-    mitre_emb_norm  = _normalize_rows(mitre_embedding)
+    # ── allocate disk-backed mmap for packet_semantic_x ───────────────────────
+    # Keeps N_pkt × D × 4 bytes off RAM; written in-place during the similarity loop.
+    packet_payload_row_index = base_artifact.arrays["packet_payload_row_index"]
+    N_pkt         = int(packet_payload_row_index.shape[0])
+    embedding_dim = int(student_embedding.shape[1])
+    packet_semantic_npy = output_npz.with_name(output_npz.stem + "_packet_semantic_x.npy")
+    pkt_sem_gb = N_pkt * embedding_dim * 4 / 1e9
+    print(f"[3/6] Allocating packet_semantic_x on disk  ({N_pkt:,} × {embedding_dim} = {pkt_sem_gb:.2f} GB) …", flush=True)
+    packet_semantic_mmap = np.lib.format.open_memmap(
+        str(packet_semantic_npy), mode="w+", dtype=np.float32, shape=(N_pkt, embedding_dim)
+    )
+
+    # ── L2-normalise MITRE embeddings (tiny — stays in RAM) ───────────────────
+    mitre_emb_norm = _normalize_rows(mitre_embedding)
 
     # ── batched GPU/CPU cosine similarity ─────────────────────────────────────
     contain_edge_index = base_artifact.arrays["contain_edge_index"]
@@ -313,12 +375,13 @@ def main() -> None:
 
     print(
         f"[4/6] Cosine similarity  "
-        f"packets={packet_emb_norm.shape[0]:,}  techniques={mitre_emb_norm.shape[0]}  "
+        f"packets={N_pkt:,}  techniques={mitre_emb_norm.shape[0]}  "
         f"device={device}  batch={args.sim_batch_size:,}",
         flush=True,
     )
     pkt_src, pkt_dst, pkt_score, flow_tech_sum, flow_tech_count = _compute_sim_edges_and_flow_sums(
-        packet_emb=packet_emb_norm,
+        student_emb=student_embedding,
+        packet_payload_idx=packet_payload_row_index,
         mitre_emb=mitre_emb_norm,
         contain_flow=contain_flow,
         contain_pkt=contain_pkt,
@@ -327,7 +390,11 @@ def main() -> None:
         threshold=args.similarity_threshold,
         device=device,
         batch_size=args.sim_batch_size,
+        packet_semantic_out=packet_semantic_mmap,
     )
+    packet_semantic_mmap.flush()
+    del packet_semantic_mmap  # close mmap; file stays on disk
+    gc.collect()
 
     if pkt_src.size > 0:
         packet_technique_edge_index = np.vstack([pkt_src, pkt_dst])
@@ -367,12 +434,13 @@ def main() -> None:
     ) = _build_technique_tactic_arrays(techniques_df, technique_tactic_edges_df)
 
     # ── assemble and save ─────────────────────────────────────────────────────
+    # packet_semantic_x is already on disk as packet_semantic_npy (mmap file written above).
+    # Excluding it from the compressed NPZ avoids decompressing/recompressing ~59 GB in RAM.
     print("[6/6] Saving NPZ …", flush=True)
     arrays = dict(base_artifact.arrays)
     arrays.update(
         {
             "technique_x":                   mitre_embedding,
-            "packet_semantic_x":             packet_embedding,
             "packet_technique_edge_index":   packet_technique_edge_index,
             "packet_technique_edge_attr":    packet_technique_edge_attr,
             "flow_technique_edge_index":     flow_technique_edge_index,
@@ -394,6 +462,7 @@ def main() -> None:
         "mitre_technique_embeddings_npy":   str(mitre_technique_embeddings_npy),
         "mitre_technique_tactic_edges_csv": str(mitre_technique_tactic_edges),
         "graph_output_npz":                 str(output_npz),
+        "packet_semantic_x_npy":           str(packet_semantic_npy),
         "device":                           str(device),
         "sim_batch_size":                   int(args.sim_batch_size),
         "flow_timeout_seconds":             float(args.flow_timeout_seconds),
