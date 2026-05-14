@@ -202,70 +202,89 @@ class HeteroNeighborSampler:
             "technique": {},
             "tactic": {},
         }
-        for flow_id in seeds:
-            _add_node(local_nodes, local_maps, "flow", int(flow_id))
+        _add_nodes_bulk(local_nodes, local_maps, "flow", seeds)
 
-        edge_rows: dict[EdgeKey, list[tuple[int, int, float]]] = {
+        # Per edge_type we accumulate three flat numpy arrays (src_global, dst_global, weight).
+        # Concatenating happens once at the end, so the K-hop loop stays free of Python-level
+        # tuple appends.
+        edge_chunks: dict[EdgeKey, list[tuple[np.ndarray, np.ndarray, np.ndarray]]] = {
             edge_type: [] for edge_type in self.backend.edge_types
         }
-        frontier: dict[str, list[int]] = {"flow": [int(x) for x in seeds.tolist()]}
+        frontier: dict[str, np.ndarray] = {"flow": seeds.copy()}
 
         for _ in range(self.hops):
-            next_frontier: dict[str, list[int]] = {}
+            next_frontier: dict[str, list[np.ndarray]] = {}
             for edge_type in self.backend.edge_types:
                 src_type, _, dst_type = edge_type
-                src_ids = frontier.get(src_type)
-                if not src_ids:
+                src_arr = frontier.get(src_type)
+                if src_arr is None or src_arr.size == 0:
                     continue
                 fanout = self._fanout(edge_type)
                 if fanout == 0:
                     continue
                 local_indptr, dst_ids, weights = self.backend.out_neighbors(
                     edge_type,
-                    np.asarray(src_ids, dtype=np.int64),
+                    src_arr,
                     fanout=fanout,
                     rng=self.rng,
                 )
-                for row, src_id in enumerate(src_ids):
-                    start = int(local_indptr[row])
-                    end = int(local_indptr[row + 1])
-                    for dst_id, weight in zip(dst_ids[start:end], weights[start:end]):
-                        dst_int = int(dst_id)
-                        edge_rows.setdefault(edge_type, []).append((int(src_id), dst_int, float(weight)))
-                        _add_node(local_nodes, local_maps, src_type, int(src_id))
-                        added = _add_node(local_nodes, local_maps, dst_type, dst_int)
-                        if added:
-                            next_frontier.setdefault(dst_type, []).append(dst_int)
-            frontier = next_frontier
-            if not frontier:
+                if dst_ids.size == 0:
+                    continue
+                counts_per_src = np.diff(local_indptr).astype(np.int64)
+                src_repeated = np.repeat(src_arr.astype(np.int64), counts_per_src)
+                edge_chunks[edge_type].append(
+                    (src_repeated, dst_ids.astype(np.int64), weights.astype(np.float32))
+                )
+
+                _add_nodes_bulk(local_nodes, local_maps, src_type, src_arr)
+                newly_added = _add_nodes_bulk(local_nodes, local_maps, dst_type, dst_ids)
+                if newly_added.size:
+                    next_frontier.setdefault(dst_type, []).append(newly_added)
+
+            if not next_frontier:
+                frontier = {}
                 break
+            frontier = {ntype: np.concatenate(chunks) for ntype, chunks in next_frontier.items()}
 
         if self.always_include_all_techniques:
-            for tech_id in range(int(self.backend.num_techniques)):
-                _add_node(local_nodes, local_maps, "technique", tech_id)
+            _add_nodes_bulk(
+                local_nodes,
+                local_maps,
+                "technique",
+                np.arange(int(self.backend.num_techniques), dtype=np.int64),
+            )
         if self.always_include_all_tactics:
-            for tactic_id in range(int(self.backend.num_tactics)):
-                _add_node(local_nodes, local_maps, "tactic", tactic_id)
-        self._add_static_tactic_edges(edge_rows, local_nodes, local_maps)
+            _add_nodes_bulk(
+                local_nodes,
+                local_maps,
+                "tactic",
+                np.arange(int(self.backend.num_tactics), dtype=np.int64),
+            )
+        self._add_static_tactic_edges(edge_chunks, local_nodes, local_maps)
 
         edge_index: dict[EdgeKey, np.ndarray] = {}
         edge_attr: dict[EdgeKey, np.ndarray] = {}
         for edge_type in self.backend.edge_types:
-            rows = edge_rows.get(edge_type, [])
-            src_type, _, dst_type = edge_type
-            pairs: list[tuple[int, int]] = []
-            weights: list[float] = []
-            for src_global, dst_global, weight in rows:
-                if src_global not in local_maps[src_type] or dst_global not in local_maps[dst_type]:
-                    continue
-                pairs.append((local_maps[src_type][src_global], local_maps[dst_type][dst_global]))
-                weights.append(weight)
-            if pairs:
-                edge_index[edge_type] = np.asarray(pairs, dtype=np.int64).T
-                edge_attr[edge_type] = np.asarray(weights, dtype=np.float32)
-            else:
+            chunks = edge_chunks.get(edge_type, [])
+            if not chunks:
                 edge_index[edge_type] = np.empty((2, 0), dtype=np.int64)
                 edge_attr[edge_type] = np.empty((0,), dtype=np.float32)
+                continue
+            src_type, _, dst_type = edge_type
+            src_global = np.concatenate([c[0] for c in chunks])
+            dst_global = np.concatenate([c[1] for c in chunks])
+            w_global = np.concatenate([c[2] for c in chunks])
+            src_local = _remap_global_to_local(src_global, local_maps[src_type])
+            dst_local = _remap_global_to_local(dst_global, local_maps[dst_type])
+            valid = (src_local >= 0) & (dst_local >= 0)
+            if not bool(valid.any()):
+                edge_index[edge_type] = np.empty((2, 0), dtype=np.int64)
+                edge_attr[edge_type] = np.empty((0,), dtype=np.float32)
+                continue
+            edge_index[edge_type] = np.vstack(
+                [src_local[valid].astype(np.int64), dst_local[valid].astype(np.int64)]
+            )
+            edge_attr[edge_type] = w_global[valid].astype(np.float32)
 
         flow_ids = np.asarray(local_nodes["flow"], dtype=np.int64)
         packet_ids = np.asarray(local_nodes["packet"], dtype=np.int64)
@@ -328,30 +347,44 @@ class HeteroNeighborSampler:
 
     def _add_static_tactic_edges(
         self,
-        edge_rows: dict[EdgeKey, list[tuple[int, int, float]]],
+        edge_chunks: dict[EdgeKey, list[tuple[np.ndarray, np.ndarray, np.ndarray]]],
         local_nodes: dict[str, list[int]],
         local_maps: dict[str, dict[int, int]],
     ) -> None:
         edge_type = ("technique", "belongs_to_tactic", "tactic")
         if edge_type not in self.backend.edge_types or not local_nodes["technique"]:
             return
+        technique_src = np.asarray(local_nodes["technique"], dtype=np.int64)
         local_indptr, dst_ids, weights = self.backend.out_neighbors(
             edge_type,
-            np.asarray(local_nodes["technique"], dtype=np.int64),
+            technique_src,
             fanout=None,
             rng=self.rng,
         )
-        rows = edge_rows.setdefault(edge_type, [])
-        existing = {(src, dst) for src, dst, _ in rows}
-        for row, src_id in enumerate(local_nodes["technique"]):
-            start = int(local_indptr[row])
-            end = int(local_indptr[row + 1])
-            for dst_id, weight in zip(dst_ids[start:end], weights[start:end]):
-                dst_int = int(dst_id)
-                _add_node(local_nodes, local_maps, "tactic", dst_int)
-                if (int(src_id), dst_int) not in existing:
-                    rows.append((int(src_id), dst_int, float(weight)))
-                    existing.add((int(src_id), dst_int))
+        if dst_ids.size == 0:
+            return
+        counts_per_src = np.diff(local_indptr).astype(np.int64)
+        src_repeated = np.repeat(technique_src, counts_per_src)
+        dst_arr = dst_ids.astype(np.int64)
+        w_arr = weights.astype(np.float32)
+        _add_nodes_bulk(local_nodes, local_maps, "tactic", dst_arr)
+
+        existing_chunks = edge_chunks.get(edge_type, [])
+        if existing_chunks:
+            # Filter out (src, dst) pairs already produced by the K-hop loop so the
+            # static technique→tactic appendix does not duplicate them.
+            existing_src = np.concatenate([c[0] for c in existing_chunks])
+            existing_dst = np.concatenate([c[1] for c in existing_chunks])
+            num_tactics = int(self.backend.num_tactics)
+            existing_keys = existing_src * np.int64(num_tactics) + existing_dst
+            new_keys = src_repeated * np.int64(num_tactics) + dst_arr
+            keep = ~np.isin(new_keys, existing_keys, assume_unique=False)
+            if not bool(keep.any()):
+                return
+            src_repeated = src_repeated[keep]
+            dst_arr = dst_arr[keep]
+            w_arr = w_arr[keep]
+        edge_chunks.setdefault(edge_type, []).append((src_repeated, dst_arr, w_arr))
 
 
 class NeighborSamplingCollator:
@@ -373,6 +406,50 @@ def _add_node(
     local_maps[node_type][node_id] = len(local_nodes[node_type])
     local_nodes[node_type].append(node_id)
     return True
+
+
+def _add_nodes_bulk(
+    local_nodes: dict[str, list[int]],
+    local_maps: dict[str, dict[int, int]],
+    node_type: str,
+    node_ids: np.ndarray,
+) -> np.ndarray:
+    """Insert a batch of global node ids, returning only the ones that were new.
+
+    Order of newly-added ids follows first-occurrence in ``node_ids`` so the
+    deterministic global→local mapping behaviour of the old per-element
+    ``_add_node`` loop is preserved.
+    """
+    arr = np.asarray(node_ids, dtype=np.int64).reshape(-1)
+    if arr.size == 0:
+        return np.empty((0,), dtype=np.int64)
+    # First-occurrence-preserving unique.
+    _, first_idx = np.unique(arr, return_index=True)
+    unique_ordered = arr[np.sort(first_idx)]
+    mapping = local_maps[node_type]
+    nodes = local_nodes[node_type]
+    new_ids: list[int] = []
+    for value in unique_ordered.tolist():
+        if value in mapping:
+            continue
+        mapping[value] = len(nodes)
+        nodes.append(value)
+        new_ids.append(value)
+    return np.asarray(new_ids, dtype=np.int64)
+
+
+def _remap_global_to_local(global_ids: np.ndarray, mapping: dict[int, int]) -> np.ndarray:
+    """Vectorized global→local remap; -1 marks a global id absent from the map."""
+    arr = np.asarray(global_ids, dtype=np.int64).reshape(-1)
+    if arr.size == 0:
+        return np.empty((0,), dtype=np.int64)
+    uniq, inv = np.unique(arr, return_inverse=True)
+    uniq_local = np.fromiter(
+        (mapping.get(int(value), -1) for value in uniq.tolist()),
+        dtype=np.int64,
+        count=int(uniq.shape[0]),
+    )
+    return uniq_local[inv]
 
 
 def _unique_preserve_order(values: np.ndarray) -> np.ndarray:

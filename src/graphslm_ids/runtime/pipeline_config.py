@@ -4,11 +4,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import yaml
-
 from graphslm_ids.slow_path.report_generator import ReportGeneratorConfig
 from graphslm_ids.slow_path.report_validator import ValidatorConfig
 from graphslm_ids.slow_path.slow_path_worker import SlowPathConfig
+from graphslm_ids.utils.io import read_yaml
 
 
 @dataclass
@@ -106,8 +105,7 @@ class PipelineConfig:
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "PipelineConfig":
-        with Path(path).open("r", encoding="utf-8") as handle:
-            raw = yaml.safe_load(handle) or {}
+        raw = read_yaml(Path(path))
         if not isinstance(raw, dict):
             raise ValueError("Pipeline config must be a YAML mapping.")
         return cls.from_mapping(raw)

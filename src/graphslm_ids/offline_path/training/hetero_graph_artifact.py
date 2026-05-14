@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import json
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+from graphslm_ids.utils.io import read_json
 
 
 EdgeKey = tuple[str, str, str]
@@ -63,8 +64,7 @@ def load_three_tier_graph_artifact(
     # Load metadata first so packet_semantic_x_npy path recorded at build-time is available.
     metadata: dict[str, Any] = {}
     if graph_meta_json.exists():
-        with graph_meta_json.open("r", encoding="utf-8") as handle:
-            metadata = json.load(handle)
+        metadata = read_json(graph_meta_json)
 
     with np.load(graph_npz, allow_pickle=False) as loaded:
         arrays = {key: loaded[key] for key in loaded.files}
@@ -173,8 +173,7 @@ def load_graph_store_artifact(
     """Load a graph store through the legacy full-batch artifact API."""
     manifest_path = Path(graph_store_root) / "manifest.json"
     if manifest_path.exists():
-        with manifest_path.open("r", encoding="utf-8") as handle:
-            manifest = json.load(handle)
+        manifest = read_json(manifest_path)
         if manifest.get("layout") == "numpy_memmap_csr":
             return _load_on_disk_graph_store_artifact(Path(graph_store_root), add_reverse_edges)
 

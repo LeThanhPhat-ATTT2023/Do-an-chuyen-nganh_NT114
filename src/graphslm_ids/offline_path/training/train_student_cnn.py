@@ -14,12 +14,10 @@ that torchrun injects.  All flags work identically in both modes.
 from __future__ import annotations
 
 import argparse
-import contextlib
 import os
 from datetime import datetime, timezone
 from pathlib import Path
 import random
-import sys
 import threading
 
 import numpy as np
@@ -30,11 +28,6 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset, random_split
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
-
-PROJECT_ROOT = Path(__file__).resolve().parents[4]
-SRC_DIR = PROJECT_ROOT / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
 
 from graphslm_ids.models.student_cnn import Student1DCNN
 from graphslm_ids.utils.io import ensure_dir, write_json

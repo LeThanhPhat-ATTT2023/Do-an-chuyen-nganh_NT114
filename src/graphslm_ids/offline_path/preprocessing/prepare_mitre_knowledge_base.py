@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from graphslm_ids.utils.io import read_json
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -78,8 +80,7 @@ def main() -> None:
     edges_csv = Path(args.technique_tactic_edges_csv)
     stats_json = Path(args.stats_json)
 
-    with input_json.open("r", encoding="utf-8") as handle:
-        stix_bundle = json.load(handle)
+    stix_bundle = read_json(input_json)
 
     objects = stix_bundle.get("objects", [])
 

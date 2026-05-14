@@ -245,7 +245,7 @@ class StudentRuntime:
 ### 3.4 `fast_path/mitre_index.py`
 
 **Trách nhiệm**: Load `mitre_techniques_embeddings.npy` + metadata; cosine
-top-k trên CPU (numpy). Optional faiss cho production.
+top-k trên CPU (numpy).
 
 ```python
 class MitreIndex:

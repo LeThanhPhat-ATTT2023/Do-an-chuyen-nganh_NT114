@@ -21,7 +21,6 @@ from scapy.utils import PcapReader
 import socket as _socket
 
 try:
-    import dpkt as _dpkt
     import dpkt.pcap as _dpkt_pcap
     import dpkt.ethernet as _dpkt_eth
     import dpkt.ip as _dpkt_ip

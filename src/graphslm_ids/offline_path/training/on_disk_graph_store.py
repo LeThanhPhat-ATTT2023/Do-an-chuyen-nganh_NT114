@@ -4,20 +4,15 @@ import argparse
 from datetime import datetime, timezone
 import json
 from pathlib import Path
-import sys
 from typing import Any
 
 import numpy as np
-
-PROJECT_ROOT = Path(__file__).resolve().parents[4]
-SRC_DIR = PROJECT_ROOT / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
 
 from graphslm_ids.offline_path.training.hetero_graph_artifact import (
     HeteroGraphArtifact,
     load_three_tier_graph_artifact,
 )
+from graphslm_ids.utils.io import read_json
 
 
 EdgeKey = tuple[str, str, str]
@@ -47,8 +42,7 @@ class OnDiskHeteroGraphStore:
         manifest_path = self.root / "manifest.json"
         if not manifest_path.exists():
             raise FileNotFoundError(f"Graph store manifest not found: {manifest_path}")
-        with manifest_path.open("r", encoding="utf-8") as handle:
-            self.manifest: dict[str, Any] = json.load(handle)
+        self.manifest: dict[str, Any] = read_json(manifest_path)
 
         layout = str(self.manifest.get("layout", ""))
         if layout != "numpy_memmap_csr":
@@ -385,44 +379,72 @@ def gather_csr_neighbors(
     fanout: int | None = None,
     rng: np.random.Generator | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Batched neighbor gather over a CSR slice.
+
+    Equivalent to the old per-row loop but vectorized: random subsampling is
+    done by assigning a uniform key to every candidate edge and keeping the
+    top ``min(degree, fanout)`` keys per row via segment-wise ordering. Output
+    order matches the old version (CSR-ascending inside each row).
+    """
     src = np.asarray(src_ids, dtype=np.int64).reshape(-1)
-    if fanout is not None and int(fanout) == 0:
+    n_src = int(src.shape[0])
+
+    if n_src == 0 or (fanout is not None and int(fanout) == 0):
         return (
-            np.zeros((src.shape[0] + 1,), dtype=np.int64),
+            np.zeros((n_src + 1,), dtype=np.int64),
             np.empty((0,), dtype=np.int64),
             np.empty((0,), dtype=np.float32),
         )
 
-    rng = rng or np.random.default_rng()
-    local_indptr = np.zeros((src.shape[0] + 1,), dtype=np.int64)
-    chunks: list[np.ndarray] = []
-    weight_chunks: list[np.ndarray] = []
-    cursor = 0
-    for row, node_id in enumerate(src):
-        start = int(indptr[int(node_id)])
-        end = int(indptr[int(node_id) + 1])
-        degree = end - start
-        if degree <= 0:
-            local_indptr[row + 1] = cursor
-            continue
-        selected = np.arange(start, end, dtype=np.int64)
-        if fanout is not None and int(fanout) > 0 and degree > int(fanout):
-            selected = rng.choice(selected, size=int(fanout), replace=False)
-            selected.sort()
-        nbrs = np.asarray(indices[selected], dtype=np.int64)
-        weights = np.asarray(attr[selected], dtype=np.float32)
-        chunks.append(nbrs)
-        weight_chunks.append(weights)
-        cursor += int(nbrs.shape[0])
-        local_indptr[row + 1] = cursor
+    indptr_arr = np.asarray(indptr, dtype=np.int64)
+    starts = indptr_arr[src]
+    ends = indptr_arr[src + 1]
+    degrees = (ends - starts).astype(np.int64)
+    total_in = int(degrees.sum())
+    if total_in == 0:
+        return (
+            np.zeros((n_src + 1,), dtype=np.int64),
+            np.empty((0,), dtype=np.int64),
+            np.empty((0,), dtype=np.float32),
+        )
 
-    if chunks:
-        return local_indptr, np.concatenate(chunks), np.concatenate(weight_chunks)
-    return (
-        local_indptr,
-        np.empty((0,), dtype=np.int64),
-        np.empty((0,), dtype=np.float32),
-    )
+    if fanout is None:
+        counts = degrees
+    else:
+        counts = np.minimum(degrees, int(fanout)).astype(np.int64)
+
+    # Build flat global-edge index for every (row, position-in-row) pair.
+    row_of_edge = np.repeat(np.arange(n_src, dtype=np.int64), degrees)
+    cum_in = np.empty((n_src + 1,), dtype=np.int64)
+    cum_in[0] = 0
+    np.cumsum(degrees, out=cum_in[1:])
+    offset_in_row = np.arange(total_in, dtype=np.int64) - cum_in[row_of_edge]
+    global_edge = np.repeat(starts, degrees) + offset_in_row
+
+    if int(counts.sum()) == total_in:
+        # No subsampling: keep every candidate edge.
+        selected = global_edge
+    else:
+        rng = rng or np.random.default_rng()
+        keys = rng.random(total_in)
+        # Sort by (row asc, key asc) -> keep first counts[r] edges per row,
+        # giving an unbiased k-of-n sample without replacement.
+        order = np.lexsort((keys, row_of_edge))
+        sorted_row = row_of_edge[order]
+        pos_in_segment = np.arange(total_in, dtype=np.int64) - cum_in[sorted_row]
+        keep = pos_in_segment < counts[sorted_row]
+        selected_in_order = order[keep]
+        # Restore CSR-ascending order inside each row for stable downstream slicing.
+        perm = np.lexsort((global_edge[selected_in_order], row_of_edge[selected_in_order]))
+        selected = selected_in_order[perm]
+
+    local_indptr = np.empty((n_src + 1,), dtype=np.int64)
+    local_indptr[0] = 0
+    np.cumsum(counts, out=local_indptr[1:])
+
+    nbrs = np.asarray(indices[selected], dtype=np.int64)
+    weights = np.asarray(attr[selected], dtype=np.float32)
+    return local_indptr, nbrs, weights
 
 
 def parse_args() -> argparse.Namespace:
