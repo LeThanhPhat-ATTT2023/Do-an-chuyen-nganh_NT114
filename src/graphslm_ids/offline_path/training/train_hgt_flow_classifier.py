@@ -5,6 +5,8 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 import random
+import sys
+import time
 from typing import Any
 
 import numpy as np
@@ -645,13 +647,19 @@ def evaluate_neighbor_sampling(
     use_semantic_edge_weights: bool,
     num_classes: int,
     label_names: dict[int, str],
+    epoch: int = 0,
+    split_name: str = "eval",
 ) -> dict[str, Any]:
     model.eval()
     preds: list[np.ndarray] = []
     labels: list[np.ndarray] = []
     loss_sum = 0.0
+    total_batches = len(loader)
+    progress_every = max(1, total_batches // 10) if total_batches else 0
+    start = time.time()
+    last_logged = 0
     with torch.no_grad():
-        for batch in loader:
+        for i, batch in enumerate(loader, start=1):
             node_features, edge_index, edge_weight, seed_mask, seed_labels = to_torch_batch(
                 batch,
                 edge_types,
@@ -665,6 +673,15 @@ def evaluate_neighbor_sampling(
             loss_sum += float(loss.item())
             preds.append(seed_logits.detach().float().argmax(dim=1).cpu().numpy())
             labels.append(seed_labels.detach().cpu().numpy())
+            if progress_every and (i - last_logged >= progress_every or i == total_batches):
+                pct = 100.0 * i / total_batches
+                elapsed = time.time() - start
+                print(
+                    f"Epoch {epoch:03d} | {split_name:<5} {i:>5}/{total_batches} "
+                    f"({pct:5.1f}%) | {elapsed:6.1f}s",
+                    flush=True,
+                )
+                last_logged = i
     pred_np = np.concatenate(preds) if preds else np.empty((0,), dtype=np.int64)
     label_np = np.concatenate(labels) if labels else np.empty((0,), dtype=np.int64)
     return metrics_from_predictions(pred_np, label_np, num_classes, label_names, loss_sum)
@@ -758,6 +775,15 @@ def train_neighbor_sampling(config: dict[str, Any], seed: int, device: torch.dev
     epochs_without_improvement = 0
     history: list[dict[str, Any]] = []
 
+    train_batches_total = len(train_loader)
+    train_progress_every = max(1, train_batches_total // 10) if train_batches_total else 0
+    print(
+        f"[HGT] Starting training: epochs={int(config['train']['epochs'])} "
+        f"train_batches/epoch={train_batches_total} val_batches={len(val_loader)} "
+        f"test_batches={len(test_loader)} progress_every={train_progress_every}",
+        flush=True,
+    )
+
     for epoch in range(1, int(config["train"]["epochs"]) + 1):
         model.train()
         optimizer.zero_grad(set_to_none=True)
@@ -771,6 +797,9 @@ def train_neighbor_sampling(config: dict[str, Any], seed: int, device: torch.dev
 
         train_iter = iter(train_loader)
         step = 0
+        batches_seen = 0
+        last_logged_batches = 0
+        epoch_start = time.time()
         while True:
             # Collect one batch per GPU to maximise parallelism
             batch_group: list[MiniBatchSubgraph] = []
@@ -823,6 +852,23 @@ def train_neighbor_sampling(config: dict[str, Any], seed: int, device: torch.dev
                 optimizer.zero_grad(set_to_none=True)
                 pending_step = False
             step += 1
+            batches_seen += len(batch_group)
+            if train_progress_every and (
+                batches_seen - last_logged_batches >= train_progress_every
+                or batches_seen >= train_batches_total
+            ):
+                running_loss = (loss_sum / examples) if examples else 0.0
+                pct = (
+                    100.0 * batches_seen / train_batches_total
+                    if train_batches_total else 0.0
+                )
+                elapsed = time.time() - epoch_start
+                print(
+                    f"Epoch {epoch:03d} | train {batches_seen:>5}/{train_batches_total} "
+                    f"({pct:5.1f}%) | loss={running_loss:.4f} | {elapsed:6.1f}s",
+                    flush=True,
+                )
+                last_logged_batches = batches_seen
 
         if pending_step:
             scaler.step(optimizer)
@@ -847,6 +893,8 @@ def train_neighbor_sampling(config: dict[str, Any], seed: int, device: torch.dev
             use_semantic_edge_weights=use_semantic_edge_weights,
             num_classes=num_classes,
             label_names=label_names,
+            epoch=epoch,
+            split_name="val",
         )
         test_metrics = evaluate_neighbor_sampling(
             model=model,
@@ -857,6 +905,8 @@ def train_neighbor_sampling(config: dict[str, Any], seed: int, device: torch.dev
             use_semantic_edge_weights=use_semantic_edge_weights,
             num_classes=num_classes,
             label_names=label_names,
+            epoch=epoch,
+            split_name="test",
         )
 
         avg_nodes = {
