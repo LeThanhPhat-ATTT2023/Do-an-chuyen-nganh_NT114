@@ -3,15 +3,9 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 from pathlib import Path
-import sys
 
 import numpy as np
 import pandas as pd
-
-PROJECT_ROOT = Path(__file__).resolve().parents[4]
-SRC_DIR = PROJECT_ROOT / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
 
 from graphslm_ids.offline_path.preprocessing.graph_artifact_builder import build_graph_artifact
 from graphslm_ids.utils.io import write_json

@@ -14,11 +14,6 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from transformers import AutoModel, AutoTokenizer
 
-PROJECT_ROOT = Path(__file__).resolve().parents[4]
-SRC_DIR = PROJECT_ROOT / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
-
 from graphslm_ids.utils.io import write_json
 
 

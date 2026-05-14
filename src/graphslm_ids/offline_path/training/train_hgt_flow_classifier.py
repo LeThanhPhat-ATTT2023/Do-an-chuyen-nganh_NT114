@@ -5,19 +5,12 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 import random
-import sys
 from typing import Any
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-import yaml
-
-PROJECT_ROOT = Path(__file__).resolve().parents[4]
-SRC_DIR = PROJECT_ROOT / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
 
 from graphslm_ids.offline_path.training.hetero_graph_artifact import (
     load_graph_store_artifact,
@@ -33,7 +26,7 @@ from graphslm_ids.offline_path.training.neighbor_sampling import (
 )
 from graphslm_ids.offline_path.training.on_disk_graph_store import OnDiskHeteroGraphStore
 from graphslm_ids.models.hgt import HeteroGraphTransformer
-from graphslm_ids.utils.io import ensure_dir, write_json
+from graphslm_ids.utils.io import ensure_dir, read_yaml, write_json
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -145,8 +138,7 @@ def deep_update(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
 def load_config(config_path: Path) -> dict[str, Any]:
     config = deepcopy(DEFAULT_CONFIG)
     if config_path.exists():
-        with config_path.open("r", encoding="utf-8") as handle:
-            loaded = yaml.safe_load(handle) or {}
+        loaded = read_yaml(config_path)
         if not isinstance(loaded, dict):
             raise ValueError("HGT config must be a YAML mapping.")
         config = deep_update(config, loaded)

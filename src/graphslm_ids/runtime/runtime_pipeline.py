@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import json
 from pathlib import Path
 import queue
 import threading
 import time
 from typing import Any
+
+from graphslm_ids.utils.io import read_json
 
 from graphslm_ids.fast_path import (
     AlertDispatcher,
@@ -52,7 +53,7 @@ class FastPathPipeline:
             cfg.fast_path.techniques_csv,
             cfg.fast_path.technique_tactic_csv,
         )
-        meta = _load_json(cfg.hgt.graph_meta_json)
+        meta = read_json(Path(cfg.hgt.graph_meta_json)) if Path(cfg.hgt.graph_meta_json).exists() else {}
         self.graph_store = (
             PersistentGraphStore(
                 cfg.graph_store.root,
@@ -235,9 +236,3 @@ class FastPathPipeline:
             self.graph_store.enforce_retention(now)
 
 
-def _load_json(path: str | Path) -> dict[str, Any]:
-    path = Path(path)
-    if not path.exists():
-        return {}
-    with path.open("r", encoding="utf-8") as handle:
-        return json.load(handle)

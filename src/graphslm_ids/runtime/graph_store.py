@@ -13,6 +13,7 @@ import numpy as np
 
 from graphslm_ids.slow_path.hot_buffer_adapter import HotBufferAdapter
 from graphslm_ids.slow_path.types import GraphContext
+from graphslm_ids.utils.io import read_json
 
 
 EDGE_RELATIONS: tuple[str, ...] = (
@@ -856,8 +857,7 @@ class PersistentGraphStore:
         current_path = self.root / "state" / "current_shard.json"
         if current_path.exists():
             try:
-                with current_path.open("r", encoding="utf-8") as handle:
-                    current = json.load(handle)
+                current = read_json(current_path)
             except json.JSONDecodeError:
                 current = None
             if isinstance(current, dict) and current.get("shard_id") and not current.get("sealed"):

@@ -216,8 +216,6 @@ Dependencies ML trong `requirements-ml.txt`:
 ```text
 torch
 transformers
-sentence-transformers
-faiss-cpu
 onnxruntime
 ```
 

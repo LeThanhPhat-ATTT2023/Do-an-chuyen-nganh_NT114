@@ -5,18 +5,12 @@ import csv
 from datetime import datetime, timezone
 import os
 from pathlib import Path
-import sys
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, Subset, random_split
 from tqdm import tqdm
-
-PROJECT_ROOT = Path(__file__).resolve().parents[4]
-SRC_DIR = PROJECT_ROOT / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
 
 from graphslm_ids.models.student_cnn import Student1DCNN
 from graphslm_ids.utils.io import ensure_dir, write_json
