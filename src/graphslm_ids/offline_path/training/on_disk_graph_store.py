@@ -218,6 +218,7 @@ def convert_npz_to_on_disk_graph_store(
     test_ratio: float = 0.1,
     seed: int = 42,
     packet_semantic_npy: str | Path | None = None,
+    symlink_packet_features: bool = False,
 ) -> dict[str, Any]:
     """Convert the legacy NPZ artifact into the mmap + CSR graph store layout."""
 
@@ -242,7 +243,10 @@ def convert_npz_to_on_disk_graph_store(
     _write_raw(root / "nodes/flow/features.f32", flow_x, np.float32)
     _write_raw(root / "nodes/flow/labels.i64", flow_y, np.int64)
     _write_raw(root / "nodes/flow/shard_index.i64", flow_shard_index, np.int64)
-    _write_raw(root / "nodes/packet/features.f32", packet_x, np.float32)
+    if symlink_packet_features and packet_semantic_npy is not None:
+        _symlink_packet_features(root / "nodes/packet/features.f32", Path(packet_semantic_npy))
+    else:
+        _write_raw(root / "nodes/packet/features.f32", packet_x, np.float32)
     _write_raw(root / "nodes/packet/shard_index.i64", packet_shard_index, np.int64)
     _write_raw(root / "nodes/technique/features.f32", technique_x, np.float32)
     _write_raw(root / "nodes/tactic/ids.i64", tactic_ids, np.int64)
@@ -436,6 +440,15 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Explicit path to packet_semantic_x.npy sidecar (auto-detected if absent).",
     )
+    parser.add_argument(
+        "--symlink-packet-features",
+        action="store_true",
+        help=(
+            "Symlink nodes/packet/features.f32 to the source .npy instead of copying. "
+            "Saves ~50-60 GB on disk-constrained environments (e.g. Kaggle /tmp). "
+            "Requires --packet-semantic-npy and the source must be float32."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -451,6 +464,7 @@ def main() -> None:
         test_ratio=args.test_ratio,
         seed=args.seed,
         packet_semantic_npy=args.packet_semantic_npy,
+        symlink_packet_features=args.symlink_packet_features,
     )
     print(f"[OK] Graph store: {args.output_root}")
     print(
@@ -481,6 +495,25 @@ def _ensure_store_dirs(root: Path) -> None:
 def _write_raw(path: Path, array: np.ndarray, dtype: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     np.asarray(array, dtype=dtype).tofile(path)
+
+
+def _symlink_packet_features(dest: Path, src: Path) -> None:
+    """Create a symlink dest -> src instead of copying 50-60 GB of packet features.
+
+    Requires src to already be float32 so the graph store reader can memmap it directly.
+    Saves the full copy on disk-constrained environments (e.g. Kaggle /tmp).
+    """
+    probe = np.load(str(src), mmap_mode="r")
+    if probe.dtype != np.float32:
+        raise ValueError(
+            f"--symlink-packet-features requires float32 source; got {probe.dtype}. "
+            "Convert the .npy to float32 first, or omit this flag."
+        )
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists() or dest.is_symlink():
+        dest.unlink()
+    dest.symlink_to(src.resolve())
+    print(f"Symlinked packet features: {dest} -> {src.resolve()}")
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
