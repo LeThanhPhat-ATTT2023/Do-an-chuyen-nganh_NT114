@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 from pathlib import Path
-import sys
 
 import os
 
@@ -12,11 +11,6 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
-
-PROJECT_ROOT = Path(__file__).resolve().parents[4]
-SRC_DIR = PROJECT_ROOT / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
 
 from graphslm_ids.models.student_cnn import Student1DCNN
 from graphslm_ids.utils.io import ensure_dir, write_json
@@ -166,6 +160,12 @@ def main() -> None:
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 
+    n_gpus = torch.cuda.device_count() if device.type == "cuda" else 0
+    effective_batch = args.batch_size * max(1, n_gpus)
+    if n_gpus > 1:
+        print(f"[Multi-GPU] DataParallel across {n_gpus} GPUs — effective batch {effective_batch}")
+        model = torch.nn.DataParallel(model)
+
     _compile_active = False
     if args.compile:
         try:
@@ -178,7 +178,7 @@ def main() -> None:
     use_amp = device.type == "cuda"
     loader = DataLoader(
         PayloadDataset(payload_matrix, total_rows),
-        batch_size=args.batch_size,
+        batch_size=effective_batch,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=(device.type == "cuda"),
@@ -224,9 +224,11 @@ def main() -> None:
         "checkpoint": str(checkpoint_path),
         "output_path": str(output_path),
         "device": str(device),
+        "num_gpus": int(max(1, n_gpus)),
         "rows": int(total_rows),
         "embedding_dim": int(embedding_dim),
-        "batch_size": int(args.batch_size),
+        "batch_size_per_gpu": int(args.batch_size),
+        "effective_batch_size": int(effective_batch),
         "num_workers": int(num_workers),
         "infer_threads": int(infer_threads),
         "dropout": float(args.dropout),
