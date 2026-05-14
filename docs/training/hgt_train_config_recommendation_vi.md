@@ -98,11 +98,39 @@ graphslm-convert-graph-store `
   --output-root "data/graph_store_v1"
 ```
 
-Train một cấu hình mới:
+Train một cấu hình mới — chọn lệnh theo môi trường:
 
 ```powershell
+# 1) Local CPU laptop / Kaggle 1 GPU / local 1 GPU — single-process
 graphslm-train-hgt --config "configs/hgt_paper_variants/hgt_t082_k5_dlg_ids_sparse_l2_h128_h4.yaml"
+
+# 2) Kaggle 2x T4 hoặc server 1 node nhiều GPU — DDP (khuyến cáo)
+#    LOCAL_RANK do torchrun set; trainer tự bật NCCL/Gloo + DistributedSampler.
+torchrun --standalone --nproc_per_node=2 `
+  -m graphslm_ids.offline_path.training.train_hgt_flow_classifier `
+  --config "configs/hgt_paper_variants/hgt_t082_k5_dlg_ids_sparse_l2_h128_h4.yaml"
+
+# 2b) Kaggle 2 GPU nếu không thể dùng torchrun trong notebook — legacy multi-GPU
+graphslm-train-hgt `
+  --config "configs/hgt_paper_variants/hgt_t082_k5_dlg_ids_sparse_l2_h128_h4.yaml" `
+  --multi-gpu
+
+# 3) Server multi-node — DDP cross-node
+torchrun --nnodes=$WORLD_NODES --nproc_per_node=8 `
+  --rdzv_backend=c10d --rdzv_endpoint=$MASTER_ADDR:29500 `
+  -m graphslm_ids.offline_path.training.train_hgt_flow_classifier `
+  --config "configs/hgt_paper_variants/hgt_t082_k5_dlg_ids_sparse_l2_h128_h4.yaml"
 ```
+
+Các cờ CLI bổ sung:
+
+| Cờ | Ý nghĩa | Mặc định |
+|---|---|---|
+| `--compile` | Bọc HGT bằng `torch.compile(mode="reduce-overhead", dynamic=True)` | tắt |
+| `--no-tf32` | Tắt TF32 (chỉ dùng khi cần FP32 strict cho repro) | TF32 bật |
+| `--amp` | Mixed precision (chỉ CUDA) | theo config |
+| `--multi-gpu` / `--no-multi-gpu` | Legacy fallback (chỉ áp dụng khi không launch qua torchrun) | true |
+| `--device {auto,cpu,cuda,cuda:N}` | Device override khi single-process | auto |
 
 Train trên Kaggle dùng:
 

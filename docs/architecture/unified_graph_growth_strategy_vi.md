@@ -775,7 +775,13 @@ Triệu chứng kích hoạt:
   - I/O contention giữa runtime writer và training reader -> đánh
     giá RapidStore-style multi-version graph store.
   - Nhu cầu xử lý nhiều node/process -> Distributed runtime, WAL
-    hoặc Kafka làm bộ đệm bền, DDP training nhiều GPU đọc cùng store.
+    hoặc Kafka làm bộ đệm bền. DDP training nhiều GPU đọc cùng store
+    đã được hỗ trợ trong train_hgt_flow_classifier.py: launch qua
+    torchrun, mỗi rank mở OnDiskHeteroGraphStore read-only độc lập,
+    OS page cache chia sẻ giữa các rank. Sharded store theo
+    flow-range/time-range là bước tiếp theo khi nhiều rank cạnh
+    tranh I/O trên cùng memmap (xem Phase 4 trong
+    docs/training/scalable_hgt_training_design_vi.md).
 ```
 
 ## 12. Cấu hình thống nhất mẫu

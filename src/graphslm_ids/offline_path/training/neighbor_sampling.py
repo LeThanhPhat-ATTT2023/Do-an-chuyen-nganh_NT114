@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 import numpy as np
+import torch
 from torch.utils.data import Dataset
 
 from graphslm_ids.offline_path.training.hetero_graph_artifact import HeteroGraphArtifact
@@ -68,6 +69,36 @@ class MiniBatchSubgraph:
     local_to_global: dict[str, np.ndarray]
     stats: dict[str, Any] = field(default_factory=dict)
 
+    def pin_memory(self) -> "MiniBatchSubgraph":
+        """Replace numpy arrays with pinned torch tensors in-place.
+
+        Called by PyTorch's DataLoader internal ``_pin_memory_loop`` when
+        ``pin_memory=True``. By pinning here (inside the DataLoader's pin
+        thread, which runs in the main process) rather than inside the training
+        loop, the H2D copy on the next step can run with ``non_blocking=True``
+        and overlap with GPU compute. Without this hook, ``MiniBatchSubgraph``
+        is treated as an opaque object and PyTorch falls back to a no-op,
+        forcing the trainer's ``to_torch_batch`` to do a synchronous pin per
+        tensor on the main thread.
+        """
+
+        def _pin_dict(d: dict[Any, np.ndarray], cast: Any = None) -> dict[Any, torch.Tensor]:
+            out: dict[Any, torch.Tensor] = {}
+            for key, value in d.items():
+                arr = np.ascontiguousarray(value, dtype=cast) if cast is not None else np.ascontiguousarray(value)
+                out[key] = torch.from_numpy(arr).pin_memory()
+            return out
+
+        # Mutate in place — DataLoader expects the same object back.
+        self.node_features = _pin_dict(self.node_features)  # type: ignore[assignment]
+        # Force int64 for edge_index, float32 for edge_attr (downstream expects these dtypes).
+        self.edge_index = _pin_dict(self.edge_index, cast=np.int64)  # type: ignore[assignment]
+        self.edge_attr = _pin_dict(self.edge_attr, cast=np.float32)  # type: ignore[assignment]
+        self.seed_mask = torch.from_numpy(np.ascontiguousarray(self.seed_mask, dtype=bool)).pin_memory()  # type: ignore[assignment]
+        self.seed_labels = torch.from_numpy(np.ascontiguousarray(self.seed_labels, dtype=np.int64)).pin_memory()  # type: ignore[assignment]
+        # seed_flow_ids + local_to_global stay on CPU as numpy — only logging consumes them.
+        return self
+
 
 class FlowSeedDataset(Dataset):
     def __init__(self, flow_ids: np.ndarray) -> None:
@@ -78,6 +109,105 @@ class FlowSeedDataset(Dataset):
 
     def __getitem__(self, index: int) -> int:
         return int(self.flow_ids[index])
+
+
+class _LocalMap:
+    """Vectorized first-occurrence dedup + sorted lookup for one node type.
+
+    Replaces the legacy ``dict[int, int]`` + ``list[int]`` pair: bulk add returns
+    the newly-inserted globals (in first-occurrence order) without any Python
+    int iteration, and bulk lookup is one ``np.searchsorted`` over the sorted
+    view of every global seen so far. Both scale linearly with neighbourhood
+    size — critical when fanouts blow up to hundreds of thousands of packets
+    on a 1TB graph.
+    """
+
+    __slots__ = ("_chunks", "_count", "_sorted", "_local_of_sorted")
+
+    def __init__(self) -> None:
+        self._chunks: list[np.ndarray] = []
+        self._count: int = 0
+        self._sorted: np.ndarray = np.empty(0, dtype=np.int64)
+        self._local_of_sorted: np.ndarray = np.empty(0, dtype=np.int64)
+
+    @property
+    def count(self) -> int:
+        return self._count
+
+    def add(self, candidates: np.ndarray) -> np.ndarray:
+        """Insert candidates, return globals that were newly added in first-occurrence order."""
+        arr = np.asarray(candidates, dtype=np.int64).reshape(-1)
+        if arr.size == 0:
+            return np.empty(0, dtype=np.int64)
+
+        uniq_sorted, first_idx = np.unique(arr, return_index=True)
+
+        if self._sorted.size:
+            pos = np.searchsorted(self._sorted, uniq_sorted)
+            present = np.zeros(uniq_sorted.size, dtype=bool)
+            in_bounds = pos < self._sorted.size
+            if in_bounds.any():
+                cand = np.where(in_bounds, pos, 0)
+                present = in_bounds & (self._sorted[cand] == uniq_sorted)
+            new_mask_sorted = ~present
+        else:
+            new_mask_sorted = np.ones(uniq_sorted.size, dtype=bool)
+
+        if not bool(new_mask_sorted.any()):
+            return np.empty(0, dtype=np.int64)
+
+        new_sorted = uniq_sorted[new_mask_sorted]
+        new_first_idx = first_idx[new_mask_sorted]
+
+        # Order the *new* uniques by their first occurrence in arr so local ids
+        # mirror the deterministic ordering the legacy Python loop produced.
+        ins_order = np.argsort(new_first_idx, kind="stable")
+        new_in_insert_order = new_sorted[ins_order]
+        n_new = new_in_insert_order.shape[0]
+        first_local = self._count
+        new_locals_insert = np.arange(first_local, first_local + n_new, dtype=np.int64)
+        self._count += n_new
+        self._chunks.append(new_in_insert_order)
+
+        # For the sorted view we need: for each new_sorted[i], its assigned local id.
+        new_locals_for_sorted = np.empty(n_new, dtype=np.int64)
+        new_locals_for_sorted[ins_order] = new_locals_insert
+
+        if self._sorted.size:
+            merged_vals = np.concatenate([self._sorted, new_sorted])
+            merged_locs = np.concatenate([self._local_of_sorted, new_locals_for_sorted])
+            order = np.argsort(merged_vals, kind="stable")
+            self._sorted = merged_vals[order]
+            self._local_of_sorted = merged_locs[order]
+        else:
+            self._sorted = new_sorted
+            self._local_of_sorted = new_locals_for_sorted
+
+        return new_in_insert_order
+
+    def lookup(self, query: np.ndarray) -> np.ndarray:
+        """Return local indices for each query global id; -1 for missing entries."""
+        arr = np.asarray(query, dtype=np.int64).reshape(-1)
+        out = np.full(arr.shape, -1, dtype=np.int64)
+        if arr.size == 0 or self._sorted.size == 0:
+            return out
+        pos = np.searchsorted(self._sorted, arr)
+        in_bounds = pos < self._sorted.size
+        if not in_bounds.any():
+            return out
+        cand = np.where(in_bounds, pos, 0)
+        match = in_bounds & (self._sorted[cand] == arr)
+        out[match] = self._local_of_sorted[pos[match]]
+        return out
+
+    def globals_array(self) -> np.ndarray:
+        if self._count == 0:
+            return np.empty(0, dtype=np.int64)
+        if len(self._chunks) == 1:
+            return self._chunks[0]
+        out = np.concatenate(self._chunks)
+        self._chunks = [out]
+        return out
 
 
 class InMemoryNeighborBackend:
@@ -187,22 +317,26 @@ class HeteroNeighborSampler:
         self.flow_feature_stats = dict(flow_feature_stats or {})
         self.standardize_flow_features = bool(standardize_flow_features)
         self.rng = np.random.default_rng(seed)
+        # Cache mean/std arrays so we don't re-allocate them on every batch.
+        self._mean_arr: np.ndarray | None = None
+        self._std_arr: np.ndarray | None = None
+        mean = self.flow_feature_stats.get("mean")
+        std = self.flow_feature_stats.get("std")
+        if mean is not None and std is not None:
+            self._mean_arr = np.asarray(mean, dtype=np.float32).reshape(1, -1)
+            self._std_arr = np.maximum(
+                np.asarray(std, dtype=np.float32).reshape(1, -1), 1e-6
+            )
 
     def sample(self, seed_flow_ids: list[int] | np.ndarray) -> MiniBatchSubgraph:
         seeds = _unique_preserve_order(np.asarray(seed_flow_ids, dtype=np.int64).reshape(-1))
-        local_nodes: dict[str, list[int]] = {
-            "flow": [],
-            "packet": [],
-            "technique": [],
-            "tactic": [],
+        local_maps: dict[str, _LocalMap] = {
+            "flow": _LocalMap(),
+            "packet": _LocalMap(),
+            "technique": _LocalMap(),
+            "tactic": _LocalMap(),
         }
-        local_maps: dict[str, dict[int, int]] = {
-            "flow": {},
-            "packet": {},
-            "technique": {},
-            "tactic": {},
-        }
-        _add_nodes_bulk(local_nodes, local_maps, "flow", seeds)
+        local_maps["flow"].add(seeds)
 
         # Per edge_type we accumulate three flat numpy arrays (src_global, dst_global, weight).
         # Concatenating happens once at the end, so the K-hop loop stays free of Python-level
@@ -236,31 +370,28 @@ class HeteroNeighborSampler:
                     (src_repeated, dst_ids.astype(np.int64), weights.astype(np.float32))
                 )
 
-                _add_nodes_bulk(local_nodes, local_maps, src_type, src_arr)
-                newly_added = _add_nodes_bulk(local_nodes, local_maps, dst_type, dst_ids)
+                local_maps[src_type].add(src_arr)
+                newly_added = local_maps[dst_type].add(dst_ids)
                 if newly_added.size:
                     next_frontier.setdefault(dst_type, []).append(newly_added)
 
             if not next_frontier:
                 frontier = {}
                 break
-            frontier = {ntype: np.concatenate(chunks) for ntype, chunks in next_frontier.items()}
+            frontier = {
+                ntype: chunks[0] if len(chunks) == 1 else np.concatenate(chunks)
+                for ntype, chunks in next_frontier.items()
+            }
 
         if self.always_include_all_techniques:
-            _add_nodes_bulk(
-                local_nodes,
-                local_maps,
-                "technique",
+            local_maps["technique"].add(
                 np.arange(int(self.backend.num_techniques), dtype=np.int64),
             )
         if self.always_include_all_tactics:
-            _add_nodes_bulk(
-                local_nodes,
-                local_maps,
-                "tactic",
+            local_maps["tactic"].add(
                 np.arange(int(self.backend.num_tactics), dtype=np.int64),
             )
-        self._add_static_tactic_edges(edge_chunks, local_nodes, local_maps)
+        self._add_static_tactic_edges(edge_chunks, local_maps)
 
         edge_index: dict[EdgeKey, np.ndarray] = {}
         edge_attr: dict[EdgeKey, np.ndarray] = {}
@@ -271,11 +402,14 @@ class HeteroNeighborSampler:
                 edge_attr[edge_type] = np.empty((0,), dtype=np.float32)
                 continue
             src_type, _, dst_type = edge_type
-            src_global = np.concatenate([c[0] for c in chunks])
-            dst_global = np.concatenate([c[1] for c in chunks])
-            w_global = np.concatenate([c[2] for c in chunks])
-            src_local = _remap_global_to_local(src_global, local_maps[src_type])
-            dst_local = _remap_global_to_local(dst_global, local_maps[dst_type])
+            if len(chunks) == 1:
+                src_global, dst_global, w_global = chunks[0]
+            else:
+                src_global = np.concatenate([c[0] for c in chunks])
+                dst_global = np.concatenate([c[1] for c in chunks])
+                w_global = np.concatenate([c[2] for c in chunks])
+            src_local = local_maps[src_type].lookup(src_global)
+            dst_local = local_maps[dst_type].lookup(dst_global)
             valid = (src_local >= 0) & (dst_local >= 0)
             if not bool(valid.any()):
                 edge_index[edge_type] = np.empty((2, 0), dtype=np.int64)
@@ -286,30 +420,31 @@ class HeteroNeighborSampler:
             )
             edge_attr[edge_type] = w_global[valid].astype(np.float32)
 
-        flow_ids = np.asarray(local_nodes["flow"], dtype=np.int64)
-        packet_ids = np.asarray(local_nodes["packet"], dtype=np.int64)
-        technique_ids = np.asarray(local_nodes["technique"], dtype=np.int64)
-        tactic_ids = np.asarray(local_nodes["tactic"], dtype=np.int64)
+        flow_ids = local_maps["flow"].globals_array()
+        packet_ids = local_maps["packet"].globals_array()
+        technique_ids = local_maps["technique"].globals_array()
+        tactic_ids = local_maps["tactic"].globals_array()
 
         flow_x = self.backend.get_flow_features(flow_ids)
         if self.standardize_flow_features:
-            flow_x = _standardize(flow_x, self.flow_feature_stats)
+            flow_x = self._standardize_cached(flow_x)
 
+        # Vectorized seed mask construction.
+        seed_local = local_maps["flow"].lookup(seeds)
         seed_mask = np.zeros((flow_ids.shape[0],), dtype=bool)
-        for flow_id in seeds:
-            local_idx = local_maps["flow"].get(int(flow_id))
-            if local_idx is not None:
-                seed_mask[local_idx] = True
+        valid_seed = seed_local >= 0
+        if bool(valid_seed.any()):
+            seed_mask[seed_local[valid_seed]] = True
 
         node_features = {
-            "flow": flow_x.astype(np.float32),
-            "packet": self.backend.get_packet_features(packet_ids).astype(np.float32)
+            "flow": flow_x.astype(np.float32, copy=False),
+            "packet": self.backend.get_packet_features(packet_ids).astype(np.float32, copy=False)
             if packet_ids.size
             else np.empty((0, self.backend.feature_dims["packet"]), dtype=np.float32),
-            "technique": self.backend.get_technique_features(technique_ids).astype(np.float32)
+            "technique": self.backend.get_technique_features(technique_ids).astype(np.float32, copy=False)
             if technique_ids.size
             else np.empty((0, self.backend.feature_dims["technique"]), dtype=np.float32),
-            "tactic": self.backend.get_tactic_index(tactic_ids).reshape(-1, 1).astype(np.int64)
+            "tactic": self.backend.get_tactic_index(tactic_ids).reshape(-1, 1).astype(np.int64, copy=False)
             if tactic_ids.size
             else np.empty((0, 1), dtype=np.int64),
         }
@@ -332,6 +467,13 @@ class HeteroNeighborSampler:
             },
         )
 
+    def _standardize_cached(self, flow_x: np.ndarray) -> np.ndarray:
+        if self._mean_arr is None or self._std_arr is None:
+            return flow_x
+        if self._mean_arr.shape[1] != flow_x.shape[1] or self._std_arr.shape[1] != flow_x.shape[1]:
+            return flow_x
+        return ((flow_x - self._mean_arr) / self._std_arr).astype(np.float32, copy=False)
+
     def _fanout(self, edge_type: EdgeKey) -> int | None:
         edge_name = edge_key_to_name(edge_type)
         relation = edge_type[1]
@@ -348,13 +490,12 @@ class HeteroNeighborSampler:
     def _add_static_tactic_edges(
         self,
         edge_chunks: dict[EdgeKey, list[tuple[np.ndarray, np.ndarray, np.ndarray]]],
-        local_nodes: dict[str, list[int]],
-        local_maps: dict[str, dict[int, int]],
+        local_maps: dict[str, _LocalMap],
     ) -> None:
         edge_type = ("technique", "belongs_to_tactic", "tactic")
-        if edge_type not in self.backend.edge_types or not local_nodes["technique"]:
+        if edge_type not in self.backend.edge_types or local_maps["technique"].count == 0:
             return
-        technique_src = np.asarray(local_nodes["technique"], dtype=np.int64)
+        technique_src = local_maps["technique"].globals_array()
         local_indptr, dst_ids, weights = self.backend.out_neighbors(
             edge_type,
             technique_src,
@@ -367,14 +508,17 @@ class HeteroNeighborSampler:
         src_repeated = np.repeat(technique_src, counts_per_src)
         dst_arr = dst_ids.astype(np.int64)
         w_arr = weights.astype(np.float32)
-        _add_nodes_bulk(local_nodes, local_maps, "tactic", dst_arr)
+        local_maps["tactic"].add(dst_arr)
 
         existing_chunks = edge_chunks.get(edge_type, [])
         if existing_chunks:
             # Filter out (src, dst) pairs already produced by the K-hop loop so the
             # static technique→tactic appendix does not duplicate them.
-            existing_src = np.concatenate([c[0] for c in existing_chunks])
-            existing_dst = np.concatenate([c[1] for c in existing_chunks])
+            if len(existing_chunks) == 1:
+                existing_src, existing_dst, _ = existing_chunks[0]
+            else:
+                existing_src = np.concatenate([c[0] for c in existing_chunks])
+                existing_dst = np.concatenate([c[1] for c in existing_chunks])
             num_tactics = int(self.backend.num_tactics)
             existing_keys = existing_src * np.int64(num_tactics) + existing_dst
             new_keys = src_repeated * np.int64(num_tactics) + dst_arr
@@ -394,6 +538,8 @@ class NeighborSamplingCollator:
     def __call__(self, seed_flow_ids: list[int]) -> MiniBatchSubgraph:
         return self.sampler.sample(seed_flow_ids)
 
+
+# ── Backward-compatible helpers (kept for downstream importers/tests) ────────
 
 def _add_node(
     local_nodes: dict[str, list[int]],
@@ -416,16 +562,15 @@ def _add_nodes_bulk(
 ) -> np.ndarray:
     """Insert a batch of global node ids, returning only the ones that were new.
 
-    Order of newly-added ids follows first-occurrence in ``node_ids`` so the
-    deterministic global→local mapping behaviour of the old per-element
-    ``_add_node`` loop is preserved.
+    Kept on the module for backward compatibility with callers that still use
+    Python dicts for the local map. The sampler itself now uses the vectorized
+    :class:`_LocalMap`.
     """
     arr = np.asarray(node_ids, dtype=np.int64).reshape(-1)
     if arr.size == 0:
         return np.empty((0,), dtype=np.int64)
-    # First-occurrence-preserving unique.
-    _, first_idx = np.unique(arr, return_index=True)
-    unique_ordered = arr[np.sort(first_idx)]
+    uniq, first_idx = np.unique(arr, return_index=True)
+    unique_ordered = uniq[np.argsort(first_idx, kind="stable")]
     mapping = local_maps[node_type]
     nodes = local_nodes[node_type]
     new_ids: list[int] = []
@@ -439,29 +584,38 @@ def _add_nodes_bulk(
 
 
 def _remap_global_to_local(global_ids: np.ndarray, mapping: dict[int, int]) -> np.ndarray:
-    """Vectorized global→local remap; -1 marks a global id absent from the map."""
+    """Vectorized global→local remap; -1 marks a global id absent from the map.
+
+    Kept for backward compatibility. The sampler now uses ``_LocalMap.lookup``
+    directly, which sidesteps the dict entirely.
+    """
     arr = np.asarray(global_ids, dtype=np.int64).reshape(-1)
     if arr.size == 0:
         return np.empty((0,), dtype=np.int64)
-    uniq, inv = np.unique(arr, return_inverse=True)
-    uniq_local = np.fromiter(
-        (mapping.get(int(value), -1) for value in uniq.tolist()),
-        dtype=np.int64,
-        count=int(uniq.shape[0]),
-    )
-    return uniq_local[inv]
+    if not mapping:
+        return np.full(arr.shape, -1, dtype=np.int64)
+    keys_arr = np.fromiter(mapping.keys(), dtype=np.int64, count=len(mapping))
+    vals_arr = np.fromiter(mapping.values(), dtype=np.int64, count=len(mapping))
+    order = np.argsort(keys_arr, kind="stable")
+    sorted_keys = keys_arr[order]
+    sorted_vals = vals_arr[order]
+    pos = np.searchsorted(sorted_keys, arr)
+    out = np.full(arr.shape, -1, dtype=np.int64)
+    in_bounds = pos < sorted_keys.size
+    if in_bounds.any():
+        cand = np.where(in_bounds, pos, 0)
+        match = in_bounds & (sorted_keys[cand] == arr)
+        out[match] = sorted_vals[pos[match]]
+    return out
 
 
 def _unique_preserve_order(values: np.ndarray) -> np.ndarray:
-    seen: set[int] = set()
-    ordered: list[int] = []
-    for value in values.tolist():
-        item = int(value)
-        if item in seen:
-            continue
-        seen.add(item)
-        ordered.append(item)
-    return np.asarray(ordered, dtype=np.int64)
+    """Vectorized first-occurrence-preserving unique."""
+    arr = np.asarray(values, dtype=np.int64).reshape(-1)
+    if arr.size == 0:
+        return np.empty((0,), dtype=np.int64)
+    _, first_idx = np.unique(arr, return_index=True)
+    return arr[np.sort(first_idx)]
 
 
 def _standardize(flow_x: np.ndarray, stats: dict[str, Any]) -> np.ndarray:
