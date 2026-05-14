@@ -87,6 +87,26 @@ def _normalize_rows(x: np.ndarray) -> np.ndarray:
 
 # ── batched similarity (GPU → CPU fallback) ───────────────────────────────────
 
+def _flow_sum_device(device: torch.device, num_flows: int, n_tech: int) -> torch.device:
+    """Pick the device for the flow_tech_sum accumulator.
+
+    Keeps it on GPU when at least 2× the matrix bytes fit free, so the per-batch
+    index_add_ avoids copying the (B, N_tech) sim matrix across the bus. Falls
+    back to CPU torch (still much faster than np.add.at because torch CPU
+    index_add_ is multi-threaded C++).
+    """
+    bytes_needed = int(num_flows) * int(n_tech) * 4
+    if device.type != "cuda":
+        return torch.device("cpu")
+    try:
+        free, _ = torch.cuda.mem_get_info(device)
+    except Exception:
+        return torch.device("cpu")
+    if int(free) > bytes_needed * 2:
+        return device
+    return torch.device("cpu")
+
+
 def _compute_sim_edges_and_flow_sums(
     student_emb: np.ndarray,         # (N_payload, D) mmap — full student embedding matrix
     packet_payload_idx: np.ndarray,  # (N_pkt,) indices into student_emb (graph packet order)
@@ -129,8 +149,14 @@ def _compute_sim_edges_and_flow_sums(
     dst_chunks:   list[np.ndarray] = []
     score_chunks: list[np.ndarray] = []
 
-    flow_tech_sum   = np.zeros((num_flows, N_tech), dtype=np.float32)
-    flow_tech_count = np.zeros(num_flows,            dtype=np.float32)
+    accum_device = _flow_sum_device(device, num_flows, N_tech)
+    print(
+        f"[similarity] flow_tech_sum accumulator on {accum_device} "
+        f"({num_flows * N_tech * 4 / 1e9:.2f} GB)",
+        flush=True,
+    )
+    flow_tech_sum_t   = torch.zeros((num_flows, N_tech), dtype=torch.float32, device=accum_device)
+    flow_tech_count_t = torch.zeros((num_flows,),         dtype=torch.float32, device=accum_device)
 
     for start in tqdm(range(0, N_pkt, batch_size), desc="similarity", unit="batch", leave=False):
         end     = min(start + batch_size, N_pkt)
@@ -169,26 +195,45 @@ def _compute_sim_edges_and_flow_sums(
         dst_chunks.append(topk_idx[above].cpu().numpy().astype(np.int64))
         score_chunks.append(topk_scores[above].cpu().numpy().astype(np.float32))
 
-        # ── flow-level accumulation ────────────────────────────────────────
+        # ── flow-level accumulation (vectorized index_add_ on accum_device) ──
         if s_pkt.size > 0:
             lo = int(np.searchsorted(s_pkt, start, side="left"))
             hi = int(np.searchsorted(s_pkt, end,   side="left"))
             if lo < hi:
-                local_pkt  = s_pkt[lo:hi] - start   # indices within this batch
-                batch_flow = s_flow[lo:hi]
-                sim_np = sim.cpu().numpy().astype(np.float32)
-                np.add.at(flow_tech_sum,   batch_flow, sim_np[local_pkt])
-                np.add.at(flow_tech_count, batch_flow, 1.0)
+                local_pkt_t = torch.from_numpy(
+                    np.ascontiguousarray(s_pkt[lo:hi] - start, dtype=np.int64)
+                ).to(sim.device, non_blocking=True)
+                batch_flow_t = torch.from_numpy(
+                    np.ascontiguousarray(s_flow[lo:hi], dtype=np.int64)
+                )
+                # Slice on sim's device first so the H2D copy (when accum_device
+                # ≠ sim.device) shrinks from O(B * N_tech) to O(len(local_pkt) * N_tech).
+                sim_subset = sim.index_select(0, local_pkt_t)
+                if accum_device != sim.device:
+                    sim_subset = sim_subset.to(accum_device, non_blocking=True)
+                batch_flow_t = batch_flow_t.to(accum_device, non_blocking=True)
+                flow_tech_sum_t.index_add_(0, batch_flow_t, sim_subset)
+                ones = torch.ones((batch_flow_t.shape[0],), dtype=torch.float32, device=accum_device)
+                flow_tech_count_t.index_add_(0, batch_flow_t, ones)
 
+        # Note: ``torch.cuda.empty_cache()`` used to live here but it forces a
+        # device-wide synchronisation, which serialises the otherwise pipelined
+        # H2D / matmul / index_add stream. We only call it on the OOM fallback
+        # path now — the caching allocator already reuses freed blocks across
+        # iterations without help.
         del sim, batch
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
 
     del mitre_t
 
     pkt_src   = np.concatenate(src_chunks)   if src_chunks   else np.empty(0, np.int64)
     pkt_dst   = np.concatenate(dst_chunks)   if dst_chunks   else np.empty(0, np.int64)
     pkt_score = np.concatenate(score_chunks) if score_chunks else np.empty(0, np.float32)
+
+    flow_tech_sum   = flow_tech_sum_t.detach().cpu().numpy()
+    flow_tech_count = flow_tech_count_t.detach().cpu().numpy()
+    del flow_tech_sum_t, flow_tech_count_t
+    if accum_device.type == "cuda":
+        torch.cuda.empty_cache()
 
     return pkt_src, pkt_dst, pkt_score, flow_tech_sum, flow_tech_count
 
@@ -445,7 +490,12 @@ def main() -> None:
     )
 
     output_npz.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(output_npz, **arrays)
+    # Uncompressed savez: ``packet_semantic_x`` is the only big array, and it's
+    # already excluded (lives as the sidecar memmap built earlier). Everything
+    # left here is int64 edge indices + small static features — they compress
+    # poorly (high-entropy ids) and savez_compressed used to spend most of its
+    # runtime on the deflate pass for no real disk-size win.
+    np.savez(output_npz, **arrays)
 
     meta = {
         "created_at_utc":                   datetime.now(timezone.utc).isoformat(),

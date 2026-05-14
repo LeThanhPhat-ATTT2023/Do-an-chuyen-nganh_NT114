@@ -1,18 +1,24 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext as _nullcontext
 from copy import deepcopy
 from datetime import datetime, timezone
+import os
 from pathlib import Path
 import random
 import sys
+import threading
 import time
 from typing import Any
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 from graphslm_ids.offline_path.training.hetero_graph_artifact import (
     load_graph_store_artifact,
@@ -69,6 +75,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "activation_checkpointing": False,
         "batch_seed_flows": 256,
         "grad_accum_steps": 1,
+        "compile": False,
+        "tf32": True,
     },
     "sampler": {
         "hops": None,
@@ -89,11 +97,26 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "always_include_all_techniques": True,
     },
     "dataloader": {
-        "num_workers": 0,
-        "prefetch_factor": 2,
-        "pin_memory": False,
+        "num_workers": -1,
+        "prefetch_factor": 4,
+        "pin_memory": True,
+        "persistent_workers": True,
     },
 }
+
+
+def _auto_dataloader_workers(num_workers_arg: int, n_gpus: int) -> int:
+    """Resolve num_workers='-1' (auto) to a sensible CPU-count-based value.
+
+    Default policy: reserve ~1 CPU per training thread, divide the rest evenly
+    among GPUs so each device has its own prefetch fleet. Capped at 8 per GPU
+    because neighbor sampling is memory-light but startup cost grows.
+    """
+    if num_workers_arg >= 0:
+        return num_workers_arg
+    cpu_n = os.cpu_count() or 1
+    workers_per_gpu = max(1, min(cpu_n // max(n_gpus, 1) - 1, 8))
+    return workers_per_gpu
 
 
 def parse_args() -> argparse.Namespace:
@@ -124,6 +147,14 @@ def parse_args() -> argparse.Namespace:
                         help="Use all available CUDA GPUs (neighbor_sampling mode only).")
     parser.add_argument("--no-multi-gpu", dest="multi_gpu", action="store_false",
                         help="Disable multi-GPU and force single GPU/CPU.")
+    parser.add_argument(
+        "--compile", action="store_true",
+        help="Wrap HGT in torch.compile(mode='reduce-overhead'). Requires PyTorch >= 2.0.",
+    )
+    parser.add_argument(
+        "--no-tf32", action="store_true",
+        help="Disable TF32 matmul (default: on, ~2x speedup on Ampere+).",
+    )
     return parser.parse_args()
 
 
@@ -182,6 +213,10 @@ def apply_cli_overrides(config: dict[str, Any], args: argparse.Namespace) -> dic
         config["train"]["seed"] = args.seed
     if args.multi_gpu is not None:
         config["train"]["multi_gpu"] = args.multi_gpu
+    if args.compile:
+        config["train"]["compile"] = True
+    if args.no_tf32:
+        config["train"]["tf32"] = False
     return config
 
 
@@ -197,6 +232,104 @@ def resolve_device(name: str) -> torch.device:
     if name == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(name)
+
+
+def _tune_cuda_backends(device: torch.device, enable_tf32: bool = True) -> None:
+    """Enable TF32 matmul and cuDNN benchmark for sustained training throughput.
+
+    No-op on CPU. TF32 trades ~3 mantissa bits for ~2x matmul speed on Ampere+
+    and is the right default for graph transformer training where the loss
+    landscape is robust to the precision drop.
+    """
+    if device.type != "cuda":
+        return
+    if enable_tf32:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    # cudnn.benchmark autotunes convolution algorithms; harmless for non-conv
+    # workloads and a clear win when fanout/seed-batch shapes stabilise.
+    torch.backends.cudnn.benchmark = True
+
+
+# ── async checkpoint save ─────────────────────────────────────────────────────
+
+_ckpt_save_thread: threading.Thread | None = None
+
+
+def _save_checkpoint_bg(state: dict[str, Any], path: Path) -> None:
+    """Save the checkpoint in a background thread; join the previous save first.
+
+    Caller MUST CPU-clone any GPU tensors in ``state`` (especially the model
+    state_dict) before invoking this, otherwise the background write races with
+    the optimizer mutating the live CUDA storage.
+    """
+    global _ckpt_save_thread
+    if _ckpt_save_thread is not None:
+        _ckpt_save_thread.join()
+    _ckpt_save_thread = threading.Thread(
+        target=torch.save, args=(state, path), daemon=True,
+    )
+    _ckpt_save_thread.start()
+
+
+def _join_checkpoint_bg() -> None:
+    global _ckpt_save_thread
+    if _ckpt_save_thread is not None:
+        _ckpt_save_thread.join()
+        _ckpt_save_thread = None
+
+
+def setup_distributed() -> tuple[int, int, int]:
+    """Return ``(rank, local_rank, world_size)`` and initialise NCCL/Gloo if launched via torchrun.
+
+    Single-process (no ``LOCAL_RANK``) returns ``(0, 0, 1)`` so the same code
+    runs unchanged on Kaggle / local CPU.  When launched via
+    ``torchrun --nproc_per_node=N`` the function picks NCCL (GPU) or Gloo (CPU)
+    backend automatically — same pattern as ``train_student_cnn.py``.
+    """
+    if "LOCAL_RANK" not in os.environ:
+        return 0, 0, 1
+    local_rank = int(os.environ["LOCAL_RANK"])
+    rank = int(os.environ.get("RANK", local_rank))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl")
+    else:
+        # Gloo lets us smoke-test DDP on a CPU-only laptop / CI.
+        dist.init_process_group(backend="gloo")
+    return rank, local_rank, world_size
+
+
+def teardown_distributed() -> None:
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def _is_ddp() -> bool:
+    return dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+
+
+def _ddp_device(local_rank: int) -> torch.device:
+    return torch.device(f"cuda:{local_rank}") if torch.cuda.is_available() else torch.device("cpu")
+
+
+def _maybe_compile(model: HeteroGraphTransformer, enabled: bool) -> HeteroGraphTransformer:
+    """Wrap the HGT in ``torch.compile`` when ``enabled`` is true.
+
+    Falls back to eager on compile failure so a broken inductor build never
+    blocks training. Reduce-overhead mode is the safer default for
+    dynamic-shape neighbor batches than ``max-autotune``.
+    """
+    if not enabled:
+        return model
+    try:
+        compiled = torch.compile(model, mode="reduce-overhead", dynamic=True)
+        print("[torch.compile] HGT wrapped with mode='reduce-overhead' dynamic=True", flush=True)
+        return compiled  # type: ignore[return-value]
+    except Exception as exc:  # pragma: no cover - depends on installed PyTorch
+        print(f"[torch.compile] skipped — {exc}", flush=True)
+        return model
 
 
 def get_training_devices(primary: torch.device, multi_gpu: bool) -> list[torch.device]:
@@ -263,20 +396,52 @@ def _multi_gpu_train_step(
     avg_loss = sum(lv.to(primary) for lv in gpu_losses) / (n * grad_accum_steps)
     scaler.scale(avg_loss).backward()
 
-    # Aggregate replica gradients to the original model's parameters
+    # Aggregate replica gradients to the original model's parameters.
+    # Use torch._foreach_add_ to fuse the per-parameter loops into a single
+    # multi-tensor kernel (CUDA: 1 launch instead of N), and group the inbound
+    # .to(primary) copies into one stream-overlapped pass per replica.
     replica_params = [list(r.parameters()) for r in replicas]
-    for param_idx, p_model in enumerate(model.parameters()):
-        grad_agg: torch.Tensor | None = None
-        for rp_list in replica_params:
-            p_r = rp_list[param_idx]
-            if p_r.grad is not None:
-                g = p_r.grad.to(primary)
-                grad_agg = g if grad_agg is None else grad_agg.add_(g)
-        if grad_agg is not None:
-            if p_model.grad is None:
-                p_model.grad = grad_agg
+    model_params = list(model.parameters())
+    n_params = len(model_params)
+
+    foreach_available = hasattr(torch, "_foreach_add_")
+    primary_grads_per_replica: list[list[torch.Tensor | None]] = []
+    for rp_list in replica_params:
+        replica_grads: list[torch.Tensor | None] = []
+        for p_r in rp_list:
+            if p_r.grad is None:
+                replica_grads.append(None)
+            elif p_r.device == primary:
+                replica_grads.append(p_r.grad)
             else:
-                p_model.grad.add_(grad_agg)
+                replica_grads.append(p_r.grad.to(primary, non_blocking=True))
+        primary_grads_per_replica.append(replica_grads)
+
+    # Stage 1: ensure each model parameter has a grad tensor to accumulate into.
+    for idx in range(n_params):
+        if model_params[idx].grad is None:
+            for replica_grads in primary_grads_per_replica:
+                if replica_grads[idx] is not None:
+                    model_params[idx].grad = torch.zeros_like(replica_grads[idx])
+                    break
+
+    # Stage 2: bulk add each replica's grads into the model's grads.
+    for replica_grads in primary_grads_per_replica:
+        tgt: list[torch.Tensor] = []
+        src: list[torch.Tensor] = []
+        for idx in range(n_params):
+            g = replica_grads[idx]
+            if g is None or model_params[idx].grad is None:
+                continue
+            tgt.append(model_params[idx].grad)
+            src.append(g)
+        if not tgt:
+            continue
+        if foreach_available:
+            torch._foreach_add_(tgt, src)
+        else:  # pragma: no cover - PyTorch < 1.10 fallback
+            for t, s in zip(tgt, src):
+                t.add_(s)
 
     node_stats: dict[str, list[int]] = {}
     edge_stats: dict[str, list[int]] = {}
@@ -542,11 +707,31 @@ def class_weights_from_backend(
     return torch.from_numpy(weights)
 
 
+def _to_device(value: Any, device: torch.device, non_blocking: bool, dtype: Any = None) -> torch.Tensor:
+    """Get a tensor on ``device``, handling numpy / pinned / unpinned inputs.
+
+    The DataLoader can hand us either numpy arrays (legacy / single-process
+    mode) or already-pinned torch tensors (``MiniBatchSubgraph.pin_memory()``
+    path). When the input is already a pinned tensor, the ``.to(device,
+    non_blocking=True)`` is a pure async H2D copy and overlaps with compute.
+    """
+    if isinstance(value, torch.Tensor):
+        t = value
+    else:
+        arr = np.ascontiguousarray(value) if dtype is None else np.ascontiguousarray(value, dtype=dtype)
+        t = torch.from_numpy(arr)
+        if non_blocking and device.type == "cuda" and not t.is_pinned():
+            t = t.pin_memory()
+    return t.to(device, non_blocking=non_blocking)
+
+
 def to_torch_batch(
     batch: MiniBatchSubgraph,
     edge_types: list[tuple[str, str, str]],
     device: torch.device,
     use_semantic_edge_weights: bool,
+    *,
+    non_blocking: bool = True,
 ) -> tuple[
     dict[str, torch.Tensor],
     dict[tuple[str, str, str], torch.Tensor],
@@ -555,7 +740,7 @@ def to_torch_batch(
     torch.Tensor,
 ]:
     node_tensors = {
-        key: torch.from_numpy(np.asarray(value)).to(device)
+        key: _to_device(value, device, non_blocking)
         for key, value in batch.node_features.items()
     }
     edge_tensors: dict[tuple[str, str, str], torch.Tensor] = {}
@@ -563,19 +748,83 @@ def to_torch_batch(
         value = batch.edge_index.get(edge_type)
         if value is None:
             value = np.empty((2, 0), dtype=np.int64)
-        edge_tensors[edge_type] = torch.from_numpy(np.asarray(value, dtype=np.int64)).to(device)
+        edge_tensors[edge_type] = _to_device(value, device, non_blocking, dtype=np.int64)
 
     edge_weights: dict[tuple[str, str, str], torch.Tensor] = {}
     if use_semantic_edge_weights:
         for edge_type in edge_types:
             if "matches_technique" not in edge_type[1]:
                 continue
-            values = np.asarray(batch.edge_attr.get(edge_type, np.empty((0,), dtype=np.float32)), dtype=np.float32)
-            edge_weights[edge_type] = torch.from_numpy(values.reshape(-1)).to(device)
+            value = batch.edge_attr.get(edge_type, np.empty((0,), dtype=np.float32))
+            t = _to_device(value, device, non_blocking, dtype=np.float32)
+            edge_weights[edge_type] = t.reshape(-1)
 
-    seed_mask = torch.from_numpy(np.asarray(batch.seed_mask, dtype=bool)).to(device)
-    seed_labels = torch.from_numpy(np.asarray(batch.seed_labels, dtype=np.int64)).to(device)
+    seed_mask = _to_device(batch.seed_mask, device, non_blocking, dtype=bool)
+    seed_labels = _to_device(batch.seed_labels, device, non_blocking, dtype=np.int64)
     return node_tensors, edge_tensors, edge_weights or None, seed_mask, seed_labels
+
+
+def _per_class_counts_tensor(
+    pred: torch.Tensor,
+    label: torch.Tensor,
+    num_classes: int,
+) -> torch.Tensor:
+    """Return a ``(num_classes, 4)`` int64 tensor of ``[tp, fp, fn, support]`` per class.
+
+    Designed so DDP eval can ``all_reduce(SUM)`` the result instead of gathering
+    full per-rank prediction vectors (which is memory-heavy for big val splits).
+    """
+    pred = pred.long().reshape(-1)
+    label = label.long().reshape(-1)
+    device = pred.device
+    cls = torch.arange(num_classes, device=device).view(-1, 1)
+    pred_eq = pred.view(1, -1) == cls   # (C, N)
+    lab_eq = label.view(1, -1) == cls   # (C, N)
+    tp = (pred_eq & lab_eq).sum(dim=1)
+    fp = (pred_eq & ~lab_eq).sum(dim=1)
+    fn = (~pred_eq & lab_eq).sum(dim=1)
+    support = lab_eq.sum(dim=1)
+    return torch.stack([tp, fp, fn, support], dim=1).to(torch.int64)
+
+
+def _metrics_from_counts(
+    counts: np.ndarray,           # (num_classes, 4)
+    label_names: dict[int, str],
+    loss_sum: float | None,
+    total_examples: int,
+) -> dict[str, Any]:
+    """Build the same metric dict shape as ``metrics_from_predictions`` from
+    pre-aggregated per-class counts. Used by DDP eval after ``all_reduce``."""
+    if counts.size == 0 or int(counts[:, 3].sum()) == 0:
+        return {"count": 0, "loss": None, "accuracy": None, "macro_f1": None, "per_class": {}}
+    tp = counts[:, 0].astype(np.int64)
+    fp = counts[:, 1].astype(np.int64)
+    fn = counts[:, 2].astype(np.int64)
+    support = counts[:, 3].astype(np.int64)
+    per_class: dict[str, dict[str, float | int]] = {}
+    f1_values: list[float] = []
+    correct = 0
+    for cid in range(counts.shape[0]):
+        prec = tp[cid] / max(tp[cid] + fp[cid], 1)
+        rec = tp[cid] / max(tp[cid] + fn[cid], 1)
+        f1 = 2.0 * prec * rec / max(prec + rec, 1e-12)
+        if support[cid] > 0:
+            f1_values.append(float(f1))
+        per_class[label_names.get(cid, str(cid))] = {
+            "support": int(support[cid]),
+            "precision": float(prec),
+            "recall": float(rec),
+            "f1": float(f1),
+        }
+        correct += int(tp[cid])
+    count = int(support.sum())
+    return {
+        "count": count,
+        "loss": float(loss_sum / max(total_examples, 1)) if loss_sum is not None else None,
+        "accuracy": float(correct / max(count, 1)),
+        "macro_f1": float(np.mean(f1_values)) if f1_values else 0.0,
+        "per_class": per_class,
+    }
 
 
 def metrics_from_predictions(
@@ -623,18 +872,83 @@ def make_neighbor_loader(
     config: dict[str, Any],
     *,
     shuffle: bool,
-) -> DataLoader:
-    num_workers = int(config.get("dataloader", {}).get("num_workers", 0))
+    n_gpus: int = 1,
+    world_size: int = 1,
+    rank: int = 0,
+    seed: int = 42,
+) -> tuple[DataLoader, DistributedSampler | None]:
+    """Build a neighbor-sampling DataLoader.
+
+    Returns ``(loader, dist_sampler)``. In DDP mode (``world_size > 1``) the
+    DistributedSampler is set up to shard ``flow_ids`` across ranks; callers must
+    invoke ``dist_sampler.set_epoch(epoch)`` each epoch to reshuffle. In
+    single-process mode the second element is ``None``.
+    """
+    dl_cfg = config.get("dataloader") or {}
+    num_workers = _auto_dataloader_workers(int(dl_cfg.get("num_workers", -1)), n_gpus)
+    dataset = FlowSeedDataset(flow_ids)
+
+    dist_sampler: DistributedSampler | None = None
     loader_kwargs: dict[str, Any] = {
         "batch_size": int(config["train"].get("batch_seed_flows", 256)),
-        "shuffle": bool(shuffle),
         "collate_fn": NeighborSamplingCollator(sampler),
         "num_workers": num_workers,
-        "pin_memory": bool(config.get("dataloader", {}).get("pin_memory", False)),
+        "pin_memory": bool(dl_cfg.get("pin_memory", True)),
     }
+    if world_size > 1:
+        dist_sampler = DistributedSampler(
+            dataset, num_replicas=world_size, rank=rank, shuffle=bool(shuffle), seed=seed
+        )
+        loader_kwargs["sampler"] = dist_sampler
+        loader_kwargs["shuffle"] = False
+    else:
+        loader_kwargs["shuffle"] = bool(shuffle)
     if num_workers > 0:
-        loader_kwargs["prefetch_factor"] = int(config.get("dataloader", {}).get("prefetch_factor", 2))
-    return DataLoader(FlowSeedDataset(flow_ids), **loader_kwargs)
+        loader_kwargs["prefetch_factor"] = int(dl_cfg.get("prefetch_factor", 4))
+        loader_kwargs["persistent_workers"] = bool(dl_cfg.get("persistent_workers", True))
+    return DataLoader(dataset, **loader_kwargs), dist_sampler
+
+
+def _multi_gpu_eval_step(
+    model: HeteroGraphTransformer,
+    batch_group: list[MiniBatchSubgraph],
+    devices: list[torch.device],
+    edge_types: list[tuple[str, str, str]],
+    use_semantic_edge_weights: bool,
+    use_amp: bool,
+) -> tuple[float, list[np.ndarray], list[np.ndarray]]:
+    """Forward replicas across GPUs in parallel; no backward, no grad."""
+    import torch.nn.parallel as P
+
+    n = min(len(batch_group), len(devices))
+    device_ids = [d.index for d in devices[:n]]
+    replicas = P.replicate(model, device_ids, detach=True)
+
+    inputs_args: list[tuple] = []
+    inputs_kwargs: list[dict[str, Any]] = []
+    masks: list[torch.Tensor] = []
+    all_labels: list[torch.Tensor] = []
+
+    for batch, device in zip(batch_group[:n], devices[:n]):
+        nf, ei, ew, sm, sl = to_torch_batch(batch, edge_types, device, use_semantic_edge_weights)
+        inputs_args.append((nf, ei))
+        inputs_kwargs.append({"edge_weight_dict": ew})
+        masks.append(sm)
+        all_labels.append(sl)
+
+    with torch.amp.autocast("cuda", enabled=use_amp):
+        all_logits = P.parallel_apply(replicas, inputs_args, inputs_kwargs)
+
+    loss_sum_f = 0.0
+    preds: list[np.ndarray] = []
+    labels_out: list[np.ndarray] = []
+    for logits, sm, sl in zip(all_logits, masks, all_labels):
+        seed_logits = logits[sm].float()
+        loss = F.cross_entropy(seed_logits, sl, reduction="sum")
+        loss_sum_f += float(loss.item())
+        preds.append(seed_logits.argmax(dim=1).cpu().numpy())
+        labels_out.append(sl.detach().cpu().numpy())
+    return loss_sum_f, preds, labels_out
 
 
 def evaluate_neighbor_sampling(
@@ -649,8 +963,20 @@ def evaluate_neighbor_sampling(
     label_names: dict[int, str],
     epoch: int = 0,
     split_name: str = "eval",
+    devices: list[torch.device] | None = None,
+    is_ddp: bool = False,
 ) -> dict[str, Any]:
+    """Three paths:
+      1. DDP (``is_ddp=True``): each rank evaluates its DistributedSampler shard,
+         accumulates per-class counts on-device, ``all_reduce`` at the end.
+      2. Legacy multi-GPU (``devices`` given, no DDP): replicate the model and
+         parallel_apply batches across GPUs — kept for Kaggle notebooks.
+      3. Single-device: straight loop.
+    """
     model.eval()
+    counts_acc = torch.zeros((num_classes, 4), dtype=torch.int64, device=device)
+    loss_sum_t = torch.zeros(1, dtype=torch.float64, device=device)
+    examples_t = torch.zeros(1, dtype=torch.int64, device=device)
     preds: list[np.ndarray] = []
     labels: list[np.ndarray] = []
     loss_sum = 0.0
@@ -658,41 +984,153 @@ def evaluate_neighbor_sampling(
     progress_every = max(1, total_batches // 10) if total_batches else 0
     start = time.time()
     last_logged = 0
-    with torch.no_grad():
-        for i, batch in enumerate(loader, start=1):
-            node_features, edge_index, edge_weight, seed_mask, seed_labels = to_torch_batch(
-                batch,
-                edge_types,
-                device,
-                use_semantic_edge_weights,
-            )
-            with torch.amp.autocast("cuda", enabled=use_amp):
-                logits = model(node_features, edge_index, edge_weight_dict=edge_weight)
-                seed_logits = logits[seed_mask]
-                loss = F.cross_entropy(seed_logits.float(), seed_labels, reduction="sum")
-            loss_sum += float(loss.item())
-            preds.append(seed_logits.detach().float().argmax(dim=1).cpu().numpy())
-            labels.append(seed_labels.detach().cpu().numpy())
-            if progress_every and (i - last_logged >= progress_every or i == total_batches):
-                pct = 100.0 * i / total_batches
-                elapsed = time.time() - start
-                print(
-                    f"Epoch {epoch:03d} | {split_name:<5} {i:>5}/{total_batches} "
-                    f"({pct:5.1f}%) | {elapsed:6.1f}s",
-                    flush=True,
+    n_gpus = len(devices) if devices else 1
+    batches_seen = 0
+    last_logged_batches = 0
+    # inference_mode is stricter than no_grad: PyTorch skips version-counter
+    # bookkeeping on every output tensor, so eval throughput is ~5-10% higher
+    # for graph-transformer workloads that produce many intermediate tensors.
+    with torch.inference_mode():
+        if is_ddp:
+            for i, batch in enumerate(loader, start=1):
+                node_features, edge_index, edge_weight, seed_mask, seed_labels = to_torch_batch(
+                    batch, edge_types, device, use_semantic_edge_weights,
                 )
-                last_logged = i
+                with torch.amp.autocast("cuda", enabled=use_amp):
+                    logits = model(node_features, edge_index, edge_weight_dict=edge_weight)
+                    seed_logits = logits[seed_mask]
+                    loss = F.cross_entropy(seed_logits.float(), seed_labels, reduction="sum")
+                loss_sum_t += loss.detach().to(torch.float64)
+                examples_t += seed_labels.numel()
+                pred = seed_logits.detach().float().argmax(dim=1)
+                counts_acc += _per_class_counts_tensor(pred, seed_labels, num_classes)
+                if progress_every and (i - last_logged >= progress_every or i == total_batches):
+                    if not dist.is_initialized() or dist.get_rank() == 0:
+                        pct = 100.0 * i / total_batches
+                        elapsed = time.time() - start
+                        print(
+                            f"Epoch {epoch:03d} | {split_name:<5} {i:>5}/{total_batches} "
+                            f"({pct:5.1f}%) | {elapsed:6.1f}s",
+                            flush=True,
+                        )
+                    last_logged = i
+            # All-reduce across ranks.
+            dist.all_reduce(counts_acc, op=dist.ReduceOp.SUM)
+            dist.all_reduce(loss_sum_t, op=dist.ReduceOp.SUM)
+            dist.all_reduce(examples_t, op=dist.ReduceOp.SUM)
+            return _metrics_from_counts(
+                counts_acc.cpu().numpy(),
+                label_names,
+                float(loss_sum_t.item()),
+                int(examples_t.item()),
+            )
+        elif n_gpus > 1 and devices is not None:
+            it = iter(loader)
+            while True:
+                batch_group: list[MiniBatchSubgraph] = []
+                for _ in range(n_gpus):
+                    try:
+                        batch_group.append(next(it))
+                    except StopIteration:
+                        break
+                if not batch_group:
+                    break
+                if len(batch_group) > 1:
+                    ls, bp, bl = _multi_gpu_eval_step(
+                        model, batch_group, devices, edge_types,
+                        use_semantic_edge_weights, use_amp,
+                    )
+                    loss_sum += ls
+                    preds.extend(bp)
+                    labels.extend(bl)
+                else:
+                    batch = batch_group[0]
+                    node_features, edge_index, edge_weight, seed_mask, seed_labels = to_torch_batch(
+                        batch, edge_types, device, use_semantic_edge_weights,
+                    )
+                    with torch.amp.autocast("cuda", enabled=use_amp):
+                        logits = model(node_features, edge_index, edge_weight_dict=edge_weight)
+                        seed_logits = logits[seed_mask]
+                        loss = F.cross_entropy(seed_logits.float(), seed_labels, reduction="sum")
+                    loss_sum += float(loss.item())
+                    preds.append(seed_logits.detach().float().argmax(dim=1).cpu().numpy())
+                    labels.append(seed_labels.detach().cpu().numpy())
+                batches_seen += len(batch_group)
+                if progress_every and (
+                    batches_seen - last_logged_batches >= progress_every
+                    or batches_seen >= total_batches
+                ):
+                    pct = 100.0 * batches_seen / max(total_batches, 1)
+                    elapsed = time.time() - start
+                    print(
+                        f"Epoch {epoch:03d} | {split_name:<5} {batches_seen:>5}/{total_batches} "
+                        f"({pct:5.1f}%) | {elapsed:6.1f}s",
+                        flush=True,
+                    )
+                    last_logged_batches = batches_seen
+        else:
+            for i, batch in enumerate(loader, start=1):
+                node_features, edge_index, edge_weight, seed_mask, seed_labels = to_torch_batch(
+                    batch,
+                    edge_types,
+                    device,
+                    use_semantic_edge_weights,
+                )
+                with torch.amp.autocast("cuda", enabled=use_amp):
+                    logits = model(node_features, edge_index, edge_weight_dict=edge_weight)
+                    seed_logits = logits[seed_mask]
+                    loss = F.cross_entropy(seed_logits.float(), seed_labels, reduction="sum")
+                loss_sum += float(loss.item())
+                preds.append(seed_logits.detach().float().argmax(dim=1).cpu().numpy())
+                labels.append(seed_labels.detach().cpu().numpy())
+                if progress_every and (i - last_logged >= progress_every or i == total_batches):
+                    pct = 100.0 * i / total_batches
+                    elapsed = time.time() - start
+                    print(
+                        f"Epoch {epoch:03d} | {split_name:<5} {i:>5}/{total_batches} "
+                        f"({pct:5.1f}%) | {elapsed:6.1f}s",
+                        flush=True,
+                    )
+                    last_logged = i
     pred_np = np.concatenate(preds) if preds else np.empty((0,), dtype=np.int64)
     label_np = np.concatenate(labels) if labels else np.empty((0,), dtype=np.int64)
     return metrics_from_predictions(pred_np, label_np, num_classes, label_names, loss_sum)
 
 
-def train_neighbor_sampling(config: dict[str, Any], seed: int, device: torch.device) -> None:
+def train_neighbor_sampling(
+    config: dict[str, Any],
+    seed: int,
+    device: torch.device,
+    *,
+    rank: int = 0,
+    local_rank: int = 0,
+    world_size: int = 1,
+) -> None:
+    """Train the HGT classifier with neighbor sampling.
+
+    Routing:
+      * ``world_size > 1``      → DDP (torchrun): each rank holds one GPU/CPU,
+        DistributedSampler shards seed flows, NCCL/Gloo all-reduces gradients.
+      * Single-process, multi GPU visible AND ``train.multi_gpu`` → legacy
+        ``replicate + parallel_apply + foreach_add_`` fallback (Kaggle notebooks
+        without torchrun).
+      * Single-process, 1 device (GPU or CPU) → straight loop.
+    """
+    is_ddp = world_size > 1
     multi_gpu = bool(config["train"].get("multi_gpu", True))
-    devices = get_training_devices(device, multi_gpu)
-    n_gpus = len(devices)
-    if n_gpus > 1:
-        print(f"[Multi-GPU] Using {n_gpus} GPUs: {', '.join(str(d) for d in devices)}")
+    # In DDP each rank owns exactly one device; the legacy multi-GPU primitive
+    # is disabled so we don't double-replicate.
+    if is_ddp:
+        devices = [device]
+        n_gpus = 1
+        if rank == 0:
+            print(f"[DDP] world_size={world_size} backend={dist.get_backend()}", flush=True)
+    else:
+        devices = get_training_devices(device, multi_gpu)
+        n_gpus = len(devices)
+        if n_gpus > 1:
+            print(f"[Multi-GPU legacy] Using {n_gpus} GPUs: {', '.join(str(d) for d in devices)}")
+    _tune_cuda_backends(device, enable_tf32=bool(config["train"].get("tf32", True)))
 
     backend = load_neighbor_backend(config)
     all_flow_ids = np.arange(int(backend.num_flows), dtype=np.int64)
@@ -717,6 +1155,9 @@ def train_neighbor_sampling(config: dict[str, Any], seed: int, device: torch.dev
     sampler_hops = sampler_cfg.get("hops")
     if sampler_hops is None:
         sampler_hops = int(config["model"]["num_layers"])
+    # Per-rank RNG seed so ranks don't all pick identical neighbour subsamples
+    # (each rank already sees a different flow shard via DistributedSampler, but
+    # diverging samplers help hide any residual correlation in random keys).
     sampler = HeteroNeighborSampler(
         backend,
         hops=int(sampler_hops),
@@ -726,11 +1167,20 @@ def train_neighbor_sampling(config: dict[str, Any], seed: int, device: torch.dev
         always_include_all_techniques=bool(sampler_cfg.get("always_include_all_techniques", True)),
         flow_feature_stats=flow_feature_stats,
         standardize_flow_features=bool(config["data"]["standardize_flow_features"]),
-        seed=seed,
+        seed=seed + rank,
     )
-    train_loader = make_neighbor_loader(train_idx_np, sampler, config, shuffle=True)
-    val_loader = make_neighbor_loader(val_idx_np, sampler, config, shuffle=False)
-    test_loader = make_neighbor_loader(test_idx_np, sampler, config, shuffle=False)
+    train_loader, train_dist_sampler = make_neighbor_loader(
+        train_idx_np, sampler, config, shuffle=True,  n_gpus=n_gpus,
+        world_size=world_size, rank=rank, seed=seed,
+    )
+    val_loader, _ = make_neighbor_loader(
+        val_idx_np, sampler, config, shuffle=False, n_gpus=n_gpus,
+        world_size=world_size, rank=rank, seed=seed,
+    )
+    test_loader, _ = make_neighbor_loader(
+        test_idx_np, sampler, config, shuffle=False, n_gpus=n_gpus,
+        world_size=world_size, rank=rank, seed=seed,
+    )
 
     edge_types = list(backend.edge_types)
     node_input_dims = {
@@ -738,7 +1188,7 @@ def train_neighbor_sampling(config: dict[str, Any], seed: int, device: torch.dev
         "packet": int(backend.feature_dims["packet"]),
         "technique": int(backend.feature_dims["technique"]),
     }
-    model = HeteroGraphTransformer(
+    raw_model = HeteroGraphTransformer(
         node_input_dims=node_input_dims,
         edge_types=edge_types,
         num_classes=num_classes,
@@ -750,6 +1200,33 @@ def train_neighbor_sampling(config: dict[str, Any], seed: int, device: torch.dev
         ffn_multiplier=int(config["model"]["ffn_multiplier"]),
         activation_checkpointing=bool(config["train"].get("activation_checkpointing", False)),
     ).to(device)
+    raw_model = _maybe_compile(raw_model, bool(config["train"].get("compile", False)))
+
+    if is_ddp:
+        # find_unused_parameters=True is required: HGT carries per-relation
+        # parameters (relation_key/value/prior) that only receive gradient when
+        # at least one edge of that relation lands in the mini-batch. Neighbor
+        # sampling can skip entire edge types on small batches, so DDP must walk
+        # the autograd graph after backward to learn which params updated.
+        #
+        # gradient_as_bucket_view=True: DDP creates ``.grad`` views into its
+        # internal flattened bucket buffer instead of a separate per-param grad
+        # tensor. Saves ~one model-size of activation memory and shortens the
+        # all-reduce path (no extra copy between .grad and the bucket).
+        #
+        # bucket_cap_mb=25: HGT is small (~10-40 MB of params), so the default
+        # 25MB bucket already collapses into 1-2 buckets — keeping the default
+        # avoids fragmenting the all-reduce across many tiny messages.
+        device_ids = [local_rank] if device.type == "cuda" else None
+        model: torch.nn.Module = DDP(
+            raw_model,
+            device_ids=device_ids,
+            find_unused_parameters=True,
+            gradient_as_bucket_view=True,
+            bucket_cap_mb=int(config["train"].get("ddp_bucket_cap_mb", 25)),
+        )
+    else:
+        model = raw_model
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -760,7 +1237,7 @@ def train_neighbor_sampling(config: dict[str, Any], seed: int, device: torch.dev
     if str(config["train"]["class_weight"]).lower() == "balanced":
         weight = class_weights_from_backend(backend, train_idx_np, num_classes).to(device)
 
-    output_dir = ensure_dir(Path(config["train"]["output_dir"]))
+    output_dir = ensure_dir(Path(config["train"]["output_dir"])) if rank == 0 else Path(config["train"]["output_dir"])
     best_checkpoint = output_dir / "hgt_flow_best.pt"
     label_names = label_name_mapping(backend.manifest, labels_np)
     monitor = str(config["train"]["monitor"])
@@ -777,20 +1254,26 @@ def train_neighbor_sampling(config: dict[str, Any], seed: int, device: torch.dev
 
     train_batches_total = len(train_loader)
     train_progress_every = max(1, train_batches_total // 10) if train_batches_total else 0
-    print(
-        f"[HGT] Starting training: epochs={int(config['train']['epochs'])} "
-        f"train_batches/epoch={train_batches_total} val_batches={len(val_loader)} "
-        f"test_batches={len(test_loader)} progress_every={train_progress_every}",
-        flush=True,
-    )
+    if rank == 0:
+        print(
+            f"[HGT] Starting training: epochs={int(config['train']['epochs'])} "
+            f"train_batches/epoch={train_batches_total} val_batches={len(val_loader)} "
+            f"test_batches={len(test_loader)} progress_every={train_progress_every}",
+            flush=True,
+        )
 
     for epoch in range(1, int(config["train"]["epochs"]) + 1):
+        if train_dist_sampler is not None:
+            # Reshuffle the DistributedSampler so each epoch sees a different
+            # rank-to-flow assignment — critical for SGD on sharded data.
+            train_dist_sampler.set_epoch(epoch)
         model.train()
         optimizer.zero_grad(set_to_none=True)
-        preds: list[np.ndarray] = []
-        labels: list[np.ndarray] = []
-        loss_sum = 0.0
-        examples = 0
+        # Train metric counts are accumulated on-device so the all-reduce at the
+        # end of the epoch is a single small tensor instead of a giant concat.
+        train_counts = torch.zeros((num_classes, 4), dtype=torch.int64, device=device)
+        train_loss_sum_t = torch.zeros(1, dtype=torch.float64, device=device)
+        train_examples_t = torch.zeros(1, dtype=torch.int64, device=device)
         pending_step = False
         sampled_nodes: dict[str, list[int]] = {"flow": [], "packet": [], "technique": [], "tactic": []}
         sampled_edges: dict[str, list[int]] = {}
@@ -801,9 +1284,12 @@ def train_neighbor_sampling(config: dict[str, Any], seed: int, device: torch.dev
         last_logged_batches = 0
         epoch_start = time.time()
         while True:
-            # Collect one batch per GPU to maximise parallelism
+            # In DDP mode each rank takes one batch at a time (DDP handles
+            # cross-rank parallelism through all-reduce). In legacy mode we
+            # still gather one batch per visible GPU.
+            group_size = 1 if is_ddp else n_gpus
             batch_group: list[MiniBatchSubgraph] = []
-            for _ in range(n_gpus):
+            for _ in range(group_size):
                 try:
                     batch_group.append(next(train_iter))
                 except StopIteration:
@@ -811,35 +1297,48 @@ def train_neighbor_sampling(config: dict[str, Any], seed: int, device: torch.dev
             if not batch_group:
                 break
 
-            if n_gpus > 1 and len(batch_group) > 1:
+            if (not is_ddp) and n_gpus > 1 and len(batch_group) > 1:
+                # Legacy single-process multi-GPU: replicate + parallel_apply.
                 ls, ex, bp, bl, ns, es = _multi_gpu_train_step(
                     model, batch_group, devices, edge_types, weight,
                     scaler, use_semantic_edge_weights, grad_accum_steps,
                 )
-                loss_sum += ls
-                examples += ex
-                preds.extend(bp)
-                labels.extend(bl)
+                train_loss_sum_t += float(ls)
+                train_examples_t += int(ex)
+                for p_np, l_np in zip(bp, bl):
+                    local_counts = _per_class_counts_tensor(
+                        torch.from_numpy(p_np), torch.from_numpy(l_np), num_classes,
+                    ).to(device)
+                    train_counts.add_(local_counts)
                 for nt, cnts in ns.items():
                     sampled_nodes.setdefault(nt, []).extend(cnts)
                 for et, cnts in es.items():
                     sampled_edges.setdefault(et, []).extend(cnts)
             else:
+                # DDP or single-device: one forward + backward per step.
                 batch = batch_group[0]
-                node_features, edge_index, edge_weight, seed_mask, seed_labels = to_torch_batch(
+                nf, ei, ew, sm, sl = to_torch_batch(
                     batch, edge_types, device, use_semantic_edge_weights,
                 )
-                with torch.amp.autocast("cuda", enabled=use_amp):
-                    logits = model(node_features, edge_index, edge_weight_dict=edge_weight)
-                    seed_logits = logits[seed_mask]
-                    loss = F.cross_entropy(seed_logits, seed_labels, weight=weight)
+                # In DDP, suppress the all-reduce on mid-accumulation backwards.
+                # The trailing backward (or the only backward when accum=1) still
+                # syncs gradients, so the optimizer step sees correct averages.
+                sync_ctx = (
+                    model.no_sync()
+                    if is_ddp and (step + 1) % grad_accum_steps != 0
+                    else _nullcontext()
+                )
+                with sync_ctx, torch.amp.autocast("cuda", enabled=use_amp):
+                    logits = model(nf, ei, edge_weight_dict=ew)
+                    seed_logits = logits[sm]
+                    loss = F.cross_entropy(seed_logits, sl, weight=weight)
                     scaled_loss = loss / grad_accum_steps
                 scaler.scale(scaled_loss).backward()
-                batch_count = int(seed_labels.numel())
-                loss_sum += float(loss.detach().item()) * batch_count
-                examples += batch_count
-                preds.append(seed_logits.detach().float().argmax(dim=1).cpu().numpy())
-                labels.append(seed_labels.detach().cpu().numpy())
+                batch_count = int(sl.numel())
+                train_loss_sum_t += loss.detach().to(torch.float64) * batch_count
+                train_examples_t += batch_count
+                pred = seed_logits.detach().float().argmax(dim=1)
+                train_counts.add_(_per_class_counts_tensor(pred, sl, num_classes))
                 for node_type, count in batch.stats.get("nodes", {}).items():
                     sampled_nodes.setdefault(node_type, []).append(int(count))
                 for edge_name, count in batch.stats.get("edges", {}).items():
@@ -853,11 +1352,14 @@ def train_neighbor_sampling(config: dict[str, Any], seed: int, device: torch.dev
                 pending_step = False
             step += 1
             batches_seen += len(batch_group)
-            if train_progress_every and (
+            if rank == 0 and train_progress_every and (
                 batches_seen - last_logged_batches >= train_progress_every
                 or batches_seen >= train_batches_total
             ):
-                running_loss = (loss_sum / examples) if examples else 0.0
+                running_loss = (
+                    float(train_loss_sum_t.item()) / float(train_examples_t.item())
+                    if int(train_examples_t.item()) else 0.0
+                )
                 pct = (
                     100.0 * batches_seen / train_batches_total
                     if train_batches_total else 0.0
@@ -875,14 +1377,18 @@ def train_neighbor_sampling(config: dict[str, Any], seed: int, device: torch.dev
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
 
-        train_pred = np.concatenate(preds) if preds else np.empty((0,), dtype=np.int64)
-        train_label = np.concatenate(labels) if labels else np.empty((0,), dtype=np.int64)
-        train_metrics = metrics_from_predictions(
-            train_pred,
-            train_label,
-            num_classes,
+        # All-reduce train metrics so every rank reports the global epoch view.
+        if is_ddp:
+            dist.all_reduce(train_counts, op=dist.ReduceOp.SUM)
+            dist.all_reduce(train_loss_sum_t, op=dist.ReduceOp.SUM)
+            dist.all_reduce(train_examples_t, op=dist.ReduceOp.SUM)
+
+        train_examples = int(train_examples_t.item())
+        train_metrics = _metrics_from_counts(
+            train_counts.detach().cpu().numpy(),
             label_names,
-            loss_sum if examples else None,
+            float(train_loss_sum_t.item()) if train_examples else None,
+            train_examples,
         )
         val_metrics = evaluate_neighbor_sampling(
             model=model,
@@ -895,6 +1401,8 @@ def train_neighbor_sampling(config: dict[str, Any], seed: int, device: torch.dev
             label_names=label_names,
             epoch=epoch,
             split_name="val",
+            devices=devices if (n_gpus > 1 and not is_ddp) else None,
+            is_ddp=is_ddp,
         )
         test_metrics = evaluate_neighbor_sampling(
             model=model,
@@ -907,6 +1415,8 @@ def train_neighbor_sampling(config: dict[str, Any], seed: int, device: torch.dev
             label_names=label_names,
             epoch=epoch,
             split_name="test",
+            devices=devices if (n_gpus > 1 and not is_ddp) else None,
+            is_ddp=is_ddp,
         )
 
         avg_nodes = {
@@ -934,26 +1444,38 @@ def train_neighbor_sampling(config: dict[str, Any], seed: int, device: torch.dev
             best_score = monitor_score
             best_epoch = epoch
             epochs_without_improvement = 0
-            torch.save(
-                {
-                    "model_state_dict": model.state_dict(),
-                    "config": config,
-                    "node_input_dims": node_input_dims,
-                    "edge_types": [list(edge_key) for edge_key in edge_types],
-                    "num_classes": num_classes,
-                    "num_tactics": int(backend.num_tactics),
-                    "label_names": label_names,
-                    "flow_feature_stats": flow_feature_stats,
-                    "epoch": epoch,
-                    "val_metrics": val_metrics,
-                    "test_metrics": test_metrics,
-                },
-                best_checkpoint,
-            )
+            if rank == 0:
+                # Always save the unwrapped (un-DDP, un-compile) state_dict so
+                # the runtime / inference path can load it without needing DDP
+                # or torch.compile installed. CPU-clone every tensor here BEFORE
+                # handing it off to the background thread — the optimizer's
+                # next step would otherwise race with the disk write on the
+                # same CUDA storage.
+                state_holder = model.module if isinstance(model, DDP) else model
+                state_holder = getattr(state_holder, "_orig_mod", state_holder)
+                cpu_state = {
+                    k: v.detach().clone().cpu() for k, v in state_holder.state_dict().items()
+                }
+                _save_checkpoint_bg(
+                    {
+                        "model_state_dict": cpu_state,
+                        "config": config,
+                        "node_input_dims": node_input_dims,
+                        "edge_types": [list(edge_key) for edge_key in edge_types],
+                        "num_classes": num_classes,
+                        "num_tactics": int(backend.num_tactics),
+                        "label_names": label_names,
+                        "flow_feature_stats": flow_feature_stats,
+                        "epoch": epoch,
+                        "val_metrics": val_metrics,
+                        "test_metrics": test_metrics,
+                    },
+                    best_checkpoint,
+                )
         else:
             epochs_without_improvement += 1
 
-        if epoch == 1 or epoch % log_every == 0:
+        if rank == 0 and (epoch == 1 or epoch % log_every == 0):
             print(
                 f"Epoch {epoch:03d} | "
                 f"loss={float(train_metrics['loss'] or 0.0):.4f} "
@@ -964,36 +1486,54 @@ def train_neighbor_sampling(config: dict[str, Any], seed: int, device: torch.dev
                 f"avg_packet_nodes={avg_nodes.get('packet', 0.0):.1f}"
             )
 
-        if epochs_without_improvement >= int(config["train"]["patience"]):
-            print(f"Early stopping at epoch {epoch}.")
+        # Broadcast the early-stop decision from rank 0 so all ranks exit together.
+        stop = epochs_without_improvement >= int(config["train"]["patience"])
+        if is_ddp:
+            stop_t = torch.tensor([1 if stop else 0], dtype=torch.int64, device=device)
+            dist.broadcast(stop_t, src=0)
+            stop = bool(stop_t.item())
+        if stop:
+            if rank == 0:
+                print(f"Early stopping at epoch {epoch}.")
             break
 
-    best_payload = load_checkpoint(best_checkpoint, device)
-    device_str = str(device) + (f" x{n_gpus}" if n_gpus > 1 else "")
-    summary = {
-        "created_at_utc": datetime.now(timezone.utc).isoformat(),
-        "config": config,
-        "device": device_str,
-        "best_checkpoint": str(best_checkpoint),
-        "best_epoch": int(best_epoch),
-        "best_score": float(best_score),
-        "num_flows": int(backend.num_flows),
-        "num_techniques": int(backend.num_techniques),
-        "num_tactics": int(backend.num_tactics),
-        "num_edge_types": int(len(edge_types)),
-        "splits": {
-            "train": int(train_idx_np.shape[0]),
-            "val": int(val_idx_np.shape[0]),
-            "test": int(test_idx_np.shape[0]),
-        },
-        "label_names": {str(key): value for key, value in label_names.items()},
-        "best_val_metrics": best_payload["val_metrics"],
-        "best_test_metrics": best_payload["test_metrics"],
-        "history": history,
-    }
-    write_json(output_dir / "training_summary.json", summary)
-    print(f"[OK] Best checkpoint: {best_checkpoint}")
-    print(f"[OK] Training summary: {output_dir / 'training_summary.json'}")
+    # Wait for the background checkpoint thread to flush AND for all ranks to
+    # be ready — only then can rank 0 load the file back safely. In non-DDP
+    # mode the barrier is a no-op.
+    _join_checkpoint_bg()
+    if is_ddp:
+        dist.barrier()
+    if rank == 0:
+        best_payload = load_checkpoint(best_checkpoint, device)
+        device_str = (
+            f"{device} x{world_size}" if is_ddp else
+            str(device) + (f" x{n_gpus}" if n_gpus > 1 else "")
+        )
+        summary = {
+            "created_at_utc": datetime.now(timezone.utc).isoformat(),
+            "config": config,
+            "device": device_str,
+            "world_size": int(world_size),
+            "best_checkpoint": str(best_checkpoint),
+            "best_epoch": int(best_epoch),
+            "best_score": float(best_score),
+            "num_flows": int(backend.num_flows),
+            "num_techniques": int(backend.num_techniques),
+            "num_tactics": int(backend.num_tactics),
+            "num_edge_types": int(len(edge_types)),
+            "splits": {
+                "train": int(train_idx_np.shape[0]),
+                "val": int(val_idx_np.shape[0]),
+                "test": int(test_idx_np.shape[0]),
+            },
+            "label_names": {str(key): value for key, value in label_names.items()},
+            "best_val_metrics": best_payload["val_metrics"],
+            "best_test_metrics": best_payload["test_metrics"],
+            "history": history,
+        }
+        write_json(output_dir / "training_summary.json", summary)
+        print(f"[OK] Best checkpoint: {best_checkpoint}")
+        print(f"[OK] Training summary: {output_dir / 'training_summary.json'}")
 
 
 def load_checkpoint(path: Path, device: torch.device) -> dict[str, Any]:
@@ -1009,13 +1549,32 @@ def main() -> None:
 
     seed = int(config["train"]["seed"])
     set_seed(seed)
-    device = resolve_device(str(config["train"]["device"]))
-    batch_mode = str(config["train"]["batch_mode"]).lower()
-    if batch_mode in {"neighbor_sampling", "neighbor", "mini_batch", "minibatch"}:
-        train_neighbor_sampling(config, seed, device)
-        return
-    if batch_mode != "full":
-        raise ValueError("train.batch_mode must be 'full' or 'neighbor_sampling'.")
+
+    # DDP-aware bootstrap: when launched via torchrun, LOCAL_RANK pins us to a
+    # specific device; otherwise we honour the config's "device" field.
+    rank, local_rank, world_size = setup_distributed()
+    if world_size > 1:
+        device = _ddp_device(local_rank)
+    else:
+        device = resolve_device(str(config["train"]["device"]))
+
+    try:
+        batch_mode = str(config["train"]["batch_mode"]).lower()
+        if batch_mode in {"neighbor_sampling", "neighbor", "mini_batch", "minibatch"}:
+            train_neighbor_sampling(
+                config, seed, device,
+                rank=rank, local_rank=local_rank, world_size=world_size,
+            )
+            return
+        if batch_mode != "full":
+            raise ValueError("train.batch_mode must be 'full' or 'neighbor_sampling'.")
+        if world_size > 1:
+            # Full-batch path doesn't (yet) support DDP — keep one rank doing
+            # the work and exit the others cleanly.
+            if rank != 0:
+                return
+    finally:
+        teardown_distributed()
 
     if str(config["data"].get("source", "npz")).lower() == "graph_store":
         artifact = load_graph_store_artifact(

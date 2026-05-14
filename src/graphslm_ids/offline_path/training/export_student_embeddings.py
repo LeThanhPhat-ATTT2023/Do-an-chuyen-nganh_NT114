@@ -65,8 +65,8 @@ def parse_args() -> argparse.Namespace:
         help="Device to use: auto, cpu, cuda, or cuda:0 style values.",
     )
     parser.add_argument(
-        "--num-workers", type=int, default=0,
-        help="DataLoader workers for CPU prefetch. 0 = single-process (safe with mmap input). -1 = auto (cpu_count // 2, max 4).",
+        "--num-workers", type=int, default=-1,
+        help="DataLoader workers for CPU prefetch. -1 = auto-detect (default); 0 = single-process.",
     )
     parser.add_argument(
         "--fp16-output",
@@ -107,6 +107,13 @@ def main() -> None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
         device = torch.device(args.device)
+
+    # TF32 + cuDNN benchmark: the student 1D-CNN is fully convolutional, so
+    # cuDNN autotune is a clear win once batch shape stabilises (after batch 1).
+    if device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
 
     num_workers, infer_threads = _auto_scale(device, args.num_workers)
 
@@ -183,7 +190,10 @@ def main() -> None:
         num_workers=num_workers,
         pin_memory=(device.type == "cuda"),
         persistent_workers=(num_workers > 0),
-        prefetch_factor=(2 if num_workers > 0 else None),
+        # Deeper prefetch when running on GPU — single-pass inference is
+        # disk-bound on 1TB datasets so over-provisioning prefetch buffers
+        # is the cheapest way to keep the device busy.
+        prefetch_factor=(4 if num_workers > 0 else None),
     )
 
     embeddings = np.lib.format.open_memmap(

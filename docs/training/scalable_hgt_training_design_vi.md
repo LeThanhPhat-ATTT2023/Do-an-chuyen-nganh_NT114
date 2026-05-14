@@ -41,6 +41,13 @@ if str(config["train"]["batch_mode"]).lower() != "full":
 `train.batch_mode: full` cho baseline nhỏ và `train.batch_mode: neighbor_sampling`
 cho graph lớn qua `OnDiskHeteroGraphStore`/`HeteroNeighborSampler`.
 
+Sampler đã được vector hoá: cấu trúc "global-id → local-id" trong mỗi mini-batch
+hiện dùng class `_LocalMap` (sorted-array + `np.searchsorted`) thay cho cặp
+`dict[int, int] + list[int]` cũ. Hệ quả là vòng K-hop không còn Python-level int
+iteration cho mỗi neighbour, sampling chạy gần như O(N) thuần numpy và giữ
+nguyên tính xác định (first-occurrence ordering) — quan trọng khi fanout × hop
+sinh ra hàng trăm nghìn neighbour mỗi batch trên graph lớn.
+
 ### 1.2 Quy mô hiện tại và tương lai
 
 ```text
@@ -453,16 +460,22 @@ for batch in train_loader:
 ### 6.2 DataLoader
 
 ```text
-PyTorch DataLoader:
+PyTorch DataLoader (default trong trainer):
   Dataset: list of seed_flow_id (chỉ index, không load feature ở đây)
   collate_fn: gọi sampler + load features từ GraphStore
-  num_workers: 4-8 (mỗi worker open memmap riêng, OS chia page cache)
-  pin_memory: True nếu dùng CUDA
-  prefetch_factor: 2-4
+  num_workers: -1 (auto-detect: cpu_count // max(world_size, 1) - 1, cap 8/GPU)
+  pin_memory: True khi device là CUDA
+  persistent_workers: True (giữ worker sống xuyên epoch, tránh re-import)
+  prefetch_factor: 4 (default đã tăng từ 2 để bù latency disk-bound sampler)
 ```
 
 `num_workers > 0` rất quan trọng: sampling là CPU-bound còn forward là
 GPU-bound. Pipeline song song để GPU không idle chờ sampler.
+
+Pin-memory hoạt động đầy đủ vì `MiniBatchSubgraph.pin_memory()` được wire vào
+DataLoader: worker thread tự pin tensor trong process worker, main thread chỉ
+việc gọi `.to(device, non_blocking=True)` → H2D copy overlap với compute của
+batch trước. Không còn round-trip numpy → torch → pin trên main thread.
 
 ### 6.3 Gradient accumulation
 
@@ -482,19 +495,48 @@ Validation cũng phải mini-batch (val set có thể vẫn lớn):
 val_loader = DataLoader(seed = val_flow_ids, sampler same as train, shuffle=False)
 
 for batch in val_loader:
-  with no_grad, autocast:
+  with inference_mode, autocast:
     logits = model(...)
-    accumulate per-class TP/FP/FN
-compute macro-F1 ở cuối epoch.
+    accumulate per-class TP/FP/FN  (helper _per_class_counts_tensor)
+compute macro-F1 ở cuối epoch (helper _metrics_from_counts).
 ```
 
-Không recompute logits cho train set ở mỗi epoch như code hiện tại — đó là
-luxury của full-batch.
+`torch.inference_mode()` được dùng thay cho `torch.no_grad()` vì PyTorch bỏ qua
+luôn bookkeeping version-counter trên mọi tensor trung gian — eval throughput
+tăng ~5-10% trên workload graph-transformer (nhiều tensor trung gian).
 
-### 6.5 AMP + activation checkpointing
+Per-class counts được accumulate trực tiếp trên device (`_per_class_counts_tensor`)
+thay vì gom prediction/label numpy concat ở cuối. Khi DDP active, các counts
+được `all_reduce(SUM)` giữa các rank để metric global đồng nhất trên mọi rank.
 
-Đã có sẵn trong `train_hgt_flow_classifier.py` và `models/hgt.py`. Giữ nguyên.
-Mini-batch + AMP + checkpointing là combo chuẩn để fit graph lớn vào GPU.
+Không recompute logits cho train set ở mỗi epoch như code full-batch cũ — đó là
+luxury của full-batch. Train metric cũng dùng cùng pattern per-class counts
+tích luỹ trong train loop.
+
+### 6.5 AMP + activation checkpointing + CUDA backend tuning
+
+Đã có sẵn trong `train_hgt_flow_classifier.py` và `models/hgt.py`. Mini-batch +
+AMP + checkpointing là combo chuẩn để fit graph lớn vào GPU.
+
+Activation checkpointing dùng `use_reentrant=False` (non-reentrant mode), nên
+tương thích với DDP `find_unused_parameters=True` mà không cần thêm cờ.
+
+Trainer tự động bật một số CUDA backend tuning khi device là CUDA:
+
+```text
+torch.backends.cuda.matmul.allow_tf32 = True   # tắt bằng --no-tf32
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True          # autotune conv algorithm
+```
+
+TF32 đổi ~3 bit mantissa lấy ~2× tốc độ matmul trên Ampere+ (A100/H100); HGT
+loss landscape không nhạy với precision drop này nên TF32 là default an toàn.
+
+Trainer cũng có cờ `train.compile` (CLI `--compile`) để bọc model qua
+`torch.compile(mode="reduce-overhead", dynamic=True)`. `dynamic=True` cần thiết
+vì neighbor sampling sinh batch có shape thay đổi mỗi step; `reduce-overhead`
+là mode dùng CUDA Graphs an toàn cho shape động hơn `max-autotune`. Nếu compile
+fail (bản torch cũ), trainer fallback eager mà không kill training.
 
 ### 6.6 Class weight với dataset lớn
 
@@ -588,13 +630,36 @@ Hành động: KHÔNG xóa baseline full-batch `configs/hgt_t082_k5_l3_d01.yaml`
 - Scale dần lên dataset lớn hơn.
 ```
 
-### Phase 4: tối ưu nâng cao (tùy chọn)
+### Phase 4: tối ưu nâng cao
 
 ```text
-- Distributed training (DDP, mỗi rank 1 GPU + memmap riêng).
+[ĐÃ HOÀN THÀNH]
+- Distributed training (DDP, mỗi rank 1 GPU + memmap riêng):
+    * setup_distributed()/teardown_distributed() trong train_hgt_flow_classifier.py.
+    * Tự detect torchrun qua biến môi trường LOCAL_RANK; fallback single-process
+      trên Kaggle/local CPU khi không có LOCAL_RANK.
+    * Backend: NCCL khi có CUDA, Gloo khi chỉ CPU (smoke-test, local laptop).
+    * DistributedSampler shard seed flows theo rank; mỗi rank mở
+      OnDiskHeteroGraphStore read-only độc lập (OS page cache chia chung).
+    * DDP(model, find_unused_parameters=True, gradient_as_bucket_view=True,
+      bucket_cap_mb=25): find_unused cần thiết vì HGT có per-relation weights
+      chỉ nhận grad khi edge của relation đó có trong batch.
+    * eval all_reduce per-class counts để mọi rank thấy metric global.
+    * Async checkpoint save (background thread) chỉ rank 0; broadcast early-stop.
+    * Legacy single-process multi-GPU (replicate + parallel_apply + foreach_add_)
+      vẫn được giữ làm fallback cho Kaggle notebook không dùng torchrun.
+
+- CUDA backend tuning (TF32 + cuDNN benchmark) + torch.compile opt-in.
+
+- pin_memory hook trong DataLoader worker (MiniBatchSubgraph.pin_memory)
+  để H2D copy overlap với compute.
+
+[CÒN LẠI]
 - LMDB hoặc HDF5 thay numpy memmap nếu cần random access nhanh hơn.
 - Caching tactic/technique features trên GPU permanent (không đi qua memmap mỗi batch).
 - Warm sampler: pre-sample subgraph cho 1-2 epoch tới và đẩy vào queue.
+- Sharded graph store theo flow-range / time-range để multi-rank giảm I/O contention.
+- GPU-resident sampler (PyG NeighborLoader GPU hoặc cuGraph) để loại bottleneck CPU sampling.
 ```
 
 ## 9. Cấu hình mẫu
@@ -626,6 +691,13 @@ train:
   activation_checkpointing: true
   device: cuda
   monitor: val_macro_f1
+  # Backend tuning (CUDA only):
+  tf32: true                # TF32 matmul + cuDNN allow_tf32 + benchmark
+  compile: false            # bật khi PyTorch >= 2.4 & batch shape ổn định
+  # DDP (chỉ tác dụng khi chạy qua torchrun):
+  ddp_bucket_cap_mb: 25     # gom grad thành ít bucket lớn cho NCCL
+  # Legacy single-process multi-GPU (replicate+parallel_apply):
+  multi_gpu: true           # ignored khi torchrun launch DDP
 
 sampler:
   hops: 3
@@ -643,9 +715,10 @@ sampler:
     rev_technique__belongs_to_tactic__tactic: 0
 
 dataloader:
-  num_workers: 6
+  num_workers: -1            # -1 = auto (cpu_count // world_size - 1, cap 8/GPU)
   prefetch_factor: 4
   pin_memory: true
+  persistent_workers: true   # giữ worker xuyên epoch để tránh re-fork
 ```
 
 Lưu ý:
