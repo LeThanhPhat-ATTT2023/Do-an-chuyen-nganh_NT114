@@ -531,6 +531,19 @@ class HeteroNeighborSampler:
         edge_chunks.setdefault(edge_type, []).append((src_repeated, dst_arr, w_arr))
 
 
+def _make_worker_init_fn(sampler: HeteroNeighborSampler, base_seed: int):
+    """Return a worker_init_fn that re-seeds sampler.rng uniquely per DataLoader worker.
+
+    Without this, every worker fork inherits the same RNG state and produces
+    correlated neighbour samples, reducing gradient diversity.
+    """
+    def worker_init_fn(worker_id: int) -> None:
+        info = torch.utils.data.get_worker_info()
+        if info is not None:
+            sampler.rng = np.random.default_rng(base_seed + info.id)
+    return worker_init_fn
+
+
 class NeighborSamplingCollator:
     def __init__(self, sampler: HeteroNeighborSampler) -> None:
         self.sampler = sampler

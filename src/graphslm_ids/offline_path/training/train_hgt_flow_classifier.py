@@ -31,6 +31,7 @@ from graphslm_ids.offline_path.training.neighbor_sampling import (
     MiniBatchSubgraph,
     NeighborBackend,
     NeighborSamplingCollator,
+    _make_worker_init_fn,
 )
 from graphslm_ids.offline_path.training.on_disk_graph_store import OnDiskHeteroGraphStore
 from graphslm_ids.models.hgt import HeteroGraphTransformer
@@ -71,12 +72,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "multi_gpu": True,
         "monitor": "val_macro_f1",
         "log_every": 1,
-        "amp": False,
+        "amp": True,
         "activation_checkpointing": False,
         "batch_seed_flows": 256,
         "grad_accum_steps": 1,
-        "compile": False,
+        "compile": True,
         "tf32": True,
+        "scheduler": "onecycle",
+        "scheduler_pct_start": 0.05,
     },
     "sampler": {
         "hops": None,
@@ -155,6 +158,10 @@ def parse_args() -> argparse.Namespace:
         "--no-tf32", action="store_true",
         help="Disable TF32 matmul (default: on, ~2x speedup on Ampere+).",
     )
+    parser.add_argument(
+        "--no-scheduler", dest="no_scheduler", action="store_true",
+        help="Disable OneCycleLR scheduler (use constant LR).",
+    )
     return parser.parse_args()
 
 
@@ -217,6 +224,8 @@ def apply_cli_overrides(config: dict[str, Any], args: argparse.Namespace) -> dic
         config["train"]["compile"] = True
     if args.no_tf32:
         config["train"]["tf32"] = False
+    if getattr(args, "no_scheduler", False):
+        config["train"]["scheduler"] = "none"
     return config
 
 
@@ -906,6 +915,7 @@ def make_neighbor_loader(
     if num_workers > 0:
         loader_kwargs["prefetch_factor"] = int(dl_cfg.get("prefetch_factor", 4))
         loader_kwargs["persistent_workers"] = bool(dl_cfg.get("persistent_workers", True))
+        loader_kwargs["worker_init_fn"] = _make_worker_init_fn(sampler, seed)
     return DataLoader(dataset, **loader_kwargs), dist_sampler
 
 
@@ -1246,6 +1256,16 @@ def train_neighbor_sampling(
         lr=float(config["train"]["lr"]),
         weight_decay=float(config["train"]["weight_decay"]),
     )
+    _scheduler_type = str(config["train"].get("scheduler", "onecycle")).lower()
+    scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
+    if _scheduler_type == "onecycle":
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=float(config["train"]["lr"]),
+            steps_per_epoch=len(train_loader),
+            epochs=int(config["train"]["epochs"]),
+            pct_start=float(config["train"].get("scheduler_pct_start", 0.05)),
+        )
     weight = None
     if str(config["train"]["class_weight"]).lower() == "balanced":
         weight = class_weights_from_backend(backend, train_idx_np, num_classes).to(device)
@@ -1371,6 +1391,8 @@ def train_neighbor_sampling(
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
+                if scheduler is not None:
+                    scheduler.step()
                 pending_step = False
             step += 1
             batches_seen += len(batch_group)
@@ -1398,6 +1420,8 @@ def train_neighbor_sampling(
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
+            if scheduler is not None:
+                scheduler.step()
 
         # All-reduce train metrics so every rank reports the global epoch view.
         if is_ddp:
@@ -1426,21 +1450,6 @@ def train_neighbor_sampling(
             devices=devices if (n_gpus > 1 and not is_ddp) else None,
             is_ddp=is_ddp,
         )
-        test_metrics = evaluate_neighbor_sampling(
-            model=model,
-            loader=test_loader,
-            edge_types=edge_types,
-            device=device,
-            use_amp=use_amp,
-            use_semantic_edge_weights=use_semantic_edge_weights,
-            num_classes=num_classes,
-            label_names=label_names,
-            epoch=epoch,
-            split_name="test",
-            devices=devices if (n_gpus > 1 and not is_ddp) else None,
-            is_ddp=is_ddp,
-        )
-
         avg_nodes = {
             node_type: float(np.mean(values)) if values else 0.0
             for node_type, values in sampled_nodes.items()
@@ -1453,7 +1462,6 @@ def train_neighbor_sampling(
             "epoch": epoch,
             "train": {key: value for key, value in train_metrics.items() if key != "per_class"},
             "val": {key: value for key, value in val_metrics.items() if key != "per_class"},
-            "test": {key: value for key, value in test_metrics.items() if key != "per_class"},
             "sampler": {
                 "avg_subgraph_nodes": avg_nodes,
                 "avg_subgraph_edges": avg_edges,
@@ -1490,7 +1498,7 @@ def train_neighbor_sampling(
                         "flow_feature_stats": flow_feature_stats,
                         "epoch": epoch,
                         "val_metrics": val_metrics,
-                        "test_metrics": test_metrics,
+                        "test_metrics": None,
                     },
                     best_checkpoint,
                 )
@@ -1503,7 +1511,6 @@ def train_neighbor_sampling(
                 f"loss={float(train_metrics['loss'] or 0.0):.4f} "
                 f"val_acc={val_metrics['accuracy']:.4f} "
                 f"val_macro_f1={val_metrics['macro_f1']:.4f} "
-                f"test_macro_f1={test_metrics['macro_f1']:.4f} "
                 f"avg_flow_nodes={avg_nodes.get('flow', 0.0):.1f} "
                 f"avg_packet_nodes={avg_nodes.get('packet', 0.0):.1f}"
             )
@@ -1527,6 +1534,22 @@ def train_neighbor_sampling(
         dist.barrier()
     if rank == 0:
         best_payload = load_checkpoint(best_checkpoint, device)
+        # Load best weights and eval test set once — avoids per-epoch test leakage.
+        state_holder = raw_model.module if isinstance(raw_model, DDP) else raw_model
+        state_holder = getattr(state_holder, "_orig_mod", state_holder)
+        state_holder.load_state_dict(best_payload["model_state_dict"])
+        test_metrics = evaluate_neighbor_sampling(
+            model=state_holder,
+            loader=test_loader,
+            edge_types=edge_types,
+            device=device,
+            use_amp=use_amp,
+            use_semantic_edge_weights=use_semantic_edge_weights,
+            num_classes=num_classes,
+            label_names=label_names,
+            split_name="test",
+            is_ddp=False,
+        )
         device_str = (
             f"{device} x{world_size}" if is_ddp else
             str(device) + (f" x{n_gpus}" if n_gpus > 1 else "")
@@ -1550,7 +1573,7 @@ def train_neighbor_sampling(
             },
             "label_names": {str(key): value for key, value in label_names.items()},
             "best_val_metrics": best_payload["val_metrics"],
-            "best_test_metrics": best_payload["test_metrics"],
+            "best_test_metrics": test_metrics,
             "history": history,
         }
         write_json(output_dir / "training_summary.json", summary)
@@ -1665,6 +1688,16 @@ def main() -> None:
         lr=float(config["train"]["lr"]),
         weight_decay=float(config["train"]["weight_decay"]),
     )
+    _scheduler_type_fb = str(config["train"].get("scheduler", "onecycle")).lower()
+    scheduler_fb: torch.optim.lr_scheduler.LRScheduler | None = None
+    if _scheduler_type_fb == "onecycle":
+        scheduler_fb = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=float(config["train"]["lr"]),
+            steps_per_epoch=1,
+            epochs=int(config["train"]["epochs"]),
+            pct_start=float(config["train"].get("scheduler_pct_start", 0.05)),
+        )
 
     weight = None
     if str(config["train"]["class_weight"]).lower() == "balanced":
@@ -1692,6 +1725,8 @@ def main() -> None:
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
+        if scheduler_fb is not None:
+            scheduler_fb.step()
 
         model.eval()
         with torch.no_grad():
@@ -1700,13 +1735,11 @@ def main() -> None:
             logits_eval = logits_eval.float()
             train_metrics = compute_metrics(logits_eval, labels, train_idx, label_names)
             val_metrics = compute_metrics(logits_eval, labels, val_idx, label_names)
-            test_metrics = compute_metrics(logits_eval, labels, test_idx, label_names)
 
         entry = {
             "epoch": epoch,
             "train": {key: value for key, value in train_metrics.items() if key != "per_class"},
             "val": {key: value for key, value in val_metrics.items() if key != "per_class"},
-            "test": {key: value for key, value in test_metrics.items() if key != "per_class"},
         }
         history.append(entry)
 
@@ -1715,9 +1748,10 @@ def main() -> None:
             best_score = monitor_score
             best_epoch = epoch
             epochs_without_improvement = 0
-            torch.save(
+            cpu_state = {k: v.detach().clone().cpu() for k, v in model.state_dict().items()}
+            _save_checkpoint_bg(
                 {
-                    "model_state_dict": model.state_dict(),
+                    "model_state_dict": cpu_state,
                     "config": config,
                     "node_input_dims": node_input_dims,
                     "edge_types": [list(edge_key) for edge_key in edge_index.keys()],
@@ -1727,7 +1761,7 @@ def main() -> None:
                     "flow_feature_stats": flow_feature_stats,
                     "epoch": epoch,
                     "val_metrics": val_metrics,
-                    "test_metrics": test_metrics,
+                    "test_metrics": None,
                 },
                 best_checkpoint,
             )
@@ -1739,15 +1773,26 @@ def main() -> None:
                 f"Epoch {epoch:03d} | "
                 f"loss={float(loss.item()):.4f} "
                 f"val_acc={val_metrics['accuracy']:.4f} "
-                f"val_macro_f1={val_metrics['macro_f1']:.4f} "
-                f"test_macro_f1={test_metrics['macro_f1']:.4f}"
+                f"val_macro_f1={val_metrics['macro_f1']:.4f}"
             )
 
         if epochs_without_improvement >= int(config["train"]["patience"]):
             print(f"Early stopping at epoch {epoch}.")
             break
 
+    # Wait for background checkpoint write to finish before loading.
+    _join_checkpoint_bg()
     best_payload = load_checkpoint(best_checkpoint, device)
+
+    # Eval test set once with the best checkpoint (avoids per-epoch test leakage).
+    model.load_state_dict(best_payload["model_state_dict"])
+    model.eval()
+    with torch.no_grad():
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            logits_test = model(node_features, edge_index, edge_weight_dict=edge_weight)
+        logits_test = logits_test.float()
+    test_metrics = compute_metrics(logits_test, labels, test_idx, label_names)
+
     summary = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "config": config,
@@ -1767,7 +1812,7 @@ def main() -> None:
         },
         "label_names": {str(key): value for key, value in label_names.items()},
         "best_val_metrics": best_payload["val_metrics"],
-        "best_test_metrics": best_payload["test_metrics"],
+        "best_test_metrics": test_metrics,
         "history": history,
     }
     write_json(output_dir / "training_summary.json", summary)
