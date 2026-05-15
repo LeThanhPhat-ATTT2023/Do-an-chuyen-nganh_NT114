@@ -132,9 +132,9 @@ class HGTLayer(nn.Module):
 
             src_x = x_dict[src_type]
             dst_x = x_dict[dst_type]
-            q = self.query[dst_type](dst_x)[dst_index].view(-1, self.num_heads, self.head_dim)
-            k = self.key[src_type](src_x)[src_index]
-            v = self.value[src_type](src_x)[src_index]
+            q = self.query[dst_type](dst_x[dst_index]).view(-1, self.num_heads, self.head_dim)
+            k = self.key[src_type](src_x[src_index])
+            v = self.value[src_type](src_x[src_index])
 
             k = self.relation_key[relation_name](k).view(-1, self.num_heads, self.head_dim)
             v = self.relation_value[relation_name](v).view(-1, self.num_heads, self.head_dim)
