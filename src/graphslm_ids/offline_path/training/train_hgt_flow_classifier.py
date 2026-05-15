@@ -1137,6 +1137,19 @@ def train_neighbor_sampling(
     labels_np = backend.get_flow_labels(all_flow_ids)
     if labels_np.size == 0:
         raise ValueError("Cannot train HGT: graph has no flow labels.")
+    unique_labels, label_counts = np.unique(labels_np, return_counts=True)
+    print(
+        f"[diag] flow labels: unique={unique_labels.tolist()} "
+        f"counts={label_counts.tolist()} "
+        f"max={int(labels_np.max())} "
+        f"num_classes will be={int(labels_np.max()) + 1}",
+        flush=True,
+    )
+    if labels_np.max() == 0:
+        raise ValueError(
+            "Cannot train HGT: all flow labels are 0 (only 1 class detected). "
+            "Check that get_flow_labels() returns correct attack/benign labels."
+        )
     num_classes = int(labels_np.max()) + 1
     train_idx_np, val_idx_np, test_idx_np = backend_splits(backend, labels_np, config, seed)
 
