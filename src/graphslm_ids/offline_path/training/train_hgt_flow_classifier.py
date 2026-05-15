@@ -1335,7 +1335,16 @@ def train_neighbor_sampling(
                     scaled_loss = loss / grad_accum_steps
                 scaler.scale(scaled_loss).backward()
                 batch_count = int(sl.numel())
-                train_loss_sum_t += loss.detach().to(torch.float64) * batch_count
+                loss_val = float(loss.detach().item())
+                if step == 0 and epoch == 1 and rank == 0:
+                    n_seeds_in_mask = int(sm.sum().item())
+                    print(
+                        f"[diag] step=0 seeds_in_mask={n_seeds_in_mask} "
+                        f"seed_labels_n={batch_count} loss={loss_val:.6f} "
+                        f"logits_shape={tuple(seed_logits.shape)}",
+                        flush=True,
+                    )
+                train_loss_sum_t += loss_val * batch_count
                 train_examples_t += batch_count
                 pred = seed_logits.detach().float().argmax(dim=1)
                 train_counts.add_(_per_class_counts_tensor(pred, sl, num_classes))
