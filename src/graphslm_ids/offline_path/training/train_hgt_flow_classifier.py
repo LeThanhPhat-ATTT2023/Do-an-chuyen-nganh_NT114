@@ -10,6 +10,7 @@ import random
 import sys
 import threading
 import time
+import warnings
 from typing import Any
 
 import numpy as np
@@ -1267,20 +1268,22 @@ def train_neighbor_sampling(
     )
     _scheduler_type = str(config["train"].get("scheduler", "onecycle")).lower()
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
-    if _scheduler_type == "onecycle":
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            max_lr=float(config["train"]["lr"]),
-            steps_per_epoch=len(train_loader),
-            epochs=int(config["train"]["epochs"]),
-            pct_start=float(config["train"].get("scheduler_pct_start", 0.05)),
-        )
-    elif _scheduler_type in {"cosine_annealing", "cosine"}:
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=int(config["train"]["epochs"]),
-            eta_min=float(config["train"].get("scheduler_eta_min", 1e-5)),
-        )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        if _scheduler_type == "onecycle":
+            scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                optimizer,
+                max_lr=float(config["train"]["lr"]),
+                steps_per_epoch=len(train_loader),
+                epochs=int(config["train"]["epochs"]),
+                pct_start=float(config["train"].get("scheduler_pct_start", 0.05)),
+            )
+        elif _scheduler_type in {"cosine_annealing", "cosine"}:
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=int(config["train"]["epochs"]),
+                eta_min=float(config["train"].get("scheduler_eta_min", 1e-5)),
+            )
     weight = None
     if str(config["train"]["class_weight"]).lower() == "balanced":
         weight = class_weights_from_backend(backend, train_idx_np, num_classes).to(device)
@@ -1713,20 +1716,22 @@ def main() -> None:
     )
     _scheduler_type_fb = str(config["train"].get("scheduler", "onecycle")).lower()
     scheduler_fb: torch.optim.lr_scheduler.LRScheduler | None = None
-    if _scheduler_type_fb == "onecycle":
-        scheduler_fb = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            max_lr=float(config["train"]["lr"]),
-            steps_per_epoch=1,
-            epochs=int(config["train"]["epochs"]),
-            pct_start=float(config["train"].get("scheduler_pct_start", 0.05)),
-        )
-    elif _scheduler_type_fb in {"cosine_annealing", "cosine"}:
-        scheduler_fb = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=int(config["train"]["epochs"]),
-            eta_min=float(config["train"].get("scheduler_eta_min", 1e-5)),
-        )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        if _scheduler_type_fb == "onecycle":
+            scheduler_fb = torch.optim.lr_scheduler.OneCycleLR(
+                optimizer,
+                max_lr=float(config["train"]["lr"]),
+                steps_per_epoch=1,
+                epochs=int(config["train"]["epochs"]),
+                pct_start=float(config["train"].get("scheduler_pct_start", 0.05)),
+            )
+        elif _scheduler_type_fb in {"cosine_annealing", "cosine"}:
+            scheduler_fb = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=int(config["train"]["epochs"]),
+                eta_min=float(config["train"].get("scheduler_eta_min", 1e-5)),
+            )
 
     weight = None
     if str(config["train"]["class_weight"]).lower() == "balanced":
