@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -177,7 +177,7 @@ def load_graph_store_artifact(
         if manifest.get("layout") == "numpy_memmap_csr":
             return _load_on_disk_graph_store_artifact(Path(graph_store_root), add_reverse_edges)
 
-    from graphslm_ids.runtime.graph_store import PersistentGraphStore
+    from graphslm_ids.runtime.pipeline.graph_store import PersistentGraphStore
 
     store = PersistentGraphStore(graph_store_root)
     arrays, metadata = store.to_three_tier_arrays(sealed_only=sealed_only)
@@ -254,7 +254,7 @@ def _load_on_disk_graph_store_artifact(
     graph_store_root: Path,
     add_reverse_edges: bool,
 ) -> HeteroGraphArtifact:
-    from graphslm_ids.offline_path.training.on_disk_graph_store import OnDiskHeteroGraphStore
+    from graphslm_ids.offline.training.on_disk_graph_store import OnDiskHeteroGraphStore
 
     store = OnDiskHeteroGraphStore(graph_store_root)
     flow_ids = np.arange(store.num_flows, dtype=np.int64)

@@ -1,7 +1,7 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
-from graphslm_ids.slow_path.evidence_bundle import EvidenceBundle
-from graphslm_ids.slow_path.types import SlowPathJob
+from graphslm_ids.runtime.slow_path.evidence_bundle import EvidenceBundle
+from graphslm_ids.runtime.slow_path.types import SlowPathJob
 
 
 def render_template(bundle: EvidenceBundle, template_tag: str = "TEMPLATE FALLBACK") -> str:

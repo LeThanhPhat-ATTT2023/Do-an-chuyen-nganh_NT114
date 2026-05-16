@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
@@ -8,7 +8,7 @@ from typing import Any
 
 import numpy as np
 
-from graphslm_ids.offline_path.training.hetero_graph_artifact import (
+from graphslm_ids.offline.training.hetero_graph_artifact import (
     HeteroGraphArtifact,
     load_three_tier_graph_artifact,
 )

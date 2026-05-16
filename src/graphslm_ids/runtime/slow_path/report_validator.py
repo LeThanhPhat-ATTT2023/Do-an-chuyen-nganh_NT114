@@ -1,9 +1,9 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import dataclass
 import re
 
-from graphslm_ids.slow_path.evidence_bundle import EvidenceBundle
+from graphslm_ids.runtime.slow_path.evidence_bundle import EvidenceBundle
 
 
 @dataclass

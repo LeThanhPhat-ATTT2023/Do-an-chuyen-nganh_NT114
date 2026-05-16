@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 
@@ -7,12 +7,12 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from graphslm_ids.offline_path.training.hetero_graph_artifact import load_graph_store_artifact
-from graphslm_ids.offline_path.training.on_disk_graph_store import (
+from graphslm_ids.offline.training.hetero_graph_artifact import load_graph_store_artifact
+from graphslm_ids.offline.training.on_disk_graph_store import (
     OnDiskHeteroGraphStore,
     convert_npz_to_on_disk_graph_store,
 )
-from graphslm_ids.offline_path.training.train_hgt_flow_classifier import train_neighbor_sampling
+from graphslm_ids.offline.training.train_hgt_flow_classifier import train_neighbor_sampling
 
 
 def _write_tiny_npz(tmp_path):

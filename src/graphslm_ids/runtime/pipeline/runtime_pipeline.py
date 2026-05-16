@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -9,7 +9,7 @@ from typing import Any
 
 from graphslm_ids.utils.io import read_json
 
-from graphslm_ids.fast_path import (
+from graphslm_ids.runtime.fast_path import (
     AlertDispatcher,
     FlowTracker,
     HGTRuntime,
@@ -22,14 +22,14 @@ from graphslm_ids.fast_path import (
     StudentRuntime,
     SubgraphBuilder,
 )
-from graphslm_ids.runtime.cold_store import ColdStore
-from graphslm_ids.runtime.counterfactual import HGTCounterfactual
-from graphslm_ids.runtime.graph_store import PersistentGraphStore
-from graphslm_ids.runtime.pipeline_config import PipelineConfig
-from graphslm_ids.slow_path.hot_buffer_adapter import HotBufferAdapter
-from graphslm_ids.slow_path.report_generator import ReportGenerator
-from graphslm_ids.slow_path.report_validator import ReportValidator
-from graphslm_ids.slow_path.slow_path_worker import SlowPathWorker
+from graphslm_ids.runtime.pipeline.cold_store import ColdStore
+from graphslm_ids.runtime.pipeline.counterfactual import HGTCounterfactual
+from graphslm_ids.runtime.pipeline.graph_store import PersistentGraphStore
+from graphslm_ids.runtime.pipeline.pipeline_config import PipelineConfig
+from graphslm_ids.runtime.slow_path.hot_buffer_adapter import HotBufferAdapter
+from graphslm_ids.runtime.slow_path.report_generator import ReportGenerator
+from graphslm_ids.runtime.slow_path.report_validator import ReportValidator
+from graphslm_ids.runtime.slow_path.slow_path_worker import SlowPathWorker
 
 
 @dataclass

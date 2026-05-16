@@ -1,4 +1,4 @@
-"""End-to-end DDP smoke check for the HGT trainer.
+﻿"""End-to-end DDP smoke check for the HGT trainer.
 
 The test launches two CPU processes via ``torch.multiprocessing``, points them
 at a tiny on-the-fly graph artifact, and runs one epoch of neighbour-sampling
@@ -109,7 +109,7 @@ def _worker(rank: int, world_size: int, port: int, npz_path: str, meta_path: str
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
 
-    from graphslm_ids.offline_path.training.train_hgt_flow_classifier import (
+    from graphslm_ids.offline.training.train_hgt_flow_classifier import (
         setup_distributed,
         teardown_distributed,
         train_neighbor_sampling,

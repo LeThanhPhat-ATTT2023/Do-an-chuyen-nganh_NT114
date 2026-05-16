@@ -1,11 +1,11 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import queue
 import time
 import uuid
 from typing import Any
 
-from graphslm_ids.slow_path.types import SlowPathJob
+from graphslm_ids.runtime.slow_path.types import SlowPathJob
 
 
 class AlertDispatcher:

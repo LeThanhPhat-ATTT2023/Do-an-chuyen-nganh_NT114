@@ -1,4 +1,4 @@
-# Báo Cáo Cấu Hình Train HGT Khuyến Nghị
+﻿# Báo Cáo Cấu Hình Train HGT Khuyến Nghị
 
 Tài liệu này chỉ giữ hai nhóm cấu hình còn dùng:
 
@@ -107,7 +107,7 @@ graphslm-train-hgt --config "configs/hgt_paper_variants/hgt_t082_k5_dlg_ids_spar
 # 2) Kaggle 2x T4 hoặc server 1 node nhiều GPU — DDP (khuyến cáo)
 #    LOCAL_RANK do torchrun set; trainer tự bật NCCL/Gloo + DistributedSampler.
 torchrun --standalone --nproc_per_node=2 `
-  -m graphslm_ids.offline_path.training.train_hgt_flow_classifier `
+  -m graphslm_ids.offline.training.train_hgt_flow_classifier `
   --config "configs/hgt_paper_variants/hgt_t082_k5_dlg_ids_sparse_l2_h128_h4.yaml"
 
 # 2b) Kaggle 2 GPU nếu không thể dùng torchrun trong notebook — legacy multi-GPU
@@ -118,7 +118,7 @@ graphslm-train-hgt `
 # 3) Server multi-node — DDP cross-node
 torchrun --nnodes=$WORLD_NODES --nproc_per_node=8 `
   --rdzv_backend=c10d --rdzv_endpoint=$MASTER_ADDR:29500 `
-  -m graphslm_ids.offline_path.training.train_hgt_flow_classifier `
+  -m graphslm_ids.offline.training.train_hgt_flow_classifier `
   --config "configs/hgt_paper_variants/hgt_t082_k5_dlg_ids_sparse_l2_h128_h4.yaml"
 ```
 

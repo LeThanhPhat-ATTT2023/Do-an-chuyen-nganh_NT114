@@ -1,9 +1,9 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import dataclass
 import math
 from typing import Any, Mapping, Sequence
-from graphslm_ids.slow_path.evidence_bundle import (
+from graphslm_ids.runtime.slow_path.evidence_bundle import (
     AlertEvidence,
     BundleStats,
     CounterfactualEvidence,
@@ -13,7 +13,7 @@ from graphslm_ids.slow_path.evidence_bundle import (
     MitreEvidence,
     PacketEvidence,
 )
-from graphslm_ids.slow_path.types import GraphContext, SlowPathJob
+from graphslm_ids.runtime.slow_path.types import GraphContext, SlowPathJob
 
 
 DEFAULT_LIMITATIONS = [

@@ -1,4 +1,4 @@
-# Thiết Kế Scalable Training Cho HGT Trên Graph Lớn
+﻿# Thiết Kế Scalable Training Cho HGT Trên Graph Lớn
 
 Tài liệu này đề xuất kiến trúc training HGT khi dataset không còn vừa RAM. Áp
 dụng khi pipeline phát triển từ mức 27K flows hiện tại lên hàng chục triệu flow
@@ -15,8 +15,8 @@ load toàn bộ vào RAM.
 Tham chiếu code:
 
 ```text
-src/graphslm_ids/offline_path/training/train_hgt_flow_classifier.py
-src/graphslm_ids/offline_path/training/hetero_graph_artifact.py
+src/graphslm_ids/offline/training/train_hgt_flow_classifier.py
+src/graphslm_ids/offline/training/hetero_graph_artifact.py
 src/graphslm_ids/models/hgt.py
 ```
 

@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -7,8 +7,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from graphslm_ids.offline_path.training.hetero_graph_artifact import HeteroGraphArtifact
-from graphslm_ids.offline_path.training.on_disk_graph_store import (
+from graphslm_ids.offline.training.hetero_graph_artifact import HeteroGraphArtifact
+from graphslm_ids.offline.training.on_disk_graph_store import (
     EdgeKey,
     edge_index_to_csr,
     edge_key_to_name,

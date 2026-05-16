@@ -1,4 +1,4 @@
-import csv
+﻿import csv
 from pathlib import Path
 
 import numpy as np
@@ -6,7 +6,7 @@ from scapy.layers.inet import IP, TCP, UDP
 from scapy.packet import Raw
 from scapy.utils import PcapWriter
 
-from graphslm_ids.offline_path.preprocessing.pcap_payload_extractor import (
+from graphslm_ids.offline.preprocessing.pcap_payload_extractor import (
     infer_label_from_path,
     stream_payload_dataset_to_disk_parallel,
     truncate_and_pad_payload,

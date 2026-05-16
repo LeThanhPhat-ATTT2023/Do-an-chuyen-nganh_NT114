@@ -1,4 +1,4 @@
-# Kiến Trúc Streaming HGT Runtime v3 - Incremental RTEC + Tiered Storage
+﻿# Kiến Trúc Streaming HGT Runtime v3 - Incremental RTEC + Tiered Storage
 
 Tài liệu này tổng hợp các kỹ thuật state-of-the-art 2024-2026 từ tài liệu user
 cung cấp (NeutronRT, RelGT, StreamTGN, HetSGFormer+ILLE, APT-HERA, IDS-HGAT,
@@ -937,15 +937,15 @@ src/graphslm_ids/models/hgt.py
   → Implement msg_local, nbr_ctx, ms_cbn, ms_cbn^(-1), aggregate, update
     theo NeutronRT API.
 
-src/graphslm_ids/fast_path/hgt_runtime.py
+src/graphslm_ids/runtime/fast_path/hgt_runtime.py
   → Replace với incremental RTEC engine.
   → Build affected subgraph theo Algorithm 4.
 
-src/graphslm_ids/fast_path/hot_graph_buffer.py
+src/graphslm_ids/runtime/fast_path/hot_graph_buffer.py
   → Refactor: chỉ làm cache layer cho embedding intermediate.
   → Phối hợp với Persistent Store làm source of truth.
 
-src/graphslm_ids/fast_path/subgraph_builder.py
+src/graphslm_ids/runtime/fast_path/subgraph_builder.py
   → Replace K-hop expansion với affected-set propagation.
 
 src/graphslm_ids/runtime/graph_store.py
@@ -955,7 +955,7 @@ src/graphslm_ids/runtime/graph_store.py
 src/graphslm_ids/runtime/cold_store.py
   → Chỉ còn fallback JSONL khi tắt graph_store; không phải source of truth.
 
-src/graphslm_ids/slow_path/context_hydrator.py
+src/graphslm_ids/runtime/slow_path/context_hydrator.py
   → Load shard from store thay vì query Hot Buffer.
   → Build evidence bundle (không attention raw).
 ```

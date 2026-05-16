@@ -1,8 +1,8 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from typing import Protocol
 
-from graphslm_ids.slow_path.types import GraphContext
+from graphslm_ids.runtime.slow_path.types import GraphContext
 
 
 class ContextSource(Protocol):

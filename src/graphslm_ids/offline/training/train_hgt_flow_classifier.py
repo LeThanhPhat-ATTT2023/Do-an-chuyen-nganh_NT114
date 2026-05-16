@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 from contextlib import nullcontext as _nullcontext
@@ -7,7 +7,6 @@ from datetime import datetime, timezone
 import os
 from pathlib import Path
 import random
-import sys
 import threading
 import time
 import warnings
@@ -21,11 +20,11 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
-from graphslm_ids.offline_path.training.hetero_graph_artifact import (
+from graphslm_ids.offline.training.hetero_graph_artifact import (
     load_graph_store_artifact,
     load_three_tier_graph_artifact,
 )
-from graphslm_ids.offline_path.training.neighbor_sampling import (
+from graphslm_ids.offline.training.neighbor_sampling import (
     FlowSeedDataset,
     HeteroNeighborSampler,
     InMemoryNeighborBackend,
@@ -34,7 +33,7 @@ from graphslm_ids.offline_path.training.neighbor_sampling import (
     NeighborSamplingCollator,
     _make_worker_init_fn,
 )
-from graphslm_ids.offline_path.training.on_disk_graph_store import OnDiskHeteroGraphStore
+from graphslm_ids.offline.training.on_disk_graph_store import OnDiskHeteroGraphStore
 from graphslm_ids.models.hgt import HeteroGraphTransformer
 from graphslm_ids.utils.io import ensure_dir, read_yaml, write_json
 
@@ -61,7 +60,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "train": {
         "output_dir": "outputs/hgt_flow_classifier_t082_k5_l3_d01",
         "epochs": 150,
-        "batch_mode": "full",
         "lr": 1e-3,
         "weight_decay": 5e-5,
         "val_ratio": 0.1,
@@ -501,118 +499,6 @@ def stratified_split(
     rng.shuffle(test)
     return train, val, test
 
-
-def standardize_flow_features(
-    flow_x: np.ndarray,
-    train_idx: np.ndarray,
-) -> tuple[np.ndarray, dict[str, list[float]]]:
-    mean = flow_x[train_idx].mean(axis=0, keepdims=True)
-    std = flow_x[train_idx].std(axis=0, keepdims=True)
-    std = np.maximum(std, 1e-6)
-    normalized = (flow_x - mean) / std
-    stats = {
-        "mean": mean.reshape(-1).astype(float).tolist(),
-        "std": std.reshape(-1).astype(float).tolist(),
-    }
-    return normalized.astype(np.float32), stats
-
-
-def to_torch_dict(
-    node_features: dict[str, np.ndarray],
-    edge_index: dict[tuple[str, str, str], np.ndarray],
-    device: torch.device,
-) -> tuple[dict[str, torch.Tensor], dict[tuple[str, str, str], torch.Tensor]]:
-    node_tensors = {
-        key: torch.from_numpy(np.asarray(value)).to(device)
-        for key, value in node_features.items()
-    }
-    edge_tensors = {
-        key: torch.from_numpy(np.asarray(value, dtype=np.int64)).to(device)
-        for key, value in edge_index.items()
-    }
-    return node_tensors, edge_tensors
-
-
-def to_torch_edge_weights(
-    edge_attr: dict[tuple[str, str, str], np.ndarray],
-    device: torch.device,
-    use_semantic_edge_weights: bool,
-) -> dict[tuple[str, str, str], torch.Tensor] | None:
-    if not use_semantic_edge_weights:
-        return None
-
-    edge_weights: dict[tuple[str, str, str], torch.Tensor] = {}
-    for edge_key, attr in edge_attr.items():
-        relation = edge_key[1]
-        if "matches_technique" not in relation:
-            continue
-        values = np.asarray(attr, dtype=np.float32)
-        if values.ndim == 2:
-            values = values[:, 0]
-        edge_weights[edge_key] = torch.from_numpy(values).to(device)
-    return edge_weights
-
-
-def class_weights(labels: np.ndarray, train_idx: np.ndarray, num_classes: int) -> torch.Tensor:
-    counts = np.bincount(labels[train_idx], minlength=num_classes).astype(np.float32)
-    weights = np.zeros(num_classes, dtype=np.float32)
-    nonzero = counts > 0
-    weights[nonzero] = counts[nonzero].sum() / (float(num_classes) * counts[nonzero])
-    return torch.from_numpy(weights)
-
-
-def compute_metrics(
-    logits: torch.Tensor,
-    labels: torch.Tensor,
-    indices: torch.Tensor,
-    label_names: dict[int, str],
-) -> dict[str, Any]:
-    if indices.numel() == 0:
-        return {
-            "count": 0,
-            "loss": None,
-            "accuracy": None,
-            "macro_f1": None,
-            "per_class": {},
-        }
-
-    selected_logits = logits[indices]
-    selected_labels = labels[indices]
-    loss = F.cross_entropy(selected_logits, selected_labels).item()
-    pred = selected_logits.argmax(dim=1)
-    correct = (pred == selected_labels).sum().item()
-    count = int(selected_labels.numel())
-
-    pred_np = pred.detach().cpu().numpy()
-    label_np = selected_labels.detach().cpu().numpy()
-    num_classes = int(logits.shape[1])
-    per_class: dict[str, dict[str, float | int]] = {}
-    f1_values: list[float] = []
-
-    for class_id in range(num_classes):
-        tp = int(((pred_np == class_id) & (label_np == class_id)).sum())
-        fp = int(((pred_np == class_id) & (label_np != class_id)).sum())
-        fn = int(((pred_np != class_id) & (label_np == class_id)).sum())
-        support = int((label_np == class_id).sum())
-        precision = tp / max(tp + fp, 1)
-        recall = tp / max(tp + fn, 1)
-        f1 = 2.0 * precision * recall / max(precision + recall, 1e-12)
-        if support > 0:
-            f1_values.append(float(f1))
-        per_class[label_names.get(class_id, str(class_id))] = {
-            "support": support,
-            "precision": float(precision),
-            "recall": float(recall),
-            "f1": float(f1),
-        }
-
-    return {
-        "count": count,
-        "loss": float(loss),
-        "accuracy": float(correct / max(count, 1)),
-        "macro_f1": float(np.mean(f1_values)) if f1_values else 0.0,
-        "per_class": per_class,
-    }
 
 
 def label_name_mapping(metadata: dict[str, Any], labels: np.ndarray) -> dict[int, str]:
@@ -1613,8 +1499,6 @@ def main() -> None:
     seed = int(config["train"]["seed"])
     set_seed(seed)
 
-    # DDP-aware bootstrap: when launched via torchrun, LOCAL_RANK pins us to a
-    # specific device; otherwise we honour the config's "device" field.
     rank, local_rank, world_size = setup_distributed()
     if world_size > 1:
         device = _ddp_device(local_rank)
@@ -1622,237 +1506,12 @@ def main() -> None:
         device = resolve_device(str(config["train"]["device"]))
 
     try:
-        batch_mode = str(config["train"]["batch_mode"]).lower()
-        if batch_mode in {"neighbor_sampling", "neighbor", "mini_batch", "minibatch"}:
-            train_neighbor_sampling(
-                config, seed, device,
-                rank=rank, local_rank=local_rank, world_size=world_size,
-            )
-            return
-        if batch_mode != "full":
-            raise ValueError("train.batch_mode must be 'full' or 'neighbor_sampling'.")
-        if world_size > 1:
-            # Full-batch path doesn't (yet) support DDP — keep one rank doing
-            # the work and exit the others cleanly.
-            if rank != 0:
-                return
+        train_neighbor_sampling(
+            config, seed, device,
+            rank=rank, local_rank=local_rank, world_size=world_size,
+        )
     finally:
         teardown_distributed()
-
-    if str(config["data"].get("source", "npz")).lower() == "graph_store":
-        artifact = load_graph_store_artifact(
-            graph_store_root=Path(config["data"]["graph_store_root"]),
-            packet_feature=str(config["data"]["packet_feature"]),
-            add_reverse_edges=bool(config["data"]["add_reverse_edges"]),
-            sealed_only=bool(config["data"].get("read_sealed_only", True)),
-        )
-    else:
-        artifact = load_three_tier_graph_artifact(
-            graph_npz=Path(config["data"]["graph_npz"]),
-            graph_meta_json=Path(config["data"]["graph_meta_json"]),
-            packet_feature=str(config["data"]["packet_feature"]),
-            add_reverse_edges=bool(config["data"]["add_reverse_edges"]),
-        )
-
-    labels_np = artifact.flow_y.astype(np.int64)
-    num_classes = int(labels_np.max()) + 1
-    train_idx_np, val_idx_np, test_idx_np = stratified_split(
-        labels=labels_np,
-        val_ratio=float(config["train"]["val_ratio"]),
-        test_ratio=float(config["train"]["test_ratio"]),
-        seed=seed,
-    )
-
-    max_train_flows_fb = int(config["train"].get("max_train_flows", 0))
-    if max_train_flows_fb > 0 and int(train_idx_np.shape[0]) > max_train_flows_fb:
-        rng_sub_fb = np.random.default_rng(seed)
-        perm_fb = rng_sub_fb.permutation(train_idx_np.shape[0])
-        full_n_fb = int(train_idx_np.shape[0])
-        train_idx_np = train_idx_np[perm_fb[:max_train_flows_fb]]
-        print(f"[subsample] Train: {max_train_flows_fb:,} / {full_n_fb:,} flows.", flush=True)
-
-    flow_feature_stats: dict[str, list[float]] | None = None
-    if bool(config["data"]["standardize_flow_features"]):
-        artifact.node_features["flow"], flow_feature_stats = standardize_flow_features(
-            artifact.node_features["flow"],
-            train_idx_np,
-        )
-
-    node_features, edge_index = to_torch_dict(artifact.node_features, artifact.edge_index, device)
-    edge_weight = to_torch_edge_weights(
-        artifact.edge_attr,
-        device=device,
-        use_semantic_edge_weights=bool(config["data"]["use_semantic_edge_weights"]),
-    )
-    labels = torch.from_numpy(labels_np).long().to(device)
-    train_idx = torch.from_numpy(train_idx_np).long().to(device)
-    val_idx = torch.from_numpy(val_idx_np).long().to(device)
-    test_idx = torch.from_numpy(test_idx_np).long().to(device)
-
-    node_input_dims = {
-        "flow": int(node_features["flow"].shape[1]),
-        "packet": int(node_features["packet"].shape[1]),
-        "technique": int(node_features["technique"].shape[1]),
-    }
-    num_tactics = int(node_features["tactic"].shape[0])
-
-    model = HeteroGraphTransformer(
-        node_input_dims=node_input_dims,
-        edge_types=list(edge_index.keys()),
-        num_classes=num_classes,
-        num_tactics=num_tactics,
-        hidden_dim=int(config["model"]["hidden_dim"]),
-        num_layers=int(config["model"]["num_layers"]),
-        num_heads=int(config["model"]["num_heads"]),
-        dropout=float(config["model"]["dropout"]),
-        ffn_multiplier=int(config["model"]["ffn_multiplier"]),
-        activation_checkpointing=bool(config["train"].get("activation_checkpointing", False)),
-    ).to(device)
-
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=float(config["train"]["lr"]),
-        weight_decay=float(config["train"]["weight_decay"]),
-    )
-    _scheduler_type_fb = str(config["train"].get("scheduler", "onecycle")).lower()
-    scheduler_fb: torch.optim.lr_scheduler.LRScheduler | None = None
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", UserWarning)
-        if _scheduler_type_fb == "onecycle":
-            scheduler_fb = torch.optim.lr_scheduler.OneCycleLR(
-                optimizer,
-                max_lr=float(config["train"]["lr"]),
-                steps_per_epoch=1,
-                epochs=int(config["train"]["epochs"]),
-                pct_start=float(config["train"].get("scheduler_pct_start", 0.05)),
-            )
-        elif _scheduler_type_fb in {"cosine_annealing", "cosine"}:
-            scheduler_fb = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer,
-                T_max=int(config["train"]["epochs"]),
-                eta_min=float(config["train"].get("scheduler_eta_min", 1e-5)),
-            )
-
-    weight = None
-    if str(config["train"]["class_weight"]).lower() == "balanced":
-        weight = class_weights(labels_np, train_idx_np, num_classes).to(device)
-
-    output_dir = ensure_dir(Path(config["train"]["output_dir"]))
-    best_checkpoint = output_dir / "hgt_flow_best.pt"
-    label_names = label_name_mapping(artifact.metadata, labels_np)
-
-    best_score = -float("inf")
-    best_epoch = 0
-    epochs_without_improvement = 0
-    history: list[dict[str, Any]] = []
-    monitor = str(config["train"]["monitor"])
-    log_every = max(1, int(config["train"]["log_every"]))
-    use_amp = bool(config["train"].get("amp", False)) and device.type == "cuda"
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-
-    for epoch in range(1, int(config["train"]["epochs"]) + 1):
-        model.train()
-        optimizer.zero_grad(set_to_none=True)
-        with torch.amp.autocast("cuda", enabled=use_amp):
-            logits = model(node_features, edge_index, edge_weight_dict=edge_weight)
-            loss = F.cross_entropy(logits[train_idx], labels[train_idx], weight=weight)
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-        if scheduler_fb is not None:
-            scheduler_fb.step()
-
-        model.eval()
-        with torch.no_grad():
-            with torch.amp.autocast("cuda", enabled=use_amp):
-                logits_eval = model(node_features, edge_index, edge_weight_dict=edge_weight)
-            logits_eval = logits_eval.float()
-            train_metrics = compute_metrics(logits_eval, labels, train_idx, label_names)
-            val_metrics = compute_metrics(logits_eval, labels, val_idx, label_names)
-
-        entry = {
-            "epoch": epoch,
-            "train": {key: value for key, value in train_metrics.items() if key != "per_class"},
-            "val": {key: value for key, value in val_metrics.items() if key != "per_class"},
-        }
-        history.append(entry)
-
-        monitor_score = float(val_metrics["macro_f1"] if monitor == "val_macro_f1" else -val_metrics["loss"])
-        if monitor_score > best_score:
-            best_score = monitor_score
-            best_epoch = epoch
-            epochs_without_improvement = 0
-            cpu_state = {k: v.detach().clone().cpu() for k, v in model.state_dict().items()}
-            _save_checkpoint_bg(
-                {
-                    "model_state_dict": cpu_state,
-                    "config": config,
-                    "node_input_dims": node_input_dims,
-                    "edge_types": [list(edge_key) for edge_key in edge_index.keys()],
-                    "num_classes": num_classes,
-                    "num_tactics": num_tactics,
-                    "label_names": label_names,
-                    "flow_feature_stats": flow_feature_stats,
-                    "epoch": epoch,
-                    "val_metrics": val_metrics,
-                    "test_metrics": None,
-                },
-                best_checkpoint,
-            )
-        else:
-            epochs_without_improvement += 1
-
-        if epoch == 1 or epoch % log_every == 0:
-            print(
-                f"Epoch {epoch:03d} | "
-                f"loss={float(loss.item()):.4f} "
-                f"val_acc={val_metrics['accuracy']:.4f} "
-                f"val_macro_f1={val_metrics['macro_f1']:.4f}"
-            )
-
-        if epochs_without_improvement >= int(config["train"]["patience"]):
-            print(f"Early stopping at epoch {epoch}.")
-            break
-
-    # Wait for background checkpoint write to finish before loading.
-    _join_checkpoint_bg()
-    best_payload = load_checkpoint(best_checkpoint, device)
-
-    # Eval test set once with the best checkpoint (avoids per-epoch test leakage).
-    model.load_state_dict(best_payload["model_state_dict"])
-    model.eval()
-    with torch.no_grad():
-        with torch.amp.autocast("cuda", enabled=use_amp):
-            logits_test = model(node_features, edge_index, edge_weight_dict=edge_weight)
-        logits_test = logits_test.float()
-    test_metrics = compute_metrics(logits_test, labels, test_idx, label_names)
-
-    summary = {
-        "created_at_utc": datetime.now(timezone.utc).isoformat(),
-        "config": config,
-        "device": str(device),
-        "best_checkpoint": str(best_checkpoint),
-        "best_epoch": int(best_epoch),
-        "best_score": float(best_score),
-        "num_flows": int(labels_np.shape[0]),
-        "num_packets": int(artifact.node_features["packet"].shape[0]),
-        "num_techniques": int(artifact.node_features["technique"].shape[0]),
-        "num_tactics": int(num_tactics),
-        "num_edge_types": int(len(edge_index)),
-        "splits": {
-            "train": int(train_idx_np.shape[0]),
-            "val": int(val_idx_np.shape[0]),
-            "test": int(test_idx_np.shape[0]),
-        },
-        "label_names": {str(key): value for key, value in label_names.items()},
-        "best_val_metrics": best_payload["val_metrics"],
-        "best_test_metrics": test_metrics,
-        "history": history,
-    }
-    write_json(output_dir / "training_summary.json", summary)
-
-    print(f"[OK] Best checkpoint: {best_checkpoint}")
-    print(f"[OK] Training summary: {output_dir / 'training_summary.json'}")
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
-import numpy as np
+﻿import numpy as np
 import pandas as pd
 
-from graphslm_ids.offline_path.preprocessing import build_three_tier_graph_artifact as module
+from graphslm_ids.offline.preprocessing import build_three_tier_graph_artifact as module
 
 
 def test_select_top_k_above_threshold() -> None:

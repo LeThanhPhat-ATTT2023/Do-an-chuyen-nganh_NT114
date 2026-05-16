@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
@@ -10,7 +10,7 @@ import pandas as pd
 import torch
 from tqdm import tqdm
 
-from graphslm_ids.offline_path.preprocessing.graph_artifact_builder import build_graph_artifact
+from graphslm_ids.offline.preprocessing.graph_artifact_builder import build_graph_artifact
 from graphslm_ids.utils.io import write_json
 
 
