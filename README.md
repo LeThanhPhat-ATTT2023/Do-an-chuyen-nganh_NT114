@@ -1,24 +1,25 @@
-# Context-Rich Explainable IDS - NT114
+# Context-Rich Explainable IDS — NT114
 
-Dự án xây dựng hệ thống phát hiện xâm nhập mạng có ngữ cảnh, kết hợp payload embedding, đồ thị dị thể, MITRE ATT&CK và lớp giải thích bằng SLM. Repo được tổ chức theo hai luồng chính:
+Hệ thống phát hiện xâm nhập mạng có ngữ cảnh, kết hợp payload embedding, đồ thị dị thể, MITRE ATT&CK và lớp giải thích bằng SLM. Repo được tổ chức theo hai luồng:
 
-- **Offline path**: xử lý dữ liệu PCAP, sinh embedding bằng teacher transformer, distill sang student 1D-CNN, xây graph dị thể và huấn luyện HGT flow classifier.
-- **Runtime path**: replay/nhận packet, trích payload online, chạy student ONNX, gắn ngữ cảnh MITRE, dựng hot graph, suy luận HGT, áp policy và đẩy alert sang slow path để sinh báo cáo XAI.
+- **Offline**: xử lý dữ liệu PCAP, sinh embedding qua teacher transformer, distill sang student 1D-CNN, xây graph dị thể 3-tier và huấn luyện HGT flow classifier.
+- **Runtime**: nhận packet, trích payload online, chạy student ONNX, gắn ngữ cảnh MITRE, dựng hot graph, suy luận HGT, áp policy và đẩy alert sang slow path để sinh báo cáo XAI.
 
-Ý tưởng cốt lõi là **không đưa raw payload trực tiếp vào GNN**. Payload được chuẩn hóa thành vector ngữ nghĩa trước, sau đó mới dùng làm đặc trưng packet trong graph. MITRE technique/tactic được đưa vào graph như tầng tri thức bổ sung để mô hình không chỉ dự đoán nhãn tấn công mà còn có đường dẫn ngữ cảnh phục vụ giải thích.
+Ý tưởng cốt lõi: **không đưa raw payload trực tiếp vào GNN**. Payload được chuẩn hóa thành vector ngữ nghĩa trước, sau đó mới dùng làm đặc trưng packet trong graph. MITRE technique/tactic được đưa vào graph như tầng tri thức bổ sung để mô hình không chỉ dự đoán nhãn tấn công mà còn có đường dẫn ngữ cảnh phục vụ giải thích.
 
 ## Mục Lục
 
 - [Trạng thái hiện tại](#trạng-thái-hiện-tại)
+- [Dataset CIC IoT 2023](#dataset-cic-iot-2023)
 - [Kiến trúc tổng quan](#kiến-trúc-tổng-quan)
 - [Cấu trúc thư mục](#cấu-trúc-thư-mục)
 - [Yêu cầu môi trường](#yêu-cầu-môi-trường)
 - [Cài đặt](#cài-đặt)
-- [Quick start](#quick-start)
 - [Pipeline offline từ đầu](#pipeline-offline-từ-đầu)
 - [Chạy runtime fast path và slow path](#chạy-runtime-fast-path-và-slow-path)
 - [Cấu hình quan trọng](#cấu-hình-quan-trọng)
 - [Console scripts](#console-scripts)
+- [Notebooks](#notebooks)
 - [Kiểm thử](#kiểm-thử)
 - [Artifact và dữ liệu](#artifact-và-dữ-liệu)
 - [Tài liệu liên quan](#tài-liệu-liên-quan)
@@ -28,34 +29,55 @@ Dự án xây dựng hệ thống phát hiện xâm nhập mạng có ngữ cả
 
 ## Trạng Thái Hiện Tại
 
-Repo hiện có đầy đủ mã nguồn cho:
+### Offline pipeline
 
-- Trích xuất payload 256 byte từ PCAP/PCAPNG.
-- Sinh teacher targets bằng transformer, mặc định dùng `ehsanaghaei/SecureBERT`.
-- Huấn luyện student 1D-CNN để xấp xỉ embedding teacher.
-- Export student sang ONNX cho online inference.
-- Sinh embedding MITRE technique và cạnh technique-tactic.
-- Xây graph dị thể gồm `flow`, `packet`, `technique`, `tactic`.
-- Huấn luyện HGT flow classifier với hai chế độ: `full` (full-graph, nhỏ) và `neighbor_sampling` (mini-batch BFS, scale với graph lớn).
-- On-disk CSR graph store (`OnDiskHeteroGraphStore`) đọc qua memory-mapped file — không cần load toàn bộ graph vào RAM.
-- Runtime replay PCAP qua fast path.
-- `PersistentGraphStore`: append-only source of truth cho runtime/training/slow path.
-- Hot graph buffer chỉ còn là cache RAM cho fast path; JSONL `ColdStore` chỉ là fallback khi tắt `graph_store`.
-- SIGC edge filter và DLG-IDS Top-N subgraph selection theo thiết kế Lean Optimal.
-- Slow path tạo evidence bundle, gọi SLM qua Ollama, validate grounding và fallback report.
-- Unit test cho graph builders, HGT, neighbor sampling, on-disk store, persistent graph store, payload extractor, fast-slow bridge và slow path.
+| Bước | Trạng thái | Artifact |
+|---|---|---|
+| Trích xuất payload 256B từ PCAP | ✅ Xong | `data/interim/payload_dataset_14gb/` |
+| Sinh teacher targets (SecureBERT) | ✅ Xong | `data/processed/teacher_targets.npy` |
+| Train student 1D-CNN | ✅ Xong | `outputs/student_cnn/student_cnn_best.pt` |
+| Export student embeddings | ✅ Xong | `data/processed/student_embeddings_14gb.npy` |
+| Chuẩn bị MITRE ATT&CK KB | ✅ Xong | `data/mitre/` |
+| Xây graph 3-tier | ✅ Xong | `data/processed/graph_artifact_3tier_14gb.*` |
+| Export student sang ONNX | ⏳ Chưa làm | `outputs/student_cnn/student_cnn.onnx` |
+| Convert graph sang on-disk CSR store | ⏳ Chưa làm | `data/graph_store_14gb/` |
+| Train HGT flow classifier | ⏳ Chưa làm | `outputs/hgt_flow_classifier_14gb/` |
 
-Baseline artifact đang dùng trong workspace local:
+### Runtime
+
+Chưa sẵn sàng chạy end-to-end — cần hoàn thành 3 bước pending ở trên trước (student ONNX, graph store, HGT checkpoint). Toàn bộ mã nguồn runtime đã implement đầy đủ.
+
+### Kết quả student 1D-CNN (14gb dataset)
+
+| Metric | Giá trị |
+|---|---:|
+| Samples tổng | 5,000,000 |
+| Samples train / val | 4,500,000 / 500,000 |
+| Embedding dim | 768 |
+| Best epoch | 2 |
+| Best val loss | 0.00111 |
+
+## Dataset CIC IoT 2023
+
+Dataset gốc: [CIC IoT Dataset 2023](https://www.unb.ca/cic/datasets/iotdataset-2023.html). Workspace hiện dùng 14 GB PCAP gồm 13 lớp:
 
 ```text
-data/processed/graph_artifact_3tier_t082_k5.npz
-data/processed/graph_artifact_3tier_t082_k5.meta.json
-outputs/hgt_flow_classifier_t082_k5_l3_d01/hgt_flow_best.pt
-outputs/student_cnn/student_cnn_best.pt
-outputs/student_cnn/student_cnn.onnx
+Backdoor_Malware
+Benign
+BrowserHijacking
+CommandInjection
+DDoS-ICMP_Fragmentation
+Recon-HostDiscovery
+Recon-OSScan
+Recon-PingSweep
+Recon-PortScan
+SqlInjection
+Uploading_Attack
+VulnerabilityScan
+XSS
 ```
 
-Thông số graph baseline:
+Thống kê graph artifact hiện có (`graph_artifact_3tier_14gb`):
 
 | Thành phần | Giá trị |
 |---|---:|
@@ -64,144 +86,112 @@ Thông số graph baseline:
 | Similarity threshold | 0.82 |
 | Packet top-k MITRE | 5 |
 | Flow top-k MITRE | 5 |
-| Số PCAP đã xử lý | 12 |
-| Số packet | 86,548 |
-| Số flow | 27,541 |
+| Số flow | 1,507,615 |
+| Số packet | 5,261,944 |
+| Cạnh flow→packet | 5,261,944 |
+| Cạnh packet→technique | 5,514,523 |
+| Cạnh flow→technique | 1,586,463 |
+| Cạnh packet→packet | 3,754,329 |
+| Cạnh technique→tactic | 887 |
 | Số MITRE technique | 691 |
 | Số MITRE tactic | 14 |
-
-Kết quả student 1D-CNN:
-
-| Metric | Giá trị |
-|---|---:|
-| Samples total | 86,548 |
-| Embedding dim | 768 |
-| Best epoch | 30 |
-| Best validation loss | 0.0020009385 |
-| Mean cosine similarity toàn tập | 0.99355167 |
-| Mean MSE toàn tập | 0.0000371204 |
-
-Kết quả HGT flow classifier baseline:
-
-| Metric | Giá trị |
-|---|---:|
-| Best epoch | 143 |
-| Validation macro-F1 | 0.351063 |
-| Test macro-F1 | 0.363932 |
-| Test accuracy | 0.347621 |
-| Train/val/test split | 22,035 / 2,753 / 2,753 |
-
-Các nhãn tấn công hiện có:
-
-```text
-Backdoor
-BrowserHijacking
-CommandInjection
-DDoS
-Recon
-SqlInjection
-Uploading
-VulnerabilityScan
-XSS
-```
 
 ## Kiến Trúc Tổng Quan
 
 ```text
-Offline training
---------------
-Raw PCAP
-  -> PayloadExtractor
-  -> payload_256.npy + metadata.csv
-  -> SecureBERT teacher embeddings
-  -> Student 1D-CNN distillation
-  -> student embeddings
-  -> MITRE technique embeddings
-  -> heterogeneous graph
-  -> HGT flow classifier
-  -> runtime artifacts
+Offline
+-------
+Raw PCAP (14 GB)
+  → PayloadExtractor        → payload_256.npy + metadata.csv
+  → SecureBERT teacher      → teacher_targets.npy
+  → Student 1D-CNN distill  → student_cnn_best.pt
+  → Export embeddings       → student_embeddings_14gb.npy
+  → MITRE ATT&CK KB         → mitre_techniques_embeddings.npy
+  → Build 3-tier graph      → graph_artifact_3tier_14gb.npz
+  → Convert CSR store       → graph_store_14gb/
+  → Train HGT               → hgt_flow_best.pt  ← [CHƯA XONG]
 
-Runtime replay / online path
-----------------------------
+Runtime
+-------
 Packet stream
-  -> FlowTracker
-  -> online PayloadExtractor
-  -> StudentRuntime ONNX
-  -> MitreIndex top-k
-  -> SIGC edge filter
-  -> PersistentGraphStore (write-through source of truth)
-  -> HotGraphBuffer cache
-  -> SubgraphBuilder + DLG-IDS Top-N
-  -> HGTRuntime
-  -> PolicyEngine
-  -> AlertDispatcher
-  -> SlowPathWorker
-  -> XAI report + graph store
+  → FlowTracker
+  → PayloadExtractor online
+  → StudentRuntime (ONNX)
+  → MitreIndex top-k
+  → SIGC edge filter
+  → PersistentGraphStore (source of truth)
+  → HotGraphBuffer (RAM cache)
+  → SubgraphBuilder (DLG-IDS Top-N)
+  → HGTRuntime
+  → PolicyEngine
+  → AlertDispatcher → SlowPathWorker → XAI report
 ```
 
 Các module chính:
 
 | Package | Vai trò |
 |---|---|
-| `graphslm_ids.offline_path.preprocessing` | Chuẩn bị dataset, MITRE KB, teacher target, graph artifact |
-| `graphslm_ids.offline_path.training` | Train/evaluate/export student và train HGT |
-| `graphslm_ids.models` | Mô hình `StudentCNN` và `HeteroGraphTransformer` |
-| `graphslm_ids.fast_path` | Data plane online: flow tracking, ONNX inference, MITRE index, SIGC, hot graph, Top-N subgraph, policy |
-| `graphslm_ids.runtime` | Control plane: config loader, pipeline orchestrator, persistent graph store, cold-store fallback, counterfactual |
-| `graphslm_ids.slow_path` | Evidence builder, ranker, SLM report generator, validator, fallback report |
+| `graphslm_ids.offline.preprocessing` | Trích payload, MITRE KB, teacher target, xây graph |
+| `graphslm_ids.offline.training` | Train/evaluate/export student, neighbor sampling, train HGT |
+| `graphslm_ids.models` | `StudentCNN` và `HeteroGraphTransformer` |
+| `graphslm_ids.runtime.fast_path` | Data plane: flow tracking, ONNX inference, MITRE index, SIGC, hot graph, Top-N subgraph, policy |
+| `graphslm_ids.runtime.slow_path` | Evidence builder, ranker, SLM report generator, validator, fallback |
+| `graphslm_ids.runtime.pipeline` | Orchestration: config, persistent graph store, cold-store, counterfactual, main pipeline |
 
 ## Cấu Trúc Thư Mục
 
 ```text
 .
-|-- configs/
-|   |-- hgt.example.yaml
-|   |-- hgt_t082_k5_l3_d01.yaml
-|   |-- pipeline.example.yaml
-|   |-- cic_iot2023_to_mitre_seed.csv
-|   `-- mitre_techniques_template.csv
-|-- data/
-|   |-- raw/
-|   |-- interim/
-|   |-- processed/
-|   `-- mitre/
-|-- docs/
-|   |-- fast_slow_bridge_design_vi.md
-|   |-- feasibility_assessment_vi.md
-|   |-- hgt_graph_threshold_selection_vi.md
-|   |-- mitre_setup_cic_iot2023_vi.md
-|   |-- slm_slow_path_xai_design_vi.md
-|   |-- streaming_hgt_runtime_strategy_vi.md
-|   `-- system_execution_flows.md
-|-- outputs/
-|   |-- hgt_flow_classifier_t082_k5_l3_d01/
-|   `-- student_cnn/
-|-- src/graphslm_ids/
-|   |-- fast_path/
-|   |-- models/
-|   |-- offline_path/
-|   |-- runtime/
-|   |-- slow_path/
-|   `-- utils/
-|-- tests/
-|-- requirements.txt
-|-- requirements-ml.txt
-|-- pyproject.toml
-`-- README.md
+├── configs/
+│   ├── hgt.example.yaml               # template HGT config
+│   ├── hgt_t082_k5_l3_d01.yaml        # config cũ (cần cập nhật paths cho 14gb)
+│   ├── hgt_paper_variants/            # 6 config biến thể cho so sánh
+│   ├── pipeline.example.yaml          # runtime pipeline config
+│   ├── cic_iot2023_to_mitre_seed.csv
+│   └── mitre_techniques_template.csv
+├── data/
+│   ├── raw/14gb/                      # 13 PCAP attack classes
+│   ├── interim/payload_dataset_14gb/  # payload_256.npy + metadata.csv
+│   ├── processed/                     # teacher targets, student embeddings, graph artifact
+│   └── mitre/                         # MITRE STIX JSON, CSV, embeddings
+├── docs/
+│   ├── architecture/                  # system flows, feasibility, fast-slow bridge, graph strategy
+│   ├── runtime/                       # MITRE setup, HGT runtime streaming
+│   ├── training/                      # HGT config guide, scalable training, student CNN report
+│   ├── xai/                           # slow path XAI design
+│   └── notebooks_vi.md
+├── models/SecureBERT/                 # teacher model weights (local)
+├── notebooks/
+│   ├── train_hgt_official_full_pipeline_kaggle.ipynb
+│   └── training/
+│       ├── kaggle/                    # 01_distill_student_cnn, 02_train_hgt_flow_classifier
+│       └── local/                    # 01_extract_payload, 02_export_embeddings, 03_build_graph
+├── outputs/
+│   └── student_cnn/                   # student_cnn_best.pt, training_summary.json
+├── src/graphslm_ids/
+│   ├── models/                        # hgt.py, student_cnn.py
+│   ├── offline/
+│   │   ├── preprocessing/             # extract_payload, build_graph, MITRE KB, ...
+│   │   └── training/                  # train_hgt, train_student, neighbor_sampling, ...
+│   ├── runtime/
+│   │   ├── fast_path/                 # flow_tracker, hgt_runtime, student_runtime, ...
+│   │   ├── slow_path/                 # evidence_builder, report_generator, slm_client, ...
+│   │   └── pipeline/                  # runtime_pipeline, pipeline_config, graph_store, ...
+│   └── utils/
+├── tests/                             # 13 test files
+├── requirements.txt
+├── requirements-ml.txt
+└── pyproject.toml
 ```
-
-Lưu ý: `data/` và `outputs/` chứa dữ liệu lớn/artifact sinh ra khi chạy pipeline nên được ignore khỏi git, trừ các file `.gitkeep`.
 
 ## Yêu Cầu Môi Trường
 
-- Python `>=3.10`.
-- Windows PowerShell được dùng trong các ví dụ lệnh dưới đây.
-- `pip` mới đủ để cài editable package.
-- Dung lượng trống cho `.npy`, `.npz`, checkpoint `.pt`, model `.onnx`.
-- Nếu chạy teacher/embedding/HGT training: cần PyTorch và các thư viện ML trong `requirements-ml.txt`.
-- Nếu chạy slow path bằng SLM local: cần Ollama hoặc backend tương thích với config trong `configs/pipeline.example.yaml`.
+- Python `>= 3.10`.
+- Windows PowerShell được dùng trong các ví dụ lệnh.
+- Để train teacher/student/HGT: cần GPU và các thư viện trong `requirements-ml.txt`.
+- Để chạy slow path với SLM local: cần Ollama hoặc backend tương thích.
 
-Dependencies nền trong `requirements.txt`:
+Dependencies nền (`requirements.txt`):
 
 ```text
 numpy
@@ -211,7 +201,7 @@ tqdm
 pyyaml
 ```
 
-Dependencies ML trong `requirements-ml.txt`:
+Dependencies ML (`requirements-ml.txt`):
 
 ```text
 torch
@@ -221,161 +211,72 @@ onnxruntime
 
 ## Cài Đặt
 
-Tạo virtual environment:
-
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-```
-
-Cài bản đầy đủ để chạy cả ML pipeline và runtime:
-
-```powershell
 pip install -r requirements-ml.txt
 pip install -e .
 ```
 
-Nếu chỉ cần chạy phần code nền không dùng teacher/HGT/ONNX:
+Kiểm tra:
 
 ```powershell
-pip install -r requirements.txt
-pip install -e .
-```
-
-Kiểm tra console scripts đã được nhận:
-
-```powershell
-graphslm-extract-payload --help
 graphslm-train-hgt --help
 graphslm-run-runtime --help
 ```
 
-## Quick Start
-
-Nếu workspace đã có sẵn artifact trong `data/processed/`, `data/mitre/` và `outputs/`, có thể chạy nhanh một replay không bật slow worker:
-
-```powershell
-graphslm-run-runtime `
-  --config "configs/pipeline.example.yaml" `
-  --input "data/raw/Recon-PortScan.pcap" `
-  --max-packets 100 `
-  --no-worker
-```
-
-Kết quả sẽ in số packet đã xử lý, số alert và đường dẫn graph store. Dòng `[ALERT]` xuất hiện khi label dự đoán không nằm trong `policy.benign_labels` (hoặc nằm trong `policy.alert_labels` nếu bạn cấu hình whitelist) và confidence vượt `policy.alert_threshold`:
-
-```text
-[ALERT] ...
-[OK] Processed packets=<n> alerts=<m>
-[OK] Graph store: data/graph_store_v1
-```
-
-Nếu fresh clone chưa có artifact, hãy chạy pipeline offline ở phần tiếp theo trước.
-
 ## Pipeline Offline Từ Đầu
 
-Các bước dưới đây tái tạo dataset, embedding, graph và checkpoint từ PCAP.
+Workspace hiện đã hoàn thành **bước 1–7**. Nếu clone mới, chạy lại từ đầu theo thứ tự sau.
 
 ### 1. Chuẩn bị MITRE ATT&CK
 
-Tạo thư mục MITRE:
-
 ```powershell
 New-Item -ItemType Directory -Path "data/mitre" -Force | Out-Null
-```
-
-Tải Enterprise ATT&CK STIX JSON:
-
-```powershell
 Invoke-WebRequest `
   -Uri "https://raw.githubusercontent.com/mitre/cti/master/enterprise-attack/enterprise-attack.json" `
   -OutFile "data/mitre/enterprise-attack.json"
+
+graphslm-prepare-mitre --input-json "data/mitre/enterprise-attack.json"
 ```
 
-Sinh CSV technique, tactic và cạnh technique-tactic:
+Output: `data/mitre/mitre_techniques.csv`, `mitre_tactics.csv`, `mitre_technique_tactic_edges.csv`.
 
-```powershell
-graphslm-prepare-mitre `
-  --input-json "data/mitre/enterprise-attack.json"
-```
+Tài liệu: `docs/runtime/mitre_setup_cic_iot2023_vi.md`.
 
-Output chính:
+### 2. Trích xuất payload dataset
 
-```text
-data/mitre/mitre_techniques.csv
-data/mitre/mitre_tactics.csv
-data/mitre/mitre_technique_tactic_edges.csv
-data/mitre/mitre_export_stats.json
-```
-
-Tài liệu chi tiết: `docs/mitre_setup_cic_iot2023_vi.md`.
-
-### 2. Chuẩn bị PCAP
-
-Đặt các file `.pcap` hoặc `.pcapng` vào:
-
-```text
-data/raw/
-```
-
-Tên file có thể được dùng để suy ra nhãn nếu metadata không có nhãn riêng. Dataset local hiện dùng các lớp như `Backdoor`, `Recon`, `SqlInjection`, `XSS`, ...
-
-### 3. Trích xuất payload dataset
+Đặt PCAP vào `data/raw/`. Cấu trúc khuyến nghị: `data/raw/<ClassName>/<file>.pcap`.
 
 ```powershell
 graphslm-extract-payload `
   --input-glob "data/raw/**/*.pcap" "data/raw/**/*.pcapng" `
-  --output-dir "data/interim/payload_dataset" `
+  --output-dir "data/interim/payload_dataset_14gb" `
   --payload-length 256
 ```
 
-Output chính:
+Output: `payload_256.npy`, `metadata.csv`, `stats.json`.
 
-```text
-data/interim/payload_dataset/payload_256.npy
-data/interim/payload_dataset/metadata.csv
-data/interim/payload_dataset/stats.json
-```
-
-Tùy chọn hữu ích:
-
-```powershell
-graphslm-extract-payload `
-  --input-glob "data/raw/**/*.pcap" `
-  --output-dir "data/interim/payload_dataset_smoke" `
-  --payload-length 256 `
-  --max-packets-per-file 1000 `
-  --shuffle `
-  --seed 42
-```
-
-### 4. Sinh teacher targets
+### 3. Sinh teacher targets
 
 ```powershell
 graphslm-build-teacher `
-  --payload-npy "data/interim/payload_dataset/payload_256.npy" `
-  --metadata-csv "data/interim/payload_dataset/metadata.csv" `
+  --payload-npy "data/interim/payload_dataset_14gb/payload_256.npy" `
+  --metadata-csv "data/interim/payload_dataset_14gb/metadata.csv" `
   --output-path "data/processed/teacher_targets.npy" `
   --model-name "ehsanaghaei/SecureBERT" `
   --batch-size 32 `
   --device auto
 ```
 
-Output:
+Teacher transformer chỉ dùng offline — runtime không gọi lại.
 
-```text
-data/processed/teacher_targets.npy
-data/processed/teacher_targets.meta.json
-```
-
-Teacher transformer chỉ dùng offline để tạo target/embedding. Runtime không gọi transformer này.
-
-### 5. Train student 1D-CNN
+### 4. Train student 1D-CNN
 
 ```powershell
 graphslm-train-student `
-  --payload-npy "data/interim/payload_dataset/payload_256.npy" `
+  --payload-npy "data/interim/payload_dataset_14gb/payload_256.npy" `
   --teacher-npy "data/processed/teacher_targets.npy" `
   --output-dir "outputs/student_cnn" `
   --batch-size 256 `
@@ -383,29 +284,19 @@ graphslm-train-student `
   --device auto
 ```
 
-Output:
-
-```text
-outputs/student_cnn/student_cnn_best.pt
-outputs/student_cnn/training_summary.json
-```
-
-Đánh giá student:
+Đánh giá:
 
 ```powershell
 graphslm-eval-student `
-  --payload-npy "data/interim/payload_dataset/payload_256.npy" `
+  --payload-npy "data/interim/payload_dataset_14gb/payload_256.npy" `
   --teacher-npy "data/processed/teacher_targets.npy" `
-  --metadata-csv "data/interim/payload_dataset/metadata.csv" `
+  --metadata-csv "data/interim/payload_dataset_14gb/metadata.csv" `
   --checkpoint "outputs/student_cnn/student_cnn_best.pt" `
   --output-path "outputs/student_cnn/evaluation_summary.json" `
-  --batch-size 512 `
-  --val-ratio 0.1 `
-  --seed 42 `
   --device auto
 ```
 
-### 6. Export student ONNX
+### 5. Export student sang ONNX
 
 ```powershell
 graphslm-export-student-onnx `
@@ -419,32 +310,24 @@ graphslm-export-student-onnx `
 
 ONNX artifact này được `StudentRuntime` dùng trong fast path.
 
-Output:
-
-```text
-outputs/student_cnn/student_cnn.onnx
-outputs/student_cnn/student_cnn.meta.json
-```
-
-### 7. Export student embeddings
+### 6. Export student embeddings
 
 ```powershell
 graphslm-export-student-emb `
-  --payload-npy "data/interim/payload_dataset/payload_256.npy" `
+  --payload-npy "data/interim/payload_dataset_14gb/payload_256.npy" `
   --checkpoint "outputs/student_cnn/student_cnn_best.pt" `
-  --output-path "data/processed/student_embeddings.npy" `
+  --output-path "data/processed/student_embeddings_14gb.npy" `
   --batch-size 1024 `
   --device auto
 ```
 
-Output:
+Hoặc dùng script PowerShell có sẵn:
 
-```text
-data/processed/student_embeddings.npy
-data/processed/student_embeddings.meta.json
+```powershell
+.\run_02_export_embeddings.ps1
 ```
 
-### 8. Tạo MITRE technique embeddings
+### 7. Tạo MITRE technique embeddings
 
 ```powershell
 graphslm-build-mitre-emb `
@@ -455,75 +338,61 @@ graphslm-build-mitre-emb `
   --device auto
 ```
 
-Output:
-
-```text
-data/mitre/mitre_techniques_embeddings.npy
-data/mitre/mitre_techniques_embeddings.meta.json
-```
-
-### 9. Xây graph dị thể 3-tier baseline
-
-Baseline hiện dùng threshold `0.82`, packet top-k `5`, flow top-k `5`.
+### 8. Xây graph 3-tier
 
 ```powershell
 graphslm-build-three-tier-graph `
-  --metadata-csv "data/interim/payload_dataset/metadata.csv" `
-  --payload-npy "data/interim/payload_dataset/payload_256.npy" `
-  --student-embedding-npy "data/processed/student_embeddings.npy" `
+  --metadata-csv "data/interim/payload_dataset_14gb/metadata.csv" `
+  --payload-npy "data/interim/payload_dataset_14gb/payload_256.npy" `
+  --student-embedding-npy "data/processed/student_embeddings_14gb.npy" `
   --mitre-techniques-csv "data/mitre/mitre_techniques.csv" `
   --mitre-technique-embeddings-npy "data/mitre/mitre_techniques_embeddings.npy" `
   --mitre-technique-tactic-edges-csv "data/mitre/mitre_technique_tactic_edges.csv" `
-  --output-npz "data/processed/graph_artifact_3tier_t082_k5.npz" `
+  --output-npz "data/processed/graph_artifact_3tier_14gb.npz" `
   --similarity-threshold 0.82 `
   --packet-top-k 5 `
   --flow-top-k 5
 ```
 
-Output:
+Output: `graph_artifact_3tier_14gb.npz` và `graph_artifact_3tier_14gb.meta.json`.
 
-```text
-data/processed/graph_artifact_3tier_t082_k5.npz
-data/processed/graph_artifact_3tier_t082_k5.meta.json
-```
+### 9. Convert graph sang on-disk CSR store
 
-Graph này có các loại cạnh chính:
-
-- Flow chứa packet.
-- Packet liên kết với MITRE technique qua cosine similarity.
-- Flow liên kết với MITRE technique qua tổng hợp top-k.
-- Technique thuộc tactic.
-- Reverse edges được thêm trong bước train/runtime nếu cấu hình bật `add_reverse_edges`.
-
-### 10. Train HGT flow classifier
-
-Với graph lớn (hàng chục nghìn flow, hàng trăm nghìn packet), cần chuyển NPZ sang on-disk CSR store trước để tránh OOM khi load toàn bộ graph vào RAM:
+Graph 14gb quá lớn để load toàn bộ vào RAM. Chuyển sang CSR store một lần:
 
 ```powershell
 graphslm-convert-graph-store `
-  --graph-npz "data/processed/graph_artifact_3tier_t082_k5.npz" `
-  --graph-meta-json "data/processed/graph_artifact_3tier_t082_k5.meta.json" `
-  --output-root "data/graph_store_v1"
+  --graph-npz "data/processed/graph_artifact_3tier_14gb.npz" `
+  --graph-meta-json "data/processed/graph_artifact_3tier_14gb.meta.json" `
+  --output-root "data/graph_store_14gb"
 ```
 
 Output:
 
 ```text
-data/graph_store_v1/manifest.json
-data/graph_store_v1/nodes/flow/features.f32
-data/graph_store_v1/nodes/flow/labels.i64
-data/graph_store_v1/edges/<edge_name>/indptr.i64
-data/graph_store_v1/edges/<edge_name>/indices.i64
-data/graph_store_v1/edges/<edge_name>/attr.f32
-data/graph_store_v1/splits/train_flow_ids.i64
+data/graph_store_14gb/manifest.json
+data/graph_store_14gb/nodes/flow/features.f32
+data/graph_store_14gb/nodes/flow/labels.i64
+data/graph_store_14gb/edges/<edge_name>/indptr.i64
+data/graph_store_14gb/edges/<edge_name>/indices.i64
+data/graph_store_14gb/splits/train_flow_ids.i64
 ```
 
-Bước này chỉ cần làm một lần. Sau đó train với `source: graph_store` và `batch_mode: neighbor_sampling` (mặc định trong `hgt.example.yaml`), toàn bộ graph sẽ được đọc qua memory-mapped file — không load đầy vào RAM:
+### 10. Train HGT flow classifier
 
-Cấu hình baseline:
+**Lưu ý**: Các file config hiện tại (`hgt_t082_k5_l3_d01.yaml`, `hgt.example.yaml`) vẫn trỏ đến artifact cũ `t082_k5`. Trước khi train, cần cập nhật `data.graph_store_root` và `data.graph_npz` trong config sang đường dẫn 14gb:
 
-```text
-configs/hgt_t082_k5_l3_d01.yaml
+```yaml
+data:
+  source: graph_store
+  graph_store_root: data/graph_store_14gb
+  graph_npz: data/processed/graph_artifact_3tier_14gb.npz
+  graph_meta_json: data/processed/graph_artifact_3tier_14gb.meta.json
+
+train:
+  output_dir: outputs/hgt_flow_classifier_14gb
+  device: cuda
+  amp: true
 ```
 
 Chạy train:
@@ -532,75 +401,58 @@ Chạy train:
 graphslm-train-hgt --config "configs/hgt_t082_k5_l3_d01.yaml"
 ```
 
+Hoặc trên Kaggle GPU T4 x2 dùng notebook `notebooks/training/kaggle/02_train_hgt_flow_classifier.ipynb`.
+
 Output:
 
 ```text
-outputs/hgt_flow_classifier_t082_k5_l3_d01/hgt_flow_best.pt
-outputs/hgt_flow_classifier_t082_k5_l3_d01/training_summary.json
-```
-
-Có thể override một số tham số từ CLI:
-
-```powershell
-graphslm-train-hgt `
-  --config "configs/hgt.example.yaml" `
-  --epochs 50 `
-  --device cpu `
-  --output-dir "outputs/hgt_debug"
+outputs/hgt_flow_classifier_14gb/hgt_flow_best.pt
+outputs/hgt_flow_classifier_14gb/training_summary.json
 ```
 
 ## Chạy Runtime Fast Path Và Slow Path
 
-Runtime dùng config tổng hợp:
+Runtime cần đủ các artifact sau:
 
 ```text
-configs/pipeline.example.yaml
-```
-
-Các artifact cần có trước khi chạy:
-
-```text
-outputs/student_cnn/student_cnn.onnx
+outputs/student_cnn/student_cnn.onnx                    ← bước 5
 data/mitre/mitre_techniques.csv
 data/mitre/mitre_technique_tactic_edges.csv
-data/mitre/mitre_techniques_embeddings.npy
-data/processed/graph_artifact_3tier_t082_k5.meta.json
-outputs/hgt_flow_classifier_t082_k5_l3_d01/hgt_flow_best.pt
+data/mitre/mitre_techniques_embeddings.npy               ← bước 7
+outputs/hgt_flow_classifier_14gb/hgt_flow_best.pt       ← bước 10
 ```
+
+Cập nhật `configs/pipeline.example.yaml` để trỏ đúng checkpoint và embedding.
 
 Chạy replay không bật slow worker:
 
 ```powershell
 graphslm-run-runtime `
   --config "configs/pipeline.example.yaml" `
-  --input "data/raw/Recon-PortScan.pcap" `
+  --input "data/raw/14gb/Recon-PortScan/Recon-PortScan.pcap" `
   --max-packets 500 `
   --no-worker
 ```
 
-Chạy replay có slow worker:
+Chạy có slow worker:
 
 ```powershell
 graphslm-run-runtime `
   --config "configs/pipeline.example.yaml" `
-  --input "data/raw/Recon-PortScan.pcap" `
+  --input "data/raw/14gb/Recon-PortScan/Recon-PortScan.pcap" `
   --max-packets 500
 ```
 
-Khi bật slow worker, pipeline sẽ:
+Khi bật slow worker, pipeline:
 
-1. Chạy fast path cho từng packet.
-2. Đưa packet/flow/technique vào `HotGraphBuffer`.
-3. Dựng subgraph quanh flow hiện tại.
-4. Chạy HGT để lấy logits và attention.
-5. Dùng `PolicyEngine` để quyết định alert.
-6. Nếu alert đạt ngưỡng, `AlertDispatcher` tạo `SlowPathJob`.
-7. `SlowPathWorker` hydrate context, build evidence, gọi SLM và validate report.
-8. Snapshot/report được ghi vào `data/runtime/events.jsonl`.
+1. Fast path xử lý từng packet → `FlowTracker` → `StudentRuntime` → `MitreIndex`.
+2. Ghi vào `PersistentGraphStore` (source of truth) và `HotGraphBuffer` (RAM cache).
+3. `SubgraphBuilder` dựng K-hop subgraph quanh flow.
+4. `HGTRuntime` suy luận, `PolicyEngine` quyết định alert.
+5. `AlertDispatcher` tạo `SlowPathJob` khi đạt ngưỡng.
+6. `SlowPathWorker` hydrate context, build evidence, gọi SLM, validate report.
 
-### Cấu hình Ollama cho slow path
-
-Mặc định `configs/pipeline.example.yaml` dùng:
+### Cấu hình Ollama
 
 ```yaml
 slm:
@@ -609,51 +461,39 @@ slm:
   endpoint: http://localhost:11434
 ```
 
-Khởi động Ollama và pull model tương ứng, hoặc sửa `slm.model` sang model bạn đang có:
-
 ```powershell
 ollama serve
 ollama pull qwen2.5:3b-instruct-q4_k_m
 ```
 
-Nếu không muốn gọi SLM khi smoke test, dùng `--no-worker`.
+Dùng `--no-worker` để bỏ qua slow path khi smoke test.
 
 ## Cấu Hình Quan Trọng
 
-### `configs/hgt_t082_k5_l3_d01.yaml` / `configs/hgt.example.yaml`
+### `configs/hgt.example.yaml` / `configs/hgt_t082_k5_l3_d01.yaml`
 
-Điều khiển bước train HGT. Các key quan trọng:
+Điều khiển train HGT. Các key quan trọng:
 
 ```yaml
 data:
-  # "graph_store" = mmap CSR (khuyến nghị, không load toàn bộ graph vào RAM)
-  # "npz"         = load NPZ đầy vào RAM (chỉ dùng khi graph nhỏ)
-  source: graph_store
-  graph_store_root: data/graph_store_v1
-  graph_npz: data/processed/graph_artifact_3tier_t082_k5.npz
-  graph_meta_json: data/processed/graph_artifact_3tier_t082_k5.meta.json
-  packet_feature: semantic
-  add_reverse_edges: true
-  standardize_flow_features: true
-  use_semantic_edge_weights: true
-
-model:
-  hidden_dim: 128
-  num_layers: 3
-  num_heads: 4
-  dropout: 0.1
+  source: graph_store          # mmap CSR — không load full graph vào RAM
+  graph_store_root: data/graph_store_14gb
+  graph_npz: data/processed/graph_artifact_3tier_14gb.npz
+  graph_meta_json: data/processed/graph_artifact_3tier_14gb.meta.json
 
 train:
-  # "neighbor_sampling" = mini-batch BFS, bắt buộc khi graph lớn
-  # "full"              = full-graph (OOM với graph lớn)
-  batch_mode: neighbor_sampling
-  batch_seed_flows: 256
-  grad_accum_steps: 4
+  output_dir: outputs/hgt_flow_classifier_14gb
   epochs: 200
   lr: 0.001
   weight_decay: 0.00005
+  batch_seed_flows: 256
+  grad_accum_steps: 2
+  scheduler: onecycle
+  scheduler_pct_start: 0.05
   class_weight: balanced
   monitor: val_macro_f1
+  device: cuda
+  amp: true
 
 sampler:
   fanouts:
@@ -666,71 +506,100 @@ sampler:
   always_include_all_techniques: true
 ```
 
+### `configs/hgt_paper_variants/`
+
+Chứa 6 config biến thể HGT dùng để so sánh trong báo cáo:
+
+| File | Mô tả |
+|---|---|
+| `hgt_t082_k5_ahgt_dfd_funnel_l3_h128_h4.yaml` | AHGT-DFD Funnel |
+| `hgt_t082_k5_dlg_ids_sparse_l2_h128_h4.yaml` | DLG-IDS Sparse |
+| `hgt_t082_k5_gatransformer_deep_l6_h256_h8.yaml` | GAT Transformer Deep |
+| `hgt_t082_k5_one2_iov_l1_h64_h2.yaml` | ONE2 IoV Lightweight |
+| `hgt_t082_k5_relgt_multi_token_l3_h128_h8.yaml` | RelGT Multi-Token |
+| `hgt_t082_k5_xgnid_dual_modal_l1_h32_h4.yaml` | XGNID Dual-Modal |
+
 ### `configs/pipeline.example.yaml`
 
 Điều khiển runtime end-to-end:
 
 | Section | Vai trò |
 |---|---|
-| `data` | Input glob, output dir, payload length |
-| `teacher` | Model teacher offline |
-| `mitre` | Đường dẫn MITRE CSV/embedding và ngưỡng similarity |
-| `fast_path` | Student ONNX, MITRE top-k, payload length |
+| `fast_path` | Student ONNX path, MITRE top-k, payload length |
 | `hot_graph` | TTL, giới hạn packet/flow/event trong RAM |
-| `preprocessor` | SIGC Local Contribution Score, lọc cạnh yếu trước khi ghi store |
+| `preprocessor` | SIGC Local Contribution Score, lọc cạnh yếu |
 | `graph_store` | Persistent Graph Store, shard seal, retention, disk quota |
-| `subgraph_builder` | DLG-IDS Top-N edge selection cho K-hop runtime subgraph |
-| `hgt` | Tham số train HGT |
+| `subgraph_builder` | DLG-IDS Top-N edge selection cho K-hop subgraph |
 | `hgt_runtime` | Checkpoint và meta dùng khi inference |
-| `policy` | Alert threshold và các label được xem là alert |
-| `slow_path` | Queue, số evidence top-k, counterfactual |
-| `cold_store` | Fallback JSONL khi `graph_store.enabled: false` |
+| `policy` | Alert threshold, benign/attack labels |
+| `slow_path` | Queue, top-k evidence, counterfactual |
+| `cold_store` | Fallback JSONL khi tắt `graph_store` |
 | `slm` | Backend/model sinh báo cáo |
 | `validator` | Ngưỡng kiểm tra grounding/hallucination |
 
-Lưu ý quan trọng: mặc định nên dùng `policy.benign_labels`. Bất kỳ nhãn nào không nằm trong danh sách benign và vượt threshold sẽ bắn alert. Chỉ dùng `policy.alert_labels` khi muốn whitelist chính xác các nhãn cần alert. Với baseline hiện tại, các nhãn tấn công là `Backdoor`, `BrowserHijacking`, `CommandInjection`, `DDoS`, `Recon`, `SqlInjection`, `Uploading`, `VulnerabilityScan`, `XSS`.
-
 ## Console Scripts
-
-Các lệnh được khai báo trong `pyproject.toml`:
 
 | Lệnh | Module | Mục đích |
 |---|---|---|
-| `graphslm-extract-payload` | `offline_path.preprocessing.extract_payload_dataset` | Trích payload từ PCAP |
-| `graphslm-prepare-mitre` | `offline_path.preprocessing.prepare_mitre_knowledge_base` | Tạo MITRE CSV từ STIX JSON |
-| `graphslm-build-teacher` | `offline_path.preprocessing.build_teacher_targets` | Sinh teacher targets |
-| `graphslm-build-mitre-emb` | `offline_path.preprocessing.build_mitre_technique_embeddings` | Sinh MITRE technique embeddings |
-| `graphslm-build-graph` | `offline_path.preprocessing.build_graph_artifact` | Xây graph flow-packet cũ |
-| `graphslm-build-three-tier-graph` | `offline_path.preprocessing.build_three_tier_graph_artifact` | Xây graph flow-packet-technique-tactic |
-| `graphslm-train-student` | `offline_path.training.train_student_cnn` | Train student 1D-CNN |
-| `graphslm-eval-student` | `offline_path.training.evaluate_student_cnn` | Đánh giá student |
-| `graphslm-export-student-onnx` | `offline_path.training.export_student_onnx` | Export student sang ONNX |
-| `graphslm-export-student-emb` | `offline_path.training.export_student_embeddings` | Export student embeddings |
-| `graphslm-train-hgt` | `offline_path.training.train_hgt_flow_classifier` | Train HGT classifier |
-| `graphslm-convert-graph-store` | `offline_path.training.on_disk_graph_store` | Chuyển NPZ graph sang on-disk CSR store (cần chạy một lần trước khi train với `source: graph_store`) |
-| `graphslm-run-runtime` | `runtime.run_runtime_pipeline` | Replay PCAP qua runtime pipeline |
+| `graphslm-extract-payload` | `offline.preprocessing.extract_payload_dataset` | Trích payload từ PCAP |
+| `graphslm-prepare-mitre` | `offline.preprocessing.prepare_mitre_knowledge_base` | Tạo MITRE CSV từ STIX JSON |
+| `graphslm-build-teacher` | `offline.preprocessing.build_teacher_targets` | Sinh teacher targets |
+| `graphslm-build-mitre-emb` | `offline.preprocessing.build_mitre_technique_embeddings` | Sinh MITRE technique embeddings |
+| `graphslm-build-graph` | `offline.preprocessing.build_graph_artifact` | Xây graph flow-packet (cũ) |
+| `graphslm-build-three-tier-graph` | `offline.preprocessing.build_three_tier_graph_artifact` | Xây graph 3-tier (flow-packet-technique-tactic) |
+| `graphslm-train-student` | `offline.training.train_student_cnn` | Train student 1D-CNN |
+| `graphslm-eval-student` | `offline.training.evaluate_student_cnn` | Đánh giá student |
+| `graphslm-export-student-onnx` | `offline.training.export_student_onnx` | Export student sang ONNX |
+| `graphslm-export-student-emb` | `offline.training.export_student_embeddings` | Export student embeddings |
+| `graphslm-train-hgt` | `offline.training.train_hgt_flow_classifier` | Train HGT classifier |
+| `graphslm-convert-graph-store` | `offline.training.on_disk_graph_store` | Chuyển NPZ sang on-disk CSR store |
+| `graphslm-run-runtime` | `runtime.pipeline.run_runtime_pipeline` | Replay PCAP qua runtime pipeline |
+
+## Notebooks
+
+| Notebook | Môi trường | Mục đích |
+|---|---|---|
+| `notebooks/training/local/01_extract_payload_from_pcap.ipynb` | Local | Trích payload từ PCAP trên máy local |
+| `notebooks/training/local/02_export_student_embeddings.ipynb` | Local | Export student embeddings sau khi train |
+| `notebooks/training/local/03_build_three_tier_graph.ipynb` | Local | Xây graph 3-tier từ artifact có sẵn |
+| `notebooks/training/kaggle/01_distill_student_cnn.ipynb` | Kaggle GPU | Train student 1D-CNN distillation |
+| `notebooks/training/kaggle/02_train_hgt_flow_classifier.ipynb` | Kaggle GPU | Train HGT từ graph artifact hoặc graph store |
+| `notebooks/train_hgt_official_full_pipeline_kaggle.ipynb` | Kaggle GPU T4x2 | Pipeline đầy đủ: PCAP → HGT, hoặc chỉ train HGT từ graph NPZ có sẵn |
+
+Notebook Kaggle full pipeline hỗ trợ hai mode (chỉnh `PIPELINE_MODE`):
+
+| `PIPELINE_MODE` | Mô tả |
+|---|---|
+| `full_from_pcap` | Chạy toàn bộ từ PCAP → graph → HGT |
+| `existing_graph_npz` | Bỏ qua tiền xử lý, chuyển graph store rồi train HGT |
+
+Và hai mode HGT (chỉnh `HGT_RUN_MODE`):
+
+| `HGT_RUN_MODE` | Mô tả |
+|---|---|
+| `deployment` | Train 1 config production |
+| `paper_variants` | Train song song 7 variant trên 2 GPU để so sánh |
 
 ## Kiểm Thử
-
-Chạy toàn bộ test:
 
 ```powershell
 pytest
 ```
 
-Chạy nhóm test chính:
+Các nhóm test chính:
 
 ```powershell
 pytest tests/test_payload_extractor.py
 pytest tests/test_graph_artifact_builder.py tests/test_three_tier_graph_artifact.py
 pytest tests/test_hgt_model.py
-pytest tests/test_hgt_neighbor_sampling.py
+pytest tests/test_hgt_neighbor_sampling.py tests/test_neighbor_sampling_vectorized.py
 pytest tests/test_on_disk_graph_store_training.py
 pytest tests/test_persistent_graph_store.py
 pytest tests/test_fast_slow_bridge.py tests/test_slow_path.py
+pytest tests/test_hgt_ddp_smoke.py
 ```
 
-Nếu test không import được package, hãy đảm bảo đã chạy:
+Nếu test không import được package:
 
 ```powershell
 pip install -e .
@@ -738,60 +607,48 @@ pip install -e .
 
 ## Artifact Và Dữ Liệu
 
-Các thư mục dữ liệu được dùng theo quy ước:
-
 | Thư mục | Nội dung |
 |---|---|
-| `data/raw/` | PCAP/PCAPNG gốc |
-| `data/interim/` | Dataset trung gian, ví dụ `payload_256.npy`, `metadata.csv` |
-| `data/processed/` | Teacher targets, student embeddings, graph artifact |
-| `data/mitre/` | MITRE STIX JSON, CSV và technique embeddings |
+| `data/raw/14gb/` | 13 PCAP theo lớp tấn công |
+| `data/interim/payload_dataset_14gb/` | `payload_256.npy`, `metadata.csv`, `stats.json` |
+| `data/processed/` | Teacher targets, student embeddings 14gb, graph artifact 3tier 14gb |
+| `data/mitre/` | STIX JSON, CSV, technique embeddings |
+| `data/graph_store_14gb/` | On-disk CSR store (cần tạo — bước 9) |
 | `data/runtime/` | Fallback cold store JSONL khi tắt `graph_store` |
-| `data/graph_store_v1/` | Persistent Graph Store runtime/training |
-| `outputs/student_cnn/` | Checkpoint/evaluation/ONNX của student |
-| `outputs/hgt_flow_classifier_t082_k5_l3_d01/` | Checkpoint và training summary HGT baseline |
+| `outputs/student_cnn/` | `student_cnn_best.pt`, `training_summary.json` |
+| `outputs/hgt_flow_classifier_14gb/` | Checkpoint và training summary HGT (cần train — bước 10) |
 
-Những artifact này có thể rất lớn và đang bị ignore bởi `.gitignore`:
-
-```text
-outputs/
-*.pt
-*.onnx
-*.npz
-*.npy
-/data/raw/*
-/data/interim/*
-/data/processed/*
-/data/mitre/*
-```
-
-Vì vậy khi clone repo mới, cần tự tạo lại artifact bằng pipeline offline hoặc copy artifact từ nơi lưu trữ riêng của nhóm.
+Artifact lớn bị ignore bởi `.gitignore` (`*.pt`, `*.onnx`, `*.npz`, `*.npy`, `data/raw/*`, `data/interim/*`, `data/processed/*`, `data/mitre/*`). Khi clone mới cần tự tái tạo theo pipeline trên, hoặc copy từ nơi lưu trữ riêng.
 
 ## Tài Liệu Liên Quan
 
 | Tài liệu | Nội dung |
 |---|---|
-| `docs/feasibility_assessment_vi.md` | Đánh giá khả thi của hướng tiếp cận |
-| `docs/mitre_setup_cic_iot2023_vi.md` | Chuẩn bị MITRE ATT&CK cho CIC IoT 2023 |
-| `docs/hgt_graph_threshold_selection_vi.md` | Chọn threshold/top-k cho graph HGT |
-| `docs/slm_slow_path_xai_design_vi.md` | Thiết kế slow path XAI bằng SLM |
-| `docs/streaming_hgt_runtime_strategy_vi.md` | Chiến lược hot graph/runtime streaming |
-| `docs/fast_slow_bridge_design_vi.md` | Thiết kế lớp nối fast path và slow path |
-| `docs/system_execution_flows.md` | Mermaid diagram cho offline/runtime flow |
+| `docs/architecture/feasibility_assessment_vi.md` | Đánh giá khả thi của hướng tiếp cận |
+| `docs/architecture/system_execution_flows.md` | Mermaid diagram cho offline/runtime flow |
+| `docs/architecture/fast_slow_bridge_design_vi.md` | Thiết kế lớp nối fast path và slow path |
+| `docs/architecture/unified_graph_growth_strategy_vi.md` | Chiến lược mở rộng graph online |
+| `docs/runtime/mitre_setup_cic_iot2023_vi.md` | Chuẩn bị MITRE ATT&CK cho CIC IoT 2023 |
+| `docs/runtime/streaming_hgt_runtime_v3_vi.md` | Chiến lược hot graph/runtime streaming |
+| `docs/training/hgt_graph_threshold_selection_vi.md` | Chọn threshold/top-k cho graph HGT |
+| `docs/training/hgt_train_config_recommendation_vi.md` | Hướng dẫn cấu hình train HGT |
+| `docs/training/scalable_hgt_training_design_vi.md` | Thiết kế neighbor sampling cho graph lớn |
+| `docs/training/student_1dcnn_distillation_report_vi.md` | Báo cáo student CNN distillation |
+| `docs/xai/slm_slow_path_xai_design_vi.md` | Thiết kế slow path XAI bằng SLM |
+| `docs/notebooks_vi.md` | Hướng dẫn sử dụng notebooks |
 
 ## Giới Hạn Hiện Tại
 
-- HGT baseline hiện mới đạt test macro-F1 khoảng `0.364`, phù hợp mức prototype/nghiên cứu, chưa phải IDS production.
-- Mapping packet/flow sang MITRE technique dựa trên cosine similarity giữa embedding, nên chỉ nên diễn giải là tương đồng ngữ nghĩa, không phải bằng chứng chắc chắn về TTP.
-- Runtime hiện hỗ trợ replay PCAP qua `graphslm-run-runtime`; live capture/inline blocking chưa phải mục tiêu chính trong repo này.
-- Slow path phụ thuộc chất lượng evidence bundle và SLM local. Validator giúp giảm hallucination nhưng không thay thế kiểm chứng của analyst.
-- Các file dữ liệu lớn không được commit. README mô tả đường dẫn artifact theo workspace hiện tại và pipeline tái tạo lại chúng.
+- HGT chưa được train trên dataset 14gb — chưa có kết quả baseline.
+- Hai HGT config hiện có vẫn trỏ đến artifact cũ (`t082_k5`); cần cập nhật paths trước khi train.
+- Runtime chưa thể chạy end-to-end vì thiếu student ONNX và HGT checkpoint.
+- Mapping packet/flow sang MITRE technique dựa trên cosine similarity ngữ nghĩa — nên diễn giải là tương đồng ngữ nghĩa, không phải bằng chứng TTP xác định.
+- Runtime hỗ trợ replay PCAP; live capture/inline blocking chưa phải mục tiêu chính.
+- Slow path phụ thuộc chất lượng SLM local. Validator giảm hallucination nhưng không thay thế kiểm chứng của analyst.
 
 ## Troubleshooting
 
 ### `ModuleNotFoundError: graphslm_ids`
-
-Cài package ở chế độ editable:
 
 ```powershell
 pip install -e .
@@ -799,24 +656,30 @@ pip install -e .
 
 ### Thiếu `torch`, `transformers` hoặc `onnxruntime`
 
-Cài full ML dependencies:
-
 ```powershell
 pip install -r requirements-ml.txt
 ```
 
-### Runtime báo thiếu `.onnx`, `.pt`, `.npy`, `.npz`
+### Runtime báo thiếu artifact
 
-Chạy lại các bước offline tương ứng:
+- Thiếu `student_cnn.onnx`: chạy `graphslm-export-student-onnx` (bước 5).
+- Thiếu `mitre_techniques_embeddings.npy`: chạy `graphslm-build-mitre-emb` (bước 7).
+- Thiếu `graph_artifact_3tier_14gb.npz`: chạy `graphslm-build-three-tier-graph` (bước 8).
+- Thiếu `hgt_flow_best.pt`: chạy `graphslm-train-hgt` (bước 10).
 
-- Thiếu `student_cnn.onnx`: chạy `graphslm-export-student-onnx`.
-- Thiếu `mitre_techniques_embeddings.npy`: chạy `graphslm-build-mitre-emb`.
-- Thiếu `graph_artifact_3tier_t082_k5.npz`: chạy `graphslm-build-three-tier-graph`.
-- Thiếu `hgt_flow_best.pt`: chạy `graphslm-train-hgt`.
+### OOM khi train HGT
+
+Đảm bảo đã chạy bước 9 (convert graph store) và config đặt:
+
+```yaml
+data:
+  source: graph_store
+  graph_store_root: data/graph_store_14gb
+```
+
+Train sẽ đọc từng chunk qua memory-mapped file — không load toàn bộ graph vào RAM.
 
 ### Ollama không phản hồi
-
-Kiểm tra Ollama server và model:
 
 ```powershell
 ollama list
@@ -827,7 +690,7 @@ Hoặc chạy runtime với `--no-worker` để bỏ qua slow path.
 
 ### Runtime chạy nhưng không có alert
 
-Kiểm tra `policy.benign_labels` và `policy.alert_labels` trong `configs/pipeline.example.yaml`. Mặc định chỉ cần cấu hình benign:
+Kiểm tra `policy.benign_labels` và `policy.alert_threshold` trong `configs/pipeline.example.yaml`:
 
 ```yaml
 policy:
@@ -836,42 +699,10 @@ policy:
     - Benign
 ```
 
-Nếu bật `alert_labels`, danh sách đó trở thành whitelist và phải khớp chính xác label trong checkpoint HGT.
-
-### OOM khi train HGT (graph quá lớn để load vào RAM)
-
-Dùng on-disk CSR store thay vì load NPZ trực tiếp. Chạy một lần:
-
-```powershell
-graphslm-convert-graph-store `
-  --graph-npz "data/processed/graph_artifact_3tier_t082_k5.npz" `
-  --graph-meta-json "data/processed/graph_artifact_3tier_t082_k5.meta.json" `
-  --output-root "data/graph_store_v1"
-```
-
-Sau đó trong config HGT đặt:
-
-```yaml
-data:
-  source: graph_store
-  graph_store_root: data/graph_store_v1
-train:
-  batch_mode: neighbor_sampling
-```
-
-Train sẽ đọc từng chunk qua mmap — không load toàn bộ graph.
-
 ### PowerShell không cho activate virtualenv
-
-Nếu gặp lỗi execution policy, mở PowerShell bằng quyền phù hợp và chạy:
 
 ```powershell
 Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
-```
-
-Sau đó activate lại:
-
-```powershell
 .\.venv\Scripts\Activate.ps1
 ```
 

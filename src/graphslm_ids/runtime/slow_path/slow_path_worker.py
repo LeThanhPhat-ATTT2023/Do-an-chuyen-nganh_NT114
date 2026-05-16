@@ -1,16 +1,16 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import queue as queue_module
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-from graphslm_ids.slow_path.context_hydrator import ContextHydrator
-from graphslm_ids.slow_path.evidence_builder import EvidenceBuilder, EvidenceBuilderConfig
-from graphslm_ids.slow_path.evidence_ranker import EvidenceRanker, RankerConfig
-from graphslm_ids.slow_path.fallback_template import render_minimal, render_template
-from graphslm_ids.slow_path.report_generator import ReportGenerationError, ReportGenerator
-from graphslm_ids.slow_path.report_validator import ReportValidator, ValidatorConfig
-from graphslm_ids.slow_path.types import SlowPathJob
+from graphslm_ids.runtime.slow_path.context_hydrator import ContextHydrator
+from graphslm_ids.runtime.slow_path.evidence_builder import EvidenceBuilder, EvidenceBuilderConfig
+from graphslm_ids.runtime.slow_path.evidence_ranker import EvidenceRanker, RankerConfig
+from graphslm_ids.runtime.slow_path.fallback_template import render_minimal, render_template
+from graphslm_ids.runtime.slow_path.report_generator import ReportGenerationError, ReportGenerator
+from graphslm_ids.runtime.slow_path.report_validator import ReportValidator, ValidatorConfig
+from graphslm_ids.runtime.slow_path.types import SlowPathJob
 
 
 @dataclass

@@ -1,10 +1,10 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import queue
 
 import numpy as np
 
-from graphslm_ids.fast_path import (
+from graphslm_ids.runtime.fast_path import (
     AlertDispatcher,
     FlowTracker,
     HotGraphBuffer,
@@ -16,7 +16,7 @@ from graphslm_ids.fast_path import (
     SubgraphBuilder,
 )
 from graphslm_ids.runtime import ColdStore, PipelineConfig
-from graphslm_ids.slow_path import HotBufferAdapter
+from graphslm_ids.runtime.slow_path import HotBufferAdapter
 
 
 def _mitre_index() -> MitreIndex:

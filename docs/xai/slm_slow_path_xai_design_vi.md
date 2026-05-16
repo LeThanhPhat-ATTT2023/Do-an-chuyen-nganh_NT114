@@ -1,4 +1,4 @@
-# Thiết Kế Chi Tiết SLM Slow Path — XAI Report Generation
+﻿# Thiết Kế Chi Tiết SLM Slow Path — XAI Report Generation
 
 > Cập nhật theo kiến trúc graph store thống nhất: Slow Path hiện ưu tiên hydrate
 > context từ `PersistentGraphStore` source of truth. Hot Buffer/ColdStore trong
@@ -135,10 +135,10 @@ annotation at scale.
 
 ## 3. Decomposition Module
 
-Các file cần implement cho Slow Path, đặt trong `src/graphslm_ids/slow_path/`:
+Các file cần implement cho Slow Path, đặt trong `src/graphslm_ids/runtime/slow_path/`:
 
 ```
-src/graphslm_ids/slow_path/
+src/graphslm_ids/runtime/slow_path/
 ├── __init__.py
 ├── context_hydrator.py        # Lấy dữ liệu từ Hot Buffer + Cold Store
 ├── evidence_builder.py        # Thuật toán build Evidence Bundle

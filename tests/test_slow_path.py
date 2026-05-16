@@ -1,8 +1,8 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import queue
 
-from graphslm_ids.slow_path import (
+from graphslm_ids.runtime.slow_path import (
     EvidenceBuilder,
     FlowContext,
     GraphContext,

@@ -1,4 +1,4 @@
-# Báo Cáo Chi Tiết: Trưng Cất Tri Thức 1D-CNN Cho Embedding Payload
+﻿# Báo Cáo Chi Tiết: Trưng Cất Tri Thức 1D-CNN Cho Embedding Payload
 
 **Dự án:** Context-Rich Explainable IDS — NT114  
 **Phạm vi:** Offline Training — Student 1D-CNN Distillation  
@@ -438,9 +438,9 @@ Quá trình trưng cất tri thức từ SecureBERT sang Student1DCNN cho kết 
 |---|---|
 | [README.md](../../README.md) | Kết quả baseline và pipeline tổng thể |
 | [src/graphslm_ids/models/student_cnn.py](../../src/graphslm_ids/models/student_cnn.py) | Định nghĩa kiến trúc Student1DCNN |
-| [src/graphslm_ids/offline_path/training/train_student_cnn.py](../../src/graphslm_ids/offline_path/training/train_student_cnn.py) | Script training với DDP, AMP, async checkpoint |
-| [src/graphslm_ids/offline_path/training/evaluate_student_cnn.py](../../src/graphslm_ids/offline_path/training/evaluate_student_cnn.py) | Đánh giá per-label, worst-case analysis |
-| [src/graphslm_ids/offline_path/training/export_student_onnx.py](../../src/graphslm_ids/offline_path/training/export_student_onnx.py) | Export sang ONNX opset 17 |
-| [src/graphslm_ids/offline_path/training/export_student_embeddings.py](../../src/graphslm_ids/offline_path/training/export_student_embeddings.py) | Bulk export embedding cho toàn dataset |
-| [src/graphslm_ids/fast_path/student_runtime.py](../../src/graphslm_ids/fast_path/student_runtime.py) | ONNX Runtime wrapper cho fast path |
-| [src/graphslm_ids/offline_path/preprocessing/build_teacher_targets.py](../../src/graphslm_ids/offline_path/preprocessing/build_teacher_targets.py) | Sinh teacher targets từ SecureBERT |
+| [src/graphslm_ids/offline/training/train_student_cnn.py](../../src/graphslm_ids/offline/training/train_student_cnn.py) | Script training với DDP, AMP, async checkpoint |
+| [src/graphslm_ids/offline/training/evaluate_student_cnn.py](../../src/graphslm_ids/offline/training/evaluate_student_cnn.py) | Đánh giá per-label, worst-case analysis |
+| [src/graphslm_ids/offline/training/export_student_onnx.py](../../src/graphslm_ids/offline/training/export_student_onnx.py) | Export sang ONNX opset 17 |
+| [src/graphslm_ids/offline/training/export_student_embeddings.py](../../src/graphslm_ids/offline/training/export_student_embeddings.py) | Bulk export embedding cho toàn dataset |
+| [src/graphslm_ids/runtime/fast_path/student_runtime.py](../../src/graphslm_ids/runtime/fast_path/student_runtime.py) | ONNX Runtime wrapper cho fast path |
+| [src/graphslm_ids/offline/preprocessing/build_teacher_targets.py](../../src/graphslm_ids/offline/preprocessing/build_teacher_targets.py) | Sinh teacher targets từ SecureBERT |

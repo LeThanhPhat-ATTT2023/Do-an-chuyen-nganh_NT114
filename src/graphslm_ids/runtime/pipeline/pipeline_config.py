@@ -1,12 +1,12 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from graphslm_ids.slow_path.report_generator import ReportGeneratorConfig
-from graphslm_ids.slow_path.report_validator import ValidatorConfig
-from graphslm_ids.slow_path.slow_path_worker import SlowPathConfig
+from graphslm_ids.runtime.slow_path.report_generator import ReportGeneratorConfig
+from graphslm_ids.runtime.slow_path.report_validator import ValidatorConfig
+from graphslm_ids.runtime.slow_path.slow_path_worker import SlowPathConfig
 from graphslm_ids.utils.io import read_yaml
 
 

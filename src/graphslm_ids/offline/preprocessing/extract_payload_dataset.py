@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import glob
@@ -7,12 +7,12 @@ from pathlib import Path
 
 import numpy as np
 
-from graphslm_ids.offline_path.preprocessing.pcap_payload_extractor import build_payload_dataset
-from graphslm_ids.offline_path.preprocessing.pcap_payload_extractor import stream_payload_dataset_to_disk
-from graphslm_ids.offline_path.preprocessing.pcap_payload_extractor import (
+from graphslm_ids.offline.preprocessing.pcap_payload_extractor import build_payload_dataset
+from graphslm_ids.offline.preprocessing.pcap_payload_extractor import stream_payload_dataset_to_disk
+from graphslm_ids.offline.preprocessing.pcap_payload_extractor import (
     stream_payload_dataset_to_disk_parallel,
 )
-from graphslm_ids.offline_path.preprocessing.graph_csv_builder import build_graph_csv_tables
+from graphslm_ids.offline.preprocessing.graph_csv_builder import build_graph_csv_tables
 from graphslm_ids.utils.io import ensure_dir, write_json
 
 

@@ -1,17 +1,18 @@
-"""Runtime orchestration for the fast-path to slow-path bridge."""
+"""Runtime package — fast-path detection, slow-path analysis, pipeline orchestration."""
 
-from graphslm_ids.runtime.cold_store import ColdStore
-from graphslm_ids.runtime.counterfactual import HGTCounterfactual
-from graphslm_ids.runtime.graph_store import PersistentGraphStore
-from graphslm_ids.runtime.pipeline_config import (
+from graphslm_ids.runtime.pipeline import (
+    ColdStore,
+    DetectionResult,
     FastPathCfg,
+    FastPathPipeline,
     GraphStoreCfg,
     HGTCfg,
+    HGTCounterfactual,
     HotGraphCfg,
     PipelineConfig,
+    PersistentGraphStore,
     PolicyCfg,
 )
-from graphslm_ids.runtime.runtime_pipeline import DetectionResult, FastPathPipeline
 
 __all__ = [
     "ColdStore",

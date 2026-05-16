@@ -1,12 +1,12 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import numpy as np
 import pytest
 
 pytest.importorskip("torch")
 
-from graphslm_ids.offline_path.training.hetero_graph_artifact import HeteroGraphArtifact
-from graphslm_ids.offline_path.training.neighbor_sampling import (
+from graphslm_ids.offline.training.hetero_graph_artifact import HeteroGraphArtifact
+from graphslm_ids.offline.training.neighbor_sampling import (
     HeteroNeighborSampler,
     InMemoryNeighborBackend,
 )

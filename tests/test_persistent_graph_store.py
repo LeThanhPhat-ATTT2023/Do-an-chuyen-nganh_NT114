@@ -1,12 +1,12 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import numpy as np
 
-from graphslm_ids.fast_path import HotGraphBuffer, MitreIndex, SubgraphBuilder
-from graphslm_ids.offline_path.training.hetero_graph_artifact import load_graph_store_artifact
+from graphslm_ids.runtime.fast_path import HotGraphBuffer, MitreIndex, SubgraphBuilder
+from graphslm_ids.offline.training.hetero_graph_artifact import load_graph_store_artifact
 from graphslm_ids.runtime import PersistentGraphStore
-from graphslm_ids.slow_path import HotBufferAdapter
-from graphslm_ids.slow_path.context_hydrator import ContextHydrator
+from graphslm_ids.runtime.slow_path import HotBufferAdapter
+from graphslm_ids.runtime.slow_path.context_hydrator import ContextHydrator
 
 
 def _mitre_index() -> MitreIndex:

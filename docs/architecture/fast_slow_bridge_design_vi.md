@@ -1,4 +1,4 @@
-# Thiết Kế Lớp Cầu Nối Fast Path ↔ Slow Path
+﻿# Thiết Kế Lớp Cầu Nối Fast Path ↔ Slow Path
 
 > Cập nhật theo `docs/unified_graph_growth_strategy_vi.md`: `ColdStore` trong tài
 > liệu này chỉ còn là fallback JSONL khi tắt `graph_store`. Runtime hiện tại dùng
@@ -7,7 +7,7 @@
 
 Tài liệu này đặc tả chi tiết lớp runtime nằm giữa **Fast Path** (online detection)
 và **Slow Path** (XAI report generation) đã được triển khai trong
-`src/graphslm_ids/slow_path/`. Mục tiêu là khép kín pipeline online: từ packet
+`src/graphslm_ids/runtime/slow_path/`. Mục tiêu là khép kín pipeline online: từ packet
 thô → HGT inference → quyết định alert → đẩy job sang Slow Path → Slow Path
 hydrate context và sinh báo cáo.
 
@@ -20,7 +20,7 @@ Phạm vi tài liệu:
 - Lộ trình implement và kiểm thử.
 
 Tài liệu này KHÔNG thay đổi thiết kế Slow Path đã chốt trong
-[slm_slow_path_xai_design_vi.md](slm_slow_path_xai_design_vi.md). Nó chỉ
+[slm_slow_path_xai_design_vi.md](../xai/slm_slow_path_xai_design_vi.md). Nó chỉ
 hiện thực hóa các giả định mà Slow Path đang dựa vào (Hot Buffer, ColdStore,
 counterfactual model, SlowPathJob).
 
@@ -31,7 +31,7 @@ counterfactual model, SlowPathJob).
 ### 1.1 Đã có
 
 ```text
-Offline pipeline (console scripts -> src/graphslm_ids/offline_path/):
+Offline pipeline (console scripts -> src/graphslm_ids/offline/):
   - extract_payload_dataset.py
   - build_teacher_targets.py
   - train_student_cnn.py
@@ -41,7 +41,7 @@ Offline pipeline (console scripts -> src/graphslm_ids/offline_path/):
   - build_three_tier_graph_artifact.py
   - train_hgt_flow_classifier.py
 
-Slow Path (src/graphslm_ids/slow_path/):
+Slow Path (src/graphslm_ids/runtime/slow_path/):
   - context_hydrator.py
   - evidence_builder.py / evidence_ranker.py / evidence_bundle.py
   - report_generator.py / report_validator.py / fallback_template.py
@@ -266,7 +266,7 @@ class MitreIndex:
 ### 3.5 `fast_path/hot_graph_buffer.py` ★
 
 **Trách nhiệm**: State trung tâm. Phải lộ ra **đúng** các attribute mà
-[hot_buffer_adapter.py](../src/graphslm_ids/slow_path/hot_buffer_adapter.py)
+[hot_buffer_adapter.py](../src/graphslm_ids/runtime/slow_path/hot_buffer_adapter.py)
 đang đọc, để Slow Path không phải sửa.
 
 #### 3.5.1 Hợp đồng attribute (bắt buộc)
@@ -301,7 +301,7 @@ class HotGraphBuffer:
 ```
 
 > Tham chiếu các tên alias mà adapter chấp nhận: xem
-> [hot_buffer_adapter.py](../src/graphslm_ids/slow_path/hot_buffer_adapter.py)
+> [hot_buffer_adapter.py](../src/graphslm_ids/runtime/slow_path/hot_buffer_adapter.py)
 > các hàm `_first_mapping(...)`. Tên trên là tên gốc đầu tiên — không cần alias.
 
 #### 3.5.2 Public methods
@@ -546,7 +546,7 @@ class AlertDispatcher:
 ```
 
 > `SlowPathJob` đã được định nghĩa trong
-> [types.py](../src/graphslm_ids/slow_path/types.py) — không thay đổi.
+> [types.py](../src/graphslm_ids/runtime/slow_path/types.py) — không thay đổi.
 
 ### 3.10 `runtime/cold_store.py`
 
@@ -582,7 +582,7 @@ class ColdStore:
 ```
 
 `load_context` mở lại dict và build `GraphContext` đúng schema mà
-[evidence_builder.py](../src/graphslm_ids/slow_path/evidence_builder.py) cần.
+[evidence_builder.py](../src/graphslm_ids/runtime/slow_path/evidence_builder.py) cần.
 
 ### 3.11 `runtime/counterfactual.py`
 
@@ -768,7 +768,7 @@ def main():
 
 ### 4.1 SlowPathJob (đã có, không đổi)
 
-Tham chiếu [types.py](../src/graphslm_ids/slow_path/types.py).
+Tham chiếu [types.py](../src/graphslm_ids/runtime/slow_path/types.py).
 
 ```text
 alert_id, flow_id, predicted_label, confidence,
@@ -779,8 +779,8 @@ timestamp, top_classes, alert_threshold, predicted_label_idx
 ### 4.2 GraphContext (Hot Buffer Adapter trả về)
 
 Tham chiếu
-[hot_buffer_adapter.py](../src/graphslm_ids/slow_path/hot_buffer_adapter.py)
-và [types.py](../src/graphslm_ids/slow_path/types.py). Buffer chỉ cần expose
+[hot_buffer_adapter.py](../src/graphslm_ids/runtime/slow_path/hot_buffer_adapter.py)
+và [types.py](../src/graphslm_ids/runtime/slow_path/types.py). Buffer chỉ cần expose
 đúng các attribute liệt kê ở Mục 3.5.1; Adapter đã handle cả mapping/method
 form (`get_flow`, `get_packets`).
 
@@ -877,7 +877,7 @@ def confidence_drops(snapshot, target_idx, orig_conf, attention):
 
 `EvidenceBuilder.__init__(counterfactual_model=...)` — cần kiểm interface
 hiện tại trong
-[evidence_builder.py](../src/graphslm_ids/slow_path/evidence_builder.py). Adapter:
+[evidence_builder.py](../src/graphslm_ids/runtime/slow_path/evidence_builder.py). Adapter:
 
 ```python
 class CounterfactualAdapter:
@@ -1002,9 +1002,9 @@ Tổng ~5 tuần solo.
 
 ## 12. Tham Chiếu
 
-- [slm_slow_path_xai_design_vi.md](slm_slow_path_xai_design_vi.md) — thiết kế Slow Path
+- [slm_slow_path_xai_design_vi.md](../xai/slm_slow_path_xai_design_vi.md) — thiết kế Slow Path
 - [streaming_hgt_runtime_v3_vi.md](streaming_hgt_runtime_v3_vi.md) — runtime architecture (NeutronRT incremental RTEC + RelGT centroids)
 - [system_execution_flows.md](system_execution_flows.md) — sơ đồ training & runtime tổng
-- [hot_buffer_adapter.py](../src/graphslm_ids/slow_path/hot_buffer_adapter.py) — alias attribute mà buffer phải lộ
+- [hot_buffer_adapter.py](../src/graphslm_ids/runtime/slow_path/hot_buffer_adapter.py) — alias attribute mà buffer phải lộ
 - [hgt.py](../src/graphslm_ids/models/hgt.py) — chữ ký `forward(return_attention=True)`
 - [pipeline.example.yaml](../configs/pipeline.example.yaml) — config baseline

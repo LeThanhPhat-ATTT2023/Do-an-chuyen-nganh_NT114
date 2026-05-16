@@ -1,8 +1,8 @@
-import json
+﻿import json
 
 import numpy as np
 
-from graphslm_ids.offline_path.training.hetero_graph_artifact import load_three_tier_graph_artifact
+from graphslm_ids.offline.training.hetero_graph_artifact import load_three_tier_graph_artifact
 
 
 def test_load_three_tier_graph_artifact_adds_reverse_edges(tmp_path) -> None:

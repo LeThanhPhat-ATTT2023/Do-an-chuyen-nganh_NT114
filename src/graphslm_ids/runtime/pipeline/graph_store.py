@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
@@ -11,8 +11,8 @@ from typing import Any, Iterator
 
 import numpy as np
 
-from graphslm_ids.slow_path.hot_buffer_adapter import HotBufferAdapter
-from graphslm_ids.slow_path.types import GraphContext
+from graphslm_ids.runtime.slow_path.hot_buffer_adapter import HotBufferAdapter
+from graphslm_ids.runtime.slow_path.types import GraphContext
 from graphslm_ids.utils.io import read_json
 
 

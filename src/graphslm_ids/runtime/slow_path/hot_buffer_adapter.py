@@ -1,10 +1,10 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import binascii
 import math
 from typing import Any, Iterable, Mapping, Sequence
 
-from graphslm_ids.slow_path.types import FlowContext, GraphContext, MitreMetadata, PacketContext
+from graphslm_ids.runtime.slow_path.types import FlowContext, GraphContext, MitreMetadata, PacketContext
 
 
 class HotBufferAdapter:
