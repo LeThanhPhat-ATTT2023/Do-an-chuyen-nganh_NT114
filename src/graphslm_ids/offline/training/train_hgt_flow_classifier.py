@@ -1170,6 +1170,13 @@ def train_neighbor_sampling(
                 T_max=int(config["train"]["epochs"]),
                 eta_min=float(config["train"].get("scheduler_eta_min", 1e-5)),
             )
+    # GradScaler calls optimizer.step() internally, so PyTorch's order check
+    # (which uses optimizer._step_count, absent on AdamW) is a false positive.
+    warnings.filterwarnings(
+        "ignore",
+        message="Detected call of `lr_scheduler.step\\(\\)` before `optimizer.step\\(\\)`",
+        category=UserWarning,
+    )
     weight = None
     if str(config["train"]["class_weight"]).lower() == "balanced":
         weight = class_weights_from_backend(backend, train_idx_np, num_classes).to(device)
