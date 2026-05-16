@@ -171,13 +171,25 @@ class HGTLayer(nn.Module):
 
         next_x: dict[str, torch.Tensor] = {}
         for node_type, x in x_dict.items():
-            # Cast aggregated back to input dtype (float16 in AMP) before the
-            # output linear projection so autocast routes it through fp16 kernels.
-            message = aggregated[node_type].reshape(x.shape[0], self.hidden_dim).to(x.dtype)
-            attended = self.out[node_type](message)
-            h = self.norm_attn[node_type](x + self.dropout(attended))
-            h = self.norm_ffn[node_type](h + self.dropout(self.ffn[node_type](h)))
-            next_x[node_type] = h
+            # Run the post-aggregation path (out projection + residual norms + FFN)
+            # in float32 even under AMP. aggregated is already float32; we cast x up
+            # rather than casting aggregated down, because:
+            # - float16 matmul of shape (N, hidden) × (hidden, hidden) accumulates
+            #   hidden products per output element; for hidden≥128 this overflows when
+            #   residual magnitudes drift over ~50 across 4+ layers.
+            # - activation_checkpointing recomputes this path in backward; any float16
+            #   overflow that wasn't inf in the original forward can become NaN in the
+            #   recompute, producing silent gradient corruption.
+            # Parameters are stored float32 by default under AMP (AMP only changes
+            # compute dtype, not storage), so autocast(enabled=False) is safe here.
+            message = aggregated[node_type].reshape(x.shape[0], self.hidden_dim)  # float32
+            x_fp32 = x.float()
+            with torch.amp.autocast("cuda", enabled=False):
+                attended = self.out[node_type](message)
+                h = self.norm_attn[node_type](x_fp32 + self.dropout(attended))
+                h = self.norm_ffn[node_type](h + self.dropout(self.ffn[node_type](h)))
+            # Cast back to input dtype so the next layer's autocast context applies correctly.
+            next_x[node_type] = h.to(x.dtype)
         if return_attention:
             return next_x, attention_dict
         return next_x

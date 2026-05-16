@@ -30,7 +30,7 @@ model:
   hidden_dim: 256
   num_layers: 6
   num_heads: 8
-  dropout: 0.1
+  dropout: 0.15
   ffn_multiplier: 2
 
 train:
@@ -39,11 +39,11 @@ train:
   batch_mode: neighbor_sampling
   batch_seed_flows: 128
   grad_accum_steps: 4
-  lr: 0.0001
+  lr: 0.00005
   weight_decay: 0.00005
-  grad_clip_norm: 1.0
+  grad_clip_norm: 0.5
   scheduler: onecycle
-  scheduler_pct_start: 0.1
+  scheduler_pct_start: 0.2
   val_ratio: 0.1
   test_ratio: 0.1
   patience: 30
