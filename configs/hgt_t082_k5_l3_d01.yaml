@@ -1,42 +1,118 @@
+# NT114 Proposed IDS-HGT — synthesized from 6 paper-variant analyses.
+#
+# Design rationale (per-axis):
+#
+#   num_layers=4:
+#     The 3-tier graph has a natural 3-hop path (flow→packet→technique→tactic).
+#     one2/xgnid show 1 layer is insufficient. relgt/ahgt show 3 layers covers
+#     the hierarchy. We add 1 more layer for global context without the cost and
+#     overfitting risk of gatransformer's 6 layers.
+#
+#   hidden_dim=256, num_heads=8 → head_dim=32:
+#     relgt uses 8 heads but hidden=128 → head_dim=16 (too small per head).
+#     gatransformer uses 256 hidden / 8 heads → head_dim=32 (stable gradient
+#     norm, no overflow). ahgt/dlg use 4 heads, which under-represents the 5
+#     distinct edge-type relations in the graph. head_dim=32 matches the sweet
+#     spot validated by gatransformer without its depth overhead.
+#
+#   ffn_multiplier=4:
+#     All 6 paper variants use 2×, which is half the standard Transformer FFN
+#     ratio. Upgrading to 4× (256→1024→256) gives more expressive non-linearity
+#     at negligible VRAM cost under neighbor sampling; it is the single largest
+#     capacity gap between our baseline and standard Transformer design.
+#
+#   dropout=0.15:
+#     ahgt-dfd insight: the model should resist catastrophic forgetting across
+#     time windows (higher dropout). 0.15 is between dlg/relgt (0.1) and the
+#     higher values used in large Transformer models. Prevents overfitting on
+#     imbalanced IDS data where majority-class patterns dominate.
+#
+#   class_weight_cap=15.0:
+#     Uncapped balanced weights reach 44.5× for class 10 (2 604 samples) on
+#     this dataset, causing loss spikes →600 that overflow float16 gradients.
+#     15.0 retains 15× emphasis on rare attack classes while keeping the
+#     worst-case loss under ~40 — safely scalable to larger imbalanced datasets.
+#
+#   lr=0.0002, pct_start=0.15, grad_accum_steps=4 (small dataset):
+#     Effective batch = 128 seeds × 4 accum = 512. A deeper model (4 layers)
+#     needs a lower peak LR than the 1–3 layer variants to avoid early
+#     instability. 0.0002 is between relgt (0.0003) and gatransformer (0.00005).
+#     pct_start=0.15 gives a 30-epoch warmup at 200 epochs — enough for the
+#     relation_prior parameters (unconstrained scalars) to reach stable values.
+#
+# ── Large-dataset notes (500 GB – 1 TB raw PCAP) ────────────────────────────
+#   When scaling to large datasets, override these fields:
+#
+#     train:
+#       epochs: 20                  # large dataset = many more steps/epoch
+#       patience: 5
+#       batch_seed_flows: 256       # larger batch per GPU
+#       grad_accum_steps: 2         # effective batch 512 still
+#
+#     dataloader:
+#       num_workers: 8              # HPC has many CPU cores
+#       prefetch_factor: 4
+#       persistent_workers: true
+#
+#     sampler:
+#       always_include_all_techniques: false   # too many nodes in large graph
+#
+#   The model architecture (layers/hidden/heads/ffn) does NOT change — neighbor
+#   sampling loads the same subgraph size regardless of total graph scale.
+
+experiment:
+  source_name: "NT114 Proposed IDS-HGT (4-layer synthesis)"
+  rationale: >
+    Synthesizes the key architectural insights from all 6 paper variants:
+    adequate depth (4 layers, vs. 1–6 in comparisons), rich multi-head
+    attention (8 heads / head_dim=32), standard FFN ratio (4×, vs. 2× in all
+    comparisons), and conservative training schedule tuned for class-imbalanced
+    IDS data. Serves as the proposed model contribution in the NT114 Q1 paper.
+
 data:
+  source: graph_store
   graph_npz: data/processed/graph_artifact_3tier_t082_k5.npz
   graph_meta_json: data/processed/graph_artifact_3tier_t082_k5.meta.json
+  graph_store_root: data/graph_store_v1
+  read_sealed_only: true
   packet_feature: semantic
   add_reverse_edges: true
   standardize_flow_features: true
   use_semantic_edge_weights: true
 
 model:
-  hidden_dim: 128
-  num_layers: 3
-  num_heads: 4
-  dropout: 0.1
-  ffn_multiplier: 2
+  hidden_dim: 256
+  num_layers: 4
+  num_heads: 8
+  dropout: 0.15
+  ffn_multiplier: 4
 
 train:
-  output_dir: outputs/hgt_flow_classifier_t082_k5_l3_d01
+  output_dir: outputs/nt114_proposed_l4_h256_h8
   epochs: 200
   batch_mode: neighbor_sampling
-  batch_seed_flows: 256
-  grad_accum_steps: 2
-  lr: 0.001
-  weight_decay: 0.00005
-  grad_clip_norm: 1.0
+  batch_seed_flows: 128
+  grad_accum_steps: 4
+  lr: 0.0002
+  weight_decay: 0.0001
+  grad_clip_norm: 0.5
   scheduler: onecycle
-  scheduler_pct_start: 0.05
+  scheduler_pct_start: 0.15
   val_ratio: 0.1
   test_ratio: 0.1
   patience: 30
   class_weight: balanced
+  class_weight_cap: 15.0
   seed: 42
   device: cuda
-  amp: true
-  activation_checkpointing: false
   monitor: val_macro_f1
   log_every: 1
+  amp: true
+  amp_dtype: bfloat16
+  activation_checkpointing: true
 
 sampler:
-  hops: 3
+  hops: 4
   fanouts:
     flow__contains__packet: 20
     packet__next_packet__packet: 4
@@ -49,10 +125,14 @@ sampler:
     rev_matches_technique: 0
     rev_belongs_to_tactic: 0
   always_include_all_tactics: true
-  always_include_all_techniques: true
+  always_include_all_techniques: true   # set false for large datasets (>10K techniques)
 
 dataloader:
-  num_workers: 2
-  prefetch_factor: 4
+  num_workers: 2          # increase to 8 on HPC server
+  prefetch_factor: 2      # increase to 4 on HPC server
   pin_memory: true
   persistent_workers: true
+
+wandb:
+  project: nt114-hgt-paper-variants
+  run_name: proposed_l4_h256_h8
