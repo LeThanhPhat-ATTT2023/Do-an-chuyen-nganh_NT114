@@ -114,12 +114,14 @@ class HGTLayer(nn.Module):
         edge_weight_dict: dict[EdgeKey, torch.Tensor] | None = None,
         return_attention: bool = False,
     ) -> dict[str, torch.Tensor] | tuple[dict[str, torch.Tensor], dict[EdgeKey, torch.Tensor]]:
+        # Accumulate in float32: float16 scatter_add_ across many edges overflows
+        # for large hidden dims (avg_packet_nodes ~450 with head_dim=32).
         aggregated: dict[str, torch.Tensor] = {
             node_type: torch.zeros(
                 x.shape[0],
                 self.num_heads,
                 self.head_dim,
-                dtype=x.dtype,
+                dtype=torch.float32,
                 device=x.device,
             )
             for node_type, x in x_dict.items()
@@ -138,27 +140,29 @@ class HGTLayer(nn.Module):
 
             src_x = x_dict[src_type]
             dst_x = x_dict[dst_type]
-            q = self.query[dst_type](dst_x[dst_index]).view(-1, self.num_heads, self.head_dim)
+            # Cast q/k/v to float32 before the dot-product: (q*k).sum() accumulates
+            # head_dim products in float16, which overflows for head_dim=32 when
+            # linear-layer outputs exceed ~10 per element (sum ~3200 * relation_prior).
+            q = self.query[dst_type](dst_x[dst_index]).view(-1, self.num_heads, self.head_dim).float()
             k = self.key[src_type](src_x[src_index])
             v = self.value[src_type](src_x[src_index])
 
-            k = self.relation_key[relation_name](k).view(-1, self.num_heads, self.head_dim)
-            v = self.relation_value[relation_name](v).view(-1, self.num_heads, self.head_dim)
+            k = self.relation_key[relation_name](k).view(-1, self.num_heads, self.head_dim).float()
+            v = self.relation_value[relation_name](v).view(-1, self.num_heads, self.head_dim).float()
 
             scores = (q * k).sum(dim=-1) / math.sqrt(self.head_dim)
             # Clamp relation_prior to prevent unbounded growth (no weight decay applied
-            # to ParameterDict entries) from scaling scores beyond float16 range.
-            relation_prior = self.relation_prior[relation_name].clamp(-10.0, 10.0)
+            # to ParameterDict entries) from scaling scores beyond safe range.
+            relation_prior = self.relation_prior[relation_name].float().clamp(-10.0, 10.0)
             scores = scores * relation_prior.view(1, self.num_heads)
             if edge_weight_dict is not None and edge_type in edge_weight_dict:
-                edge_weight = edge_weight_dict[edge_type].to(dtype=scores.dtype, device=scores.device)
+                edge_weight = edge_weight_dict[edge_type].float().to(device=scores.device)
                 if edge_weight.ndim == 2:
                     edge_weight = edge_weight[:, 0]
-                # Clamp both sides: lower bound avoids -inf, upper bound prevents
-                # large positive log values from causing overflow in float16.
                 scores = scores + edge_weight.clamp(1e-6, 1e6).log().view(-1, 1)
+            # scores is float32; _edge_softmax_by_dst also computes in float32.
             attn = _edge_softmax_by_dst(scores, dst_index, int(dst_x.shape[0]))
-            messages = attn.unsqueeze(-1) * v
+            messages = attn.unsqueeze(-1) * v  # float32 * float32 = float32
             if return_attention:
                 attention_dict[edge_type] = attn.detach().mean(dim=1)
 
@@ -167,7 +171,9 @@ class HGTLayer(nn.Module):
 
         next_x: dict[str, torch.Tensor] = {}
         for node_type, x in x_dict.items():
-            message = aggregated[node_type].reshape(x.shape[0], self.hidden_dim)
+            # Cast aggregated back to input dtype (float16 in AMP) before the
+            # output linear projection so autocast routes it through fp16 kernels.
+            message = aggregated[node_type].reshape(x.shape[0], self.hidden_dim).to(x.dtype)
             attended = self.out[node_type](message)
             h = self.norm_attn[node_type](x + self.dropout(attended))
             h = self.norm_ffn[node_type](h + self.dropout(self.ffn[node_type](h)))
