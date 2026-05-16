@@ -37,8 +37,9 @@ train:
   batch_mode: neighbor_sampling
   batch_seed_flows: 128
   grad_accum_steps: 1
-  lr: 0.01
+  lr: 0.001
   weight_decay: 0.00005
+  grad_clip_norm: 1.0
   scheduler: none
   val_ratio: 0.1
   test_ratio: 0.1
