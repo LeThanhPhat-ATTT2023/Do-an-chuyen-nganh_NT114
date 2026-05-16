@@ -1296,10 +1296,11 @@ def train_neighbor_sampling(
                 if grad_clip_norm > 0.0:
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                _scale_before = scaler.get_scale()
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
-                if scheduler is not None:
+                if scheduler is not None and scaler.get_scale() >= _scale_before:
                     scheduler.step()
                 pending_step = False
             step += 1
@@ -1328,10 +1329,11 @@ def train_neighbor_sampling(
             if grad_clip_norm > 0.0:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+            _scale_before = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
-            if scheduler is not None:
+            if scheduler is not None and scaler.get_scale() >= _scale_before:
                 scheduler.step()
 
         # All-reduce train metrics so every rank reports the global epoch view.
