@@ -54,7 +54,12 @@ train:
   monitor: val_macro_f1
   log_every: 1
   amp: true
+  amp_dtype: bfloat16
+  class_weight_cap: 20.0
   activation_checkpointing: true
+
+wandb:
+  project: nt114-hgt-paper-variants
 
 sampler:
   hops: 3

@@ -107,6 +107,65 @@ DEFAULT_CONFIG: dict[str, Any] = {
 }
 
 
+def resolve_amp_dtype(config: dict) -> torch.dtype:
+    """Return bfloat16 if requested AND natively supported by the GPU, else float16.
+
+    Kaggle T4/P100 do not support bfloat16 natively, so this falls back to
+    float16 automatically — the same config YAML runs on both Kaggle and A100+.
+    """
+    cfg = str(config["train"].get("amp_dtype", "float16")).lower()
+    if cfg == "bfloat16" and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float16
+
+
+def _wandb_init(config: dict, rank: int) -> bool:
+    """Initialize a W&B run on rank-0. Returns True if active, False if skipped."""
+    if rank != 0:
+        return False
+    wcfg = config.get("wandb", {}) or {}
+    if not wcfg.get("project"):
+        return False
+    try:
+        import wandb  # optional dependency
+        run_name = wcfg.get("run_name") or (config.get("experiment") or {}).get("source_name")
+        wandb.init(
+            project=wcfg["project"],
+            entity=wcfg.get("entity") or None,
+            name=run_name or None,
+            config=config,
+            resume="allow",
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _wandb_log(entry: dict, use_wandb: bool) -> None:
+    if not use_wandb:
+        return
+    try:
+        import wandb
+        flat: dict = {"epoch": entry["epoch"]}
+        for split in ("train", "val"):
+            for k, v in (entry.get(split) or {}).items():
+                if isinstance(v, (int, float)):
+                    flat[f"{split}/{k}"] = v
+        wandb.log(flat, step=entry["epoch"])
+    except Exception:
+        pass
+
+
+def _wandb_finish(use_wandb: bool) -> None:
+    if not use_wandb:
+        return
+    try:
+        import wandb
+        wandb.finish()
+    except Exception:
+        pass
+
+
 def _auto_dataloader_workers(num_workers_arg: int, n_gpus: int) -> int:
     """Resolve num_workers='-1' (auto) to a sensible CPU-count-based value.
 
@@ -393,6 +452,8 @@ def _multi_gpu_train_step(
         seed_logits = logits[sm].float()
         w = weight.to(device) if weight is not None else None
         loss = F.cross_entropy(seed_logits, sl, weight=w)
+        if not torch.isfinite(loss):
+            continue
         gpu_losses.append(loss)
         preds.append(seed_logits.detach().argmax(dim=1).cpu().numpy())
         labels_out.append(sl.detach().cpu().numpy())
@@ -401,8 +462,9 @@ def _multi_gpu_train_step(
         examples += batch_n
 
     # Gather losses to primary device, scale by 1/(n_gpus * grad_accum), backward
-    avg_loss = sum(lv.to(primary) for lv in gpu_losses) / (n * grad_accum_steps)
-    scaler.scale(avg_loss).backward()
+    if gpu_losses:
+        avg_loss = sum(lv.to(primary) for lv in gpu_losses) / (n * grad_accum_steps)
+        scaler.scale(avg_loss).backward()
 
     # Aggregate replica gradients to the original model's parameters.
     # Use torch._foreach_add_ to fuse the per-parameter loops into a single
@@ -591,15 +653,21 @@ def class_weights_from_backend(
     backend: NeighborBackend,
     train_idx: np.ndarray,
     num_classes: int,
+    max_weight: float = float("inf"),
 ) -> torch.Tensor:
     manifest_weights = (backend.manifest or {}).get("class_weights")
     if isinstance(manifest_weights, list) and len(manifest_weights) >= num_classes:
-        return torch.tensor(manifest_weights[:num_classes], dtype=torch.float32)
+        weights = np.array(manifest_weights[:num_classes], dtype=np.float32)
+        if max_weight < float("inf"):
+            weights = np.minimum(weights, max_weight)
+        return torch.from_numpy(weights)
     labels = backend.get_flow_labels(np.asarray(train_idx, dtype=np.int64))
     counts = np.bincount(labels, minlength=num_classes).astype(np.float32)
     weights = np.zeros(num_classes, dtype=np.float32)
     nonzero = counts > 0
     weights[nonzero] = counts[nonzero].sum() / (float(num_classes) * counts[nonzero])
+    if max_weight < float("inf"):
+        weights = np.minimum(weights, max_weight)
     return torch.from_numpy(weights)
 
 
@@ -813,6 +881,7 @@ def _multi_gpu_eval_step(
     edge_types: list[tuple[str, str, str]],
     use_semantic_edge_weights: bool,
     use_amp: bool,
+    amp_dtype: torch.dtype = torch.float16,
 ) -> tuple[float, list[np.ndarray], list[np.ndarray]]:
     """Forward replicas across GPUs in parallel; no backward, no grad."""
     import torch.nn.parallel as P
@@ -833,7 +902,7 @@ def _multi_gpu_eval_step(
         masks.append(sm)
         all_labels.append(sl)
 
-    with torch.amp.autocast("cuda", enabled=use_amp):
+    with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
         all_logits = P.parallel_apply(replicas, inputs_args, inputs_kwargs)
 
     loss_sum_f = 0.0
@@ -855,6 +924,7 @@ def evaluate_neighbor_sampling(
     edge_types: list[tuple[str, str, str]],
     device: torch.device,
     use_amp: bool,
+    amp_dtype: torch.dtype = torch.float16,
     use_semantic_edge_weights: bool,
     num_classes: int,
     label_names: dict[int, str],
@@ -893,7 +963,7 @@ def evaluate_neighbor_sampling(
                 node_features, edge_index, edge_weight, seed_mask, seed_labels = to_torch_batch(
                     batch, edge_types, device, use_semantic_edge_weights,
                 )
-                with torch.amp.autocast("cuda", enabled=use_amp):
+                with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
                     logits = model(node_features, edge_index, edge_weight_dict=edge_weight)
                     seed_logits = logits[seed_mask]
                     loss = F.cross_entropy(seed_logits.float(), seed_labels, reduction="sum")
@@ -935,7 +1005,7 @@ def evaluate_neighbor_sampling(
                 if len(batch_group) > 1:
                     ls, bp, bl = _multi_gpu_eval_step(
                         model, batch_group, devices, edge_types,
-                        use_semantic_edge_weights, use_amp,
+                        use_semantic_edge_weights, use_amp, amp_dtype,
                     )
                     loss_sum += ls
                     preds.extend(bp)
@@ -973,7 +1043,7 @@ def evaluate_neighbor_sampling(
                     device,
                     use_semantic_edge_weights,
                 )
-                with torch.amp.autocast("cuda", enabled=use_amp):
+                with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
                     logits = model(node_features, edge_index, edge_weight_dict=edge_weight)
                     seed_logits = logits[seed_mask]
                     loss = F.cross_entropy(seed_logits.float(), seed_labels, reduction="sum")
@@ -1179,7 +1249,8 @@ def train_neighbor_sampling(
     )
     weight = None
     if str(config["train"]["class_weight"]).lower() == "balanced":
-        weight = class_weights_from_backend(backend, train_idx_np, num_classes).to(device)
+        _max_w = float(config["train"].get("class_weight_cap", float("inf")))
+        weight = class_weights_from_backend(backend, train_idx_np, num_classes, max_weight=_max_w).to(device)
 
     output_dir = ensure_dir(Path(config["train"]["output_dir"])) if rank == 0 else Path(config["train"]["output_dir"])
     best_checkpoint = output_dir / "hgt_flow_best.pt"
@@ -1187,7 +1258,14 @@ def train_neighbor_sampling(
     monitor = str(config["train"]["monitor"])
     log_every = max(1, int(config["train"]["log_every"]))
     use_amp = bool(config["train"].get("amp", False)) and device.type == "cuda"
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    amp_dtype = resolve_amp_dtype(config)
+    # init_scale=2**12 instead of the default 2**16: with max class_weight=10 the
+    # worst-case loss is ~10*log(13)≈26; at 65536 that gives scaled_loss≈1.7M which
+    # overflows float16 gradients in 6-layer models before the scaler can adapt.
+    # BF16 has FP32 range so it never overflows, but GradScaler is kept for FP16
+    # compatibility; it auto-grows the scale and is a no-op when disabled.
+    scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and amp_dtype == torch.float16), init_scale=2**12)
+    use_wandb = _wandb_init(config, rank)
     grad_accum_steps = max(1, int(config["train"].get("grad_accum_steps", 1)))
     grad_clip_norm = float(config["train"].get("grad_clip_norm", 0.0))
     use_semantic_edge_weights = bool(config["data"]["use_semantic_edge_weights"])
@@ -1273,14 +1351,15 @@ def train_neighbor_sampling(
                     if is_ddp and (step + 1) % grad_accum_steps != 0
                     else _nullcontext()
                 )
-                with sync_ctx, torch.amp.autocast("cuda", enabled=use_amp):
+                with sync_ctx, torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
                     logits = model(nf, ei, edge_weight_dict=ew)
                     seed_logits = logits[sm]
                     loss = F.cross_entropy(seed_logits, sl, weight=weight)
-                    scaled_loss = loss / grad_accum_steps
-                scaler.scale(scaled_loss).backward()
                 batch_count = int(sl.numel())
-                loss_val = float(loss.detach().item())
+                _loss_ok = bool(torch.isfinite(loss).item())
+                if _loss_ok:
+                    scaler.scale(loss / grad_accum_steps).backward()
+                loss_val = float(loss.detach().item()) if _loss_ok else float("nan")
                 if step == 0 and epoch == 1 and rank == 0:
                     n_seeds_in_mask = int(sm.sum().item())
                     print(
@@ -1289,8 +1368,9 @@ def train_neighbor_sampling(
                         f"logits_shape={tuple(seed_logits.shape)}",
                         flush=True,
                     )
-                train_loss_sum_t += loss_val * batch_count
-                train_examples_t += batch_count
+                if _loss_ok:
+                    train_loss_sum_t += loss_val * batch_count
+                    train_examples_t += batch_count
                 pred = seed_logits.detach().float().argmax(dim=1)
                 train_counts.add_(_per_class_counts_tensor(pred, sl, num_classes))
                 for node_type, count in batch.stats.get("nodes", {}).items():
@@ -1362,6 +1442,7 @@ def train_neighbor_sampling(
             edge_types=edge_types,
             device=device,
             use_amp=use_amp,
+            amp_dtype=amp_dtype,
             use_semantic_edge_weights=use_semantic_edge_weights,
             num_classes=num_classes,
             label_names=label_names,
@@ -1388,6 +1469,7 @@ def train_neighbor_sampling(
             },
         }
         history.append(entry)
+        _wandb_log(entry, use_wandb)
 
         monitor_score = float(val_metrics["macro_f1"] if monitor == "val_macro_f1" else -val_metrics["loss"])
         if monitor_score > best_score:
@@ -1464,6 +1546,7 @@ def train_neighbor_sampling(
             edge_types=edge_types,
             device=device,
             use_amp=use_amp,
+            amp_dtype=amp_dtype,
             use_semantic_edge_weights=use_semantic_edge_weights,
             num_classes=num_classes,
             label_names=label_names,
@@ -1499,6 +1582,7 @@ def train_neighbor_sampling(
         write_json(output_dir / "training_summary.json", summary)
         print(f"[OK] Best checkpoint: {best_checkpoint}")
         print(f"[OK] Training summary: {output_dir / 'training_summary.json'}")
+    _wandb_finish(use_wandb)
 
 
 def load_checkpoint(path: Path, device: torch.device) -> dict[str, Any]:
