@@ -31,20 +31,24 @@ model:
 
 train:
   output_dir: outputs/hgt_paper_variants/xgnid_dual_modal_l1_h32_h4
-  epochs: 200
+  epochs: 30
   batch_mode: neighbor_sampling
   batch_seed_flows: 70
   grad_accum_steps: 1
   lr: 0.001
   weight_decay: 0.00005
+  scheduler: onecycle
+  scheduler_pct_start: 0.05
   val_ratio: 0.1
   test_ratio: 0.1
-  patience: 15
+  patience: 10
   class_weight: balanced
   seed: 42
   device: cuda
   monitor: val_macro_f1
   log_every: 1
+  amp: true
+  activation_checkpointing: false
 
 sampler:
   hops: 1

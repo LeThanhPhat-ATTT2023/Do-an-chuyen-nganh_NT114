@@ -1163,6 +1163,15 @@ def train_neighbor_sampling(
     num_classes = int(labels_np.max()) + 1
     train_idx_np, val_idx_np, test_idx_np = backend_splits(backend, labels_np, config, seed)
 
+    max_train_flows = int(config["train"].get("max_train_flows", 0))
+    if max_train_flows > 0 and int(train_idx_np.shape[0]) > max_train_flows:
+        rng_sub = np.random.default_rng(seed + rank)
+        perm = rng_sub.permutation(train_idx_np.shape[0])
+        full_n = int(train_idx_np.shape[0])
+        train_idx_np = train_idx_np[perm[:max_train_flows]]
+        if rank == 0:
+            print(f"[subsample] Train: {max_train_flows:,} / {full_n:,} flows.", flush=True)
+
     flow_feature_stats: dict[str, list[float]] | None = None
     if bool(config["data"]["standardize_flow_features"]):
         manifest_stats = (backend.manifest or {}).get("flow_feature_stats")
@@ -1265,6 +1274,12 @@ def train_neighbor_sampling(
             steps_per_epoch=len(train_loader),
             epochs=int(config["train"]["epochs"]),
             pct_start=float(config["train"].get("scheduler_pct_start", 0.05)),
+        )
+    elif _scheduler_type in {"cosine_annealing", "cosine"}:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=int(config["train"]["epochs"]),
+            eta_min=float(config["train"].get("scheduler_eta_min", 1e-5)),
         )
     weight = None
     if str(config["train"]["class_weight"]).lower() == "balanced":
@@ -1645,6 +1660,14 @@ def main() -> None:
         seed=seed,
     )
 
+    max_train_flows_fb = int(config["train"].get("max_train_flows", 0))
+    if max_train_flows_fb > 0 and int(train_idx_np.shape[0]) > max_train_flows_fb:
+        rng_sub_fb = np.random.default_rng(seed)
+        perm_fb = rng_sub_fb.permutation(train_idx_np.shape[0])
+        full_n_fb = int(train_idx_np.shape[0])
+        train_idx_np = train_idx_np[perm_fb[:max_train_flows_fb]]
+        print(f"[subsample] Train: {max_train_flows_fb:,} / {full_n_fb:,} flows.", flush=True)
+
     flow_feature_stats: dict[str, list[float]] | None = None
     if bool(config["data"]["standardize_flow_features"]):
         artifact.node_features["flow"], flow_feature_stats = standardize_flow_features(
@@ -1697,6 +1720,12 @@ def main() -> None:
             steps_per_epoch=1,
             epochs=int(config["train"]["epochs"]),
             pct_start=float(config["train"].get("scheduler_pct_start", 0.05)),
+        )
+    elif _scheduler_type_fb in {"cosine_annealing", "cosine"}:
+        scheduler_fb = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=int(config["train"]["epochs"]),
+            eta_min=float(config["train"].get("scheduler_eta_min", 1e-5)),
         )
 
     weight = None
