@@ -16,14 +16,42 @@ model:
 train:
   output_dir: outputs/hgt_flow_classifier_t082_k5_l3_d01
   epochs: 200
-  batch_mode: full
+  batch_mode: neighbor_sampling
+  batch_seed_flows: 256
+  grad_accum_steps: 2
   lr: 0.001
   weight_decay: 0.00005
+  scheduler: onecycle
+  scheduler_pct_start: 0.05
   val_ratio: 0.1
   test_ratio: 0.1
   patience: 30
   class_weight: balanced
   seed: 42
-  device: cpu
+  device: cuda
+  amp: true
+  activation_checkpointing: false
   monitor: val_macro_f1
   log_every: 1
+
+sampler:
+  hops: 3
+  fanouts:
+    flow__contains__packet: 20
+    packet__next_packet__packet: 4
+    packet__matches_technique__technique: 5
+    flow__matches_technique__technique: 5
+    technique__belongs_to_tactic__tactic: 1
+  reverse_fanouts:
+    rev_contains: 1
+    rev_next_packet: 1
+    rev_matches_technique: 0
+    rev_belongs_to_tactic: 0
+  always_include_all_tactics: true
+  always_include_all_techniques: true
+
+dataloader:
+  num_workers: 2
+  prefetch_factor: 4
+  pin_memory: true
+  persistent_workers: true
