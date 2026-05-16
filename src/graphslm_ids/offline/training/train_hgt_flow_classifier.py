@@ -1264,6 +1264,9 @@ def train_neighbor_sampling(
     # overflows float16 gradients in 6-layer models before the scaler can adapt.
     # BF16 has FP32 range so it never overflows, but GradScaler is kept for FP16
     # compatibility; it auto-grows the scale and is a no-op when disabled.
+    # GradScaler is enabled only for float16 (bfloat16 has float32 range so no
+    # overflow scaling needed). However we still need non-finite gradient
+    # detection for bfloat16 — that is handled by _grads_finite() below.
     scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and amp_dtype == torch.float16), init_scale=2**12)
     use_wandb = _wandb_init(config, rank)
     grad_accum_steps = max(1, int(config["train"].get("grad_accum_steps", 1)))
@@ -1298,8 +1301,11 @@ def train_neighbor_sampling(
         train_loss_sum_t = torch.zeros(1, dtype=torch.float64, device=device)
         train_examples_t = torch.zeros(1, dtype=torch.int64, device=device)
         pending_step = False
-        sampled_nodes: dict[str, list[int]] = {"flow": [], "packet": [], "technique": [], "tactic": []}
-        sampled_edges: dict[str, list[int]] = {}
+        # Running sums avoid building O(N_batches) Python lists and calling np.mean at epoch end.
+        sampled_node_sum: dict[str, int] = {}
+        sampled_node_cnt: dict[str, int] = {}
+        sampled_edge_sum: dict[str, int] = {}
+        sampled_edge_cnt: dict[str, int] = {}
 
         train_iter = iter(train_loader)
         step = 0
@@ -1334,9 +1340,11 @@ def train_neighbor_sampling(
                     ).to(device)
                     train_counts.add_(local_counts)
                 for nt, cnts in ns.items():
-                    sampled_nodes.setdefault(nt, []).extend(cnts)
+                    sampled_node_sum[nt] = sampled_node_sum.get(nt, 0) + sum(cnts)
+                    sampled_node_cnt[nt] = sampled_node_cnt.get(nt, 0) + len(cnts)
                 for et, cnts in es.items():
-                    sampled_edges.setdefault(et, []).extend(cnts)
+                    sampled_edge_sum[et] = sampled_edge_sum.get(et, 0) + sum(cnts)
+                    sampled_edge_cnt[et] = sampled_edge_cnt.get(et, 0) + len(cnts)
             else:
                 # DDP or single-device: one forward + backward per step.
                 batch = batch_group[0]
@@ -1371,24 +1379,40 @@ def train_neighbor_sampling(
                 if _loss_ok:
                     train_loss_sum_t += loss_val * batch_count
                     train_examples_t += batch_count
-                pred = seed_logits.detach().float().argmax(dim=1)
-                train_counts.add_(_per_class_counts_tensor(pred, sl, num_classes))
+                    pred = seed_logits.detach().float().argmax(dim=1)
+                    train_counts.add_(_per_class_counts_tensor(pred, sl, num_classes))
                 for node_type, count in batch.stats.get("nodes", {}).items():
-                    sampled_nodes.setdefault(node_type, []).append(int(count))
+                    c = int(count)
+                    sampled_node_sum[node_type] = sampled_node_sum.get(node_type, 0) + c
+                    sampled_node_cnt[node_type] = sampled_node_cnt.get(node_type, 0) + 1
                 for edge_name, count in batch.stats.get("edges", {}).items():
-                    sampled_edges.setdefault(edge_name, []).append(int(count))
+                    c = int(count)
+                    sampled_edge_sum[edge_name] = sampled_edge_sum.get(edge_name, 0) + c
+                    sampled_edge_cnt[edge_name] = sampled_edge_cnt.get(edge_name, 0) + 1
 
             pending_step = True
             if (step + 1) % grad_accum_steps == 0:
+                scaler.unscale_(optimizer)
                 if grad_clip_norm > 0.0:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
-                _scale_before = scaler.get_scale()
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad(set_to_none=True)
-                if scheduler is not None and scaler.get_scale() >= _scale_before:
-                    scheduler.step()
+                    # clip_grad_norm_ returns total_norm as a scalar tensor.
+                    # When any grad is inf: total_norm=inf → clip_coef=0 → inf*0=NaN.
+                    # Checking total_norm.isfinite() after the call is O(1) and catches
+                    # this before the NaN gradients can be applied to weights.
+                    total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                    _bad_grads = not total_norm.isfinite()
+                else:
+                    _bad_grads = False
+                if _bad_grads:
+                    # Discard NaN/inf gradients before step to avoid weight corruption.
+                    optimizer.zero_grad(set_to_none=True)
+                    scaler.update()
+                else:
+                    _scale_before = scaler.get_scale()
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
+                    if scheduler is not None and scaler.get_scale() >= _scale_before:
+                        scheduler.step()
                 pending_step = False
             step += 1
             batches_seen += len(batch_group)
@@ -1413,15 +1437,22 @@ def train_neighbor_sampling(
                 last_logged_batches = batches_seen
 
         if pending_step:
+            scaler.unscale_(optimizer)
             if grad_clip_norm > 0.0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
-            _scale_before = scaler.get_scale()
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad(set_to_none=True)
-            if scheduler is not None and scaler.get_scale() >= _scale_before:
-                scheduler.step()
+                total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                _bad_grads = not total_norm.isfinite()
+            else:
+                _bad_grads = False
+            if _bad_grads:
+                optimizer.zero_grad(set_to_none=True)
+                scaler.update()
+            else:
+                _scale_before = scaler.get_scale()
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                if scheduler is not None and scaler.get_scale() >= _scale_before:
+                    scheduler.step()
 
         # All-reduce train metrics so every rank reports the global epoch view.
         if is_ddp:
@@ -1452,12 +1483,14 @@ def train_neighbor_sampling(
             is_ddp=is_ddp,
         )
         avg_nodes = {
-            node_type: float(np.mean(values)) if values else 0.0
-            for node_type, values in sampled_nodes.items()
+            nt: sampled_node_sum[nt] / sampled_node_cnt[nt]
+            for nt in sampled_node_sum
+            if sampled_node_cnt.get(nt, 0) > 0
         }
         avg_edges = {
-            edge_name: float(np.mean(values)) if values else 0.0
-            for edge_name, values in sampled_edges.items()
+            en: sampled_edge_sum[en] / sampled_edge_cnt[en]
+            for en in sampled_edge_sum
+            if sampled_edge_cnt.get(en, 0) > 0
         }
         entry = {
             "epoch": epoch,
