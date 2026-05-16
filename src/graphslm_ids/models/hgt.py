@@ -23,6 +23,12 @@ def _edge_softmax_by_dst(
     if scores.numel() == 0:
         return scores
 
+    # Compute in float32 to avoid float16 underflow/overflow: custom scatter ops
+    # are not autocast-promoted by PyTorch, so float16 exp() can underflow to 0,
+    # making denom=0 and producing NaN in deep models with AMP enabled.
+    orig_dtype = scores.dtype
+    scores = scores.float()
+
     num_heads = int(scores.shape[1])
     expanded_index = dst_index[:, None].expand(-1, num_heads)
     max_scores = torch.full(
@@ -47,7 +53,7 @@ def _edge_softmax_by_dst(
         device=scores.device,
     )
     denom.scatter_add_(0, expanded_index, exp_scores)
-    return exp_scores / denom[dst_index].clamp_min(1e-12)
+    return (exp_scores / denom[dst_index].clamp_min(1e-6)).to(orig_dtype)
 
 
 class HGTLayer(nn.Module):
@@ -140,12 +146,17 @@ class HGTLayer(nn.Module):
             v = self.relation_value[relation_name](v).view(-1, self.num_heads, self.head_dim)
 
             scores = (q * k).sum(dim=-1) / math.sqrt(self.head_dim)
-            scores = scores * self.relation_prior[relation_name].view(1, self.num_heads)
+            # Clamp relation_prior to prevent unbounded growth (no weight decay applied
+            # to ParameterDict entries) from scaling scores beyond float16 range.
+            relation_prior = self.relation_prior[relation_name].clamp(-10.0, 10.0)
+            scores = scores * relation_prior.view(1, self.num_heads)
             if edge_weight_dict is not None and edge_type in edge_weight_dict:
                 edge_weight = edge_weight_dict[edge_type].to(dtype=scores.dtype, device=scores.device)
                 if edge_weight.ndim == 2:
                     edge_weight = edge_weight[:, 0]
-                scores = scores + edge_weight.clamp_min(1e-6).log().view(-1, 1)
+                # Clamp both sides: lower bound avoids -inf, upper bound prevents
+                # large positive log values from causing overflow in float16.
+                scores = scores + edge_weight.clamp(1e-6, 1e6).log().view(-1, 1)
             attn = _edge_softmax_by_dst(scores, dst_index, int(dst_x.shape[0]))
             messages = attn.unsqueeze(-1) * v
             if return_attention:
