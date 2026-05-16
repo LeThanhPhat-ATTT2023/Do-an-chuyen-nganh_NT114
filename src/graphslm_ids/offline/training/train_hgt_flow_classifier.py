@@ -1182,6 +1182,7 @@ def train_neighbor_sampling(
     use_amp = bool(config["train"].get("amp", False)) and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     grad_accum_steps = max(1, int(config["train"].get("grad_accum_steps", 1)))
+    grad_clip_norm = float(config["train"].get("grad_clip_norm", 0.0))
     use_semantic_edge_weights = bool(config["data"]["use_semantic_edge_weights"])
 
     best_score = -float("inf")
@@ -1292,6 +1293,9 @@ def train_neighbor_sampling(
 
             pending_step = True
             if (step + 1) % grad_accum_steps == 0:
+                if grad_clip_norm > 0.0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
@@ -1321,6 +1325,9 @@ def train_neighbor_sampling(
                 last_logged_batches = batches_seen
 
         if pending_step:
+            if grad_clip_norm > 0.0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
