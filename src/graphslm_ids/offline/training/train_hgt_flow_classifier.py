@@ -391,8 +391,8 @@ def _maybe_compile(model: HeteroGraphTransformer, enabled: bool) -> HeteroGraphT
     if not enabled:
         return model
     try:
-        compiled = torch.compile(model, mode="reduce-overhead", dynamic=True)
-        print("[torch.compile] HGT wrapped with mode='reduce-overhead' dynamic=True", flush=True)
+        compiled = torch.compile(model, mode="default", dynamic=False)
+        print("[torch.compile] HGT wrapped with mode='default' dynamic=False", flush=True)
         return compiled  # type: ignore[return-value]
     except Exception as exc:  # pragma: no cover - depends on installed PyTorch
         print(f"[torch.compile] skipped — {exc}", flush=True)
