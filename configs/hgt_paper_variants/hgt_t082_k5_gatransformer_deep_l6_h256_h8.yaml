@@ -6,14 +6,24 @@
 # Reported accuracy ~99.7% on node classification and ~99.1% on edge
 # classification, at the cost of being the deepest variant in the comparison.
 # Local approximation: our model is a single uniform HGT stack, so we set
-# num_layers=6 and rely on per-edge-type attention to play the same role as
+# num_layers=3 and rely on per-edge-type attention to play the same role as
 # the GAT prefix. The rolling time window is enforced upstream by the runtime
 # Hot Graph Buffer + sliding seal scheduler (see unified_graph_growth_strategy
 # section 10.2), not by this training config.
+#
+# Fix applied (v2):
+#   - Reduced to 3 layers / 128 hidden / 4 heads: 6-layer h256 consumed ~40 min/epoch
+#     and exhausted the 12h Kaggle limit after only 17 epochs with a frozen loss.
+#   - LR raised from 5e-5 to 1e-3: the original very low LR combined with
+#     OneCycleLR warmup meant the model was at <2e-5 effective LR for the first
+#     17 epochs — no meaningful weight update was occurring.
+#   - Scheduler changed to cosine_annealing: OneCycleLR was mismatch for truncated runs.
+#   - Reverse fanouts set to non-zero: previous rev_matches_technique=0 was blocking
+#     gradient propagation (same root cause as dlg_ids_sparse).
 experiment:
   source_name: "GATransformer Deep Stack (GAT + Transformer hybrid)"
   citation_hint: "GATransformer: A Network Threat Detection Method Based on Graph-Sequence Enhanced Transformer, 2025"
-  rationale: "Probe whether a deeper 6-layer / 256-hidden / 8-head HGT recovers long-range temporal pattern accuracy reported by GATransformer; expect higher VRAM cost and slower per-step latency."
+  rationale: "Probe whether a deep HGT recovers long-range temporal pattern accuracy reported by GATransformer; depth reduced from 6 to 3 layers to fit the 12h Kaggle budget."
 
 data:
   source: graph_store
@@ -27,56 +37,58 @@ data:
   use_semantic_edge_weights: true
 
 model:
-  hidden_dim: 256
-  num_layers: 6
-  num_heads: 8
+  hidden_dim: 128
+  num_layers: 3
+  num_heads: 4
   dropout: 0.15
   ffn_multiplier: 2
 
 train:
   output_dir: outputs/hgt_paper_variants/gatransformer_deep_l6_h256_h8
-  epochs: 200
+  epochs: 100
   batch_mode: neighbor_sampling
-  batch_seed_flows: 128
-  grad_accum_steps: 4
-  lr: 0.00005
+  batch_seed_flows: 256
+  grad_accum_steps: 2
+  lr: 0.001
   weight_decay: 0.00005
-  grad_clip_norm: 0.5
-  scheduler: onecycle
-  scheduler_pct_start: 0.2
+  grad_clip_norm: 1.0
+  scheduler: cosine_annealing
+  scheduler_eta_min: 1.0e-5
   val_ratio: 0.1
   test_ratio: 0.1
-  patience: 30
+  patience: 40
   class_weight: balanced
+  class_weight_cap: 10.0
   seed: 42
   device: cuda
   monitor: val_macro_f1
   log_every: 1
   amp: true
   amp_dtype: bfloat16
-  class_weight_cap: 10.0
   activation_checkpointing: true
+  compile: true
 
 wandb:
   project: nt114-hgt-paper-variants
 
 sampler:
-  hops: 6
+  hops: 3
   fanouts:
-    flow__contains__packet: 16
+    flow__contains__packet: 8
     packet__next_packet__packet: 3
     packet__matches_technique__technique: 4
     flow__matches_technique__technique: 4
     technique__belongs_to_tactic__tactic: 1
   reverse_fanouts:
-    rev_contains: 1
-    rev_next_packet: 1
-    rev_matches_technique: 0
+    rev_contains: 3
+    rev_next_packet: 2
+    rev_matches_technique: 2
     rev_belongs_to_tactic: 0
   always_include_all_tactics: true
-  always_include_all_techniques: false
+  always_include_all_techniques: true
 
 dataloader:
   num_workers: 2
-  prefetch_factor: 2
+  prefetch_factor: 4
   pin_memory: true
+  persistent_workers: true

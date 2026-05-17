@@ -33,12 +33,12 @@
 #     15.0 retains 15× emphasis on rare attack classes while keeping the
 #     worst-case loss under ~40 — safely scalable to larger imbalanced datasets.
 #
-#   lr=0.0002, pct_start=0.15, grad_accum_steps=4 (small dataset):
-#     Effective batch = 128 seeds × 4 accum = 512. A deeper model (4 layers)
-#     needs a lower peak LR than the 1–3 layer variants to avoid early
-#     instability. 0.0002 is between relgt (0.0003) and gatransformer (0.00005).
-#     pct_start=0.15 gives a 30-epoch warmup at 200 epochs — enough for the
-#     relation_prior parameters (unconstrained scalars) to reach stable values.
+#   lr=0.0005, cosine_annealing, grad_accum_steps=2 (DDP x2 GPUs):
+#     With DDP world_size=2 and batch_seed_flows=256 per GPU, effective global
+#     batch = 256 × 2 × 2 = 1024. A 4-layer model needs a moderate LR;
+#     0.0005 is between ahgt (0.001) and the original 0.0002.
+#     cosine_annealing avoids the pct_start misalignment that caused instability
+#     when OneCycleLR's decay phase was entered before convergence.
 #
 # ── Large-dataset notes (500 GB – 1 TB raw PCAP) ────────────────────────────
 #   When scaling to large datasets, override these fields:
@@ -89,18 +89,18 @@ model:
 
 train:
   output_dir: outputs/nt114_proposed_l4_h256_h8
-  epochs: 200
+  epochs: 100
   batch_mode: neighbor_sampling
-  batch_seed_flows: 128
-  grad_accum_steps: 4
-  lr: 0.0002
+  batch_seed_flows: 256
+  grad_accum_steps: 2
+  lr: 0.0005
   weight_decay: 0.0001
   grad_clip_norm: 0.5
-  scheduler: onecycle
-  scheduler_pct_start: 0.15
+  scheduler: cosine_annealing
+  scheduler_eta_min: 1.0e-5
   val_ratio: 0.1
   test_ratio: 0.1
-  patience: 30
+  patience: 40
   class_weight: balanced
   class_weight_cap: 15.0
   seed: 42
@@ -110,26 +110,28 @@ train:
   amp: true
   amp_dtype: bfloat16
   activation_checkpointing: true
+  compile: true
+  multi_gpu: true
 
 sampler:
   hops: 4
   fanouts:
-    flow__contains__packet: 20
+    flow__contains__packet: 8
     packet__next_packet__packet: 4
     packet__matches_technique__technique: 5
     flow__matches_technique__technique: 5
     technique__belongs_to_tactic__tactic: 1
   reverse_fanouts:
-    rev_contains: 1
-    rev_next_packet: 1
-    rev_matches_technique: 0
+    rev_contains: 3
+    rev_next_packet: 2
+    rev_matches_technique: 2
     rev_belongs_to_tactic: 0
   always_include_all_tactics: true
   always_include_all_techniques: true   # set false for large datasets (>10K techniques)
 
 dataloader:
   num_workers: 2          # increase to 8 on HPC server
-  prefetch_factor: 2      # increase to 4 on HPC server
+  prefetch_factor: 4      # increase on HPC server
   pin_memory: true
   persistent_workers: true
 

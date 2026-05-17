@@ -11,6 +11,11 @@
 # num_layers=2 to keep K-hop bounded, and bump dropout slightly to compensate
 # for the smaller receptive field. The LCS-based pruning module itself is
 # upstream (subgraph_builder), not part of this training script.
+#
+# Fix applied (v2): previous run had rev_next_packet=0 and rev_matches_technique=0
+# which blocked backward signal propagation through HGT — loss was stuck at
+# ln(13)=2.565 across all 45 epochs. Reverse fanouts are now non-zero so
+# packet/technique nodes receive upstream gradient from flow seeds.
 experiment:
   source_name: "DLG-IDS Sparse Spatio-Temporal (HGT backbone)"
   citation_hint: "DLG-IDS: Dynamic Graph and LLM-Semantic Enhanced Spatiotemporal GNN for Lightweight Intrusion Detection in Industrial Control Systems, 2026"
@@ -36,27 +41,28 @@ model:
 
 train:
   output_dir: outputs/hgt_paper_variants/dlg_ids_sparse_l2_h128_h4
-  epochs: 200
+  epochs: 100
   batch_mode: neighbor_sampling
   batch_seed_flows: 256
   grad_accum_steps: 2
   lr: 0.001
   weight_decay: 0.00005
   grad_clip_norm: 1.0
-  scheduler: onecycle
-  scheduler_pct_start: 0.05
+  scheduler: cosine_annealing
+  scheduler_eta_min: 1.0e-5
   val_ratio: 0.1
   test_ratio: 0.1
-  patience: 30
+  patience: 40
   class_weight: balanced
+  class_weight_cap: 10.0
   seed: 42
   device: cuda
   monitor: val_macro_f1
   log_every: 1
   amp: true
   amp_dtype: bfloat16
-  class_weight_cap: 20.0
   activation_checkpointing: true
+  compile: true
 
 wandb:
   project: nt114-hgt-paper-variants
@@ -64,20 +70,21 @@ wandb:
 sampler:
   hops: 2
   fanouts:
-    flow__contains__packet: 10
+    flow__contains__packet: 8
     packet__next_packet__packet: 2
     packet__matches_technique__technique: 3
     flow__matches_technique__technique: 3
     technique__belongs_to_tactic__tactic: 1
   reverse_fanouts:
-    rev_contains: 1
-    rev_next_packet: 0
-    rev_matches_technique: 0
+    rev_contains: 3
+    rev_next_packet: 2
+    rev_matches_technique: 2
     rev_belongs_to_tactic: 0
   always_include_all_tactics: true
-  always_include_all_techniques: false
+  always_include_all_techniques: true
 
 dataloader:
   num_workers: 2
-  prefetch_factor: 2
+  prefetch_factor: 4
   pin_memory: true
+  persistent_workers: true
