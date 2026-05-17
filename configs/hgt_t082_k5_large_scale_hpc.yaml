@@ -50,8 +50,8 @@ train:
   lr: 0.0002
   weight_decay: 0.0001
   grad_clip_norm: 0.5
-  scheduler: onecycle
-  scheduler_pct_start: 0.15
+  scheduler: cosine_annealing
+  scheduler_eta_min: 1.0e-5
   val_ratio: 0.05         # 5% val is enough with millions of flows
   test_ratio: 0.05
   patience: 5             # proportional to epochs (was 30/200 = 15%)
@@ -61,6 +61,7 @@ train:
   device: cuda
   monitor: val_macro_f1
   log_every: 1
+  stratified_batch_sampling: true
   amp: true
   amp_dtype: bfloat16     # A100 native BF16 — no overflow risk at any scale
   activation_checkpointing: true
@@ -76,7 +77,7 @@ sampler:
   reverse_fanouts:
     rev_contains: 1
     rev_next_packet: 1
-    rev_matches_technique: 0
+    rev_matches_technique: 2
     rev_belongs_to_tactic: 0
   always_include_all_tactics: true
   always_include_all_techniques: false  # must be false at large scale

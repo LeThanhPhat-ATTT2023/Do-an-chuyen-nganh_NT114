@@ -17,7 +17,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.utils.data.distributed import DistributedSampler
 
 from graphslm_ids.offline.training.hetero_graph_artifact import (
@@ -830,6 +830,30 @@ def metrics_from_predictions(
     }
 
 
+def _interleave_by_class(
+    flow_ids: np.ndarray,
+    class_labels: np.ndarray,
+) -> np.ndarray:
+    """Round-robin interleave flow_ids across classes for DDP stratified sampling.
+
+    DistributedSampler cannot be combined with WeightedRandomSampler, so for
+    multi-GPU training we pre-sort flow_ids into a class-interleaved order.
+    DistributedSampler then shards and shuffles this pre-balanced sequence each
+    epoch, giving each GPU approximately equal class representation per batch.
+    """
+    buckets = [
+        flow_ids[class_labels == lbl].tolist()
+        for lbl in sorted(np.unique(class_labels).tolist())
+    ]
+    result: list[int] = []
+    max_len = max(len(b) for b in buckets)
+    for i in range(max_len):
+        for b in buckets:
+            if i < len(b):
+                result.append(b[i])
+    return np.array(result, dtype=np.int64)
+
+
 def make_neighbor_loader(
     flow_ids: np.ndarray,
     sampler: HeteroNeighborSampler,
@@ -840,6 +864,7 @@ def make_neighbor_loader(
     world_size: int = 1,
     rank: int = 0,
     seed: int = 42,
+    class_labels: np.ndarray | None = None,
 ) -> tuple[DataLoader, DistributedSampler | None]:
     """Build a neighbor-sampling DataLoader.
 
@@ -847,7 +872,22 @@ def make_neighbor_loader(
     DistributedSampler is set up to shard ``flow_ids`` across ranks; callers must
     invoke ``dist_sampler.set_epoch(epoch)`` each epoch to reshuffle. In
     single-process mode the second element is ``None``.
+
+    When ``class_labels`` is provided and ``train.stratified_batch_sampling``
+    is true in config, each training batch is class-balanced:
+      - Single GPU: WeightedRandomSampler (exact per-batch balance).
+      - Multi GPU: flow_ids pre-sorted by round-robin class interleaving;
+        DistributedSampler shuffles the balanced sequence each epoch.
     """
+    use_stratified = (
+        class_labels is not None
+        and shuffle
+        and bool(config.get("train", {}).get("stratified_batch_sampling", False))
+    )
+
+    if use_stratified and world_size > 1:
+        flow_ids = _interleave_by_class(flow_ids, class_labels)
+
     dl_cfg = config.get("dataloader") or {}
     num_workers = _auto_dataloader_workers(int(dl_cfg.get("num_workers", -1)), n_gpus)
     dataset = FlowSeedDataset(flow_ids)
@@ -864,6 +904,17 @@ def make_neighbor_loader(
             dataset, num_replicas=world_size, rank=rank, shuffle=bool(shuffle), seed=seed
         )
         loader_kwargs["sampler"] = dist_sampler
+        loader_kwargs["shuffle"] = False
+    elif use_stratified:
+        num_classes = int(class_labels.max()) + 1
+        cls_counts = np.bincount(class_labels, minlength=num_classes).astype(np.float64)
+        cls_counts = np.where(cls_counts == 0, 1.0, cls_counts)
+        sample_weights = torch.from_numpy(
+            (1.0 / cls_counts)[class_labels]
+        ).float()
+        loader_kwargs["sampler"] = WeightedRandomSampler(
+            sample_weights, num_samples=len(sample_weights), replacement=True
+        )
         loader_kwargs["shuffle"] = False
     else:
         loader_kwargs["shuffle"] = bool(shuffle)
@@ -1158,9 +1209,11 @@ def train_neighbor_sampling(
         standardize_flow_features=bool(config["data"]["standardize_flow_features"]),
         seed=seed + rank,
     )
+    train_labels_np = labels_np[train_idx_np]
     train_loader, train_dist_sampler = make_neighbor_loader(
-        train_idx_np, sampler, config, shuffle=True,  n_gpus=n_gpus,
+        train_idx_np, sampler, config, shuffle=True, n_gpus=n_gpus,
         world_size=world_size, rank=rank, seed=seed,
+        class_labels=train_labels_np,
     )
     val_loader, _ = make_neighbor_loader(
         val_idx_np, sampler, config, shuffle=False, n_gpus=n_gpus,

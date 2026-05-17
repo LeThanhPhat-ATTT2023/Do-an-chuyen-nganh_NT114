@@ -54,6 +54,7 @@ train:
   device: cuda
   monitor: val_macro_f1
   log_every: 1
+  stratified_batch_sampling: true
   amp: true
   amp_dtype: bfloat16
   activation_checkpointing: true
