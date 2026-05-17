@@ -5,9 +5,20 @@
 # hardware. The aggressive 1-layer depth is deliberate: most IoV intrusions
 # (CAN-bus injection, lateral control commands) are 1-hop neighborhood signals,
 # so deeper HGTs add cost without lifting accuracy and risk over-smoothing.
-# Note: this local trainer uses AdamW with a constant LR; the original LR=0.01
-# is kept here as documented, but in practice you may want to lower it if the
-# loss diverges on the IDS three-tier graph (different label imbalance).
+#
+# Fix applied (v2):
+#   - rev_next_packet: 0 → 1, rev_matches_technique: 0 → 2: both reverse
+#     fanouts were blocking gradient propagation through packet chains and MITRE
+#     technique nodes. Same root cause as dlg_ids_sparse and relgt bugs.
+#   - LR lowered from 0.01 → 0.001: original LR=0.01 diverges on the IDS
+#     three-tier graph due to different label imbalance vs IoV dataset.
+#   - Scheduler changed from none → cosine_annealing: constant LR causes
+#     late-training noise; cosine decay stabilises convergence without changing
+#     the paper's intent (no warmup, gentle decay).
+#   - class_weight_cap: 10.0 added: prevents loss spikes from uncapped balanced
+#     weights on imbalanced datasets.
+#   - compile: true: torch.compile for throughput gain.
+#   - persistent_workers: true: avoids DataLoader worker respawn overhead.
 experiment:
   source_name: "One^2 IDS (IoV, weak-labeled vehicular HGT)"
   citation_hint: "One^2: An Intrusion Detection System for Both Internal and External Vehicular Network from Weak Labeled Data, 2025"
@@ -40,18 +51,22 @@ train:
   lr: 0.001
   weight_decay: 0.00005
   grad_clip_norm: 1.0
-  scheduler: none
+  scheduler: cosine_annealing
+  scheduler_eta_min: 1.0e-5
   val_ratio: 0.1
   test_ratio: 0.1
   patience: 20
   class_weight: balanced
+  class_weight_cap: 10.0
   seed: 42
   device: cuda
   monitor: val_macro_f1
   log_every: 1
+  stratified_batch_sampling: true
   amp: true
   amp_dtype: bfloat16
   activation_checkpointing: false
+  compile: true
 
 wandb:
   project: nt114-hgt-paper-variants
@@ -66,8 +81,8 @@ sampler:
     technique__belongs_to_tactic__tactic: 1
   reverse_fanouts:
     rev_contains: 1
-    rev_next_packet: 0
-    rev_matches_technique: 0
+    rev_next_packet: 1
+    rev_matches_technique: 2
     rev_belongs_to_tactic: 0
   always_include_all_tactics: true
   always_include_all_techniques: false
@@ -76,3 +91,4 @@ dataloader:
   num_workers: 2
   prefetch_factor: 2
   pin_memory: true
+  persistent_workers: true

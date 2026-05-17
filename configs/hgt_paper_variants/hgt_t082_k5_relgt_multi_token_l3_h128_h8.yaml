@@ -42,8 +42,8 @@ train:
   lr: 0.0003
   weight_decay: 0.00005
   grad_clip_norm: 0.5
-  scheduler: onecycle
-  scheduler_pct_start: 0.1
+  scheduler: cosine_annealing
+  scheduler_eta_min: 1.0e-5
   val_ratio: 0.1
   test_ratio: 0.1
   patience: 30
@@ -52,6 +52,7 @@ train:
   device: cuda
   monitor: val_macro_f1
   log_every: 1
+  stratified_batch_sampling: true
   amp: true
   amp_dtype: bfloat16
   class_weight_cap: 10.0
@@ -71,7 +72,7 @@ sampler:
   reverse_fanouts:
     rev_contains: 1
     rev_next_packet: 1
-    rev_matches_technique: 0
+    rev_matches_technique: 2
     rev_belongs_to_tactic: 0
   always_include_all_tactics: true
   always_include_all_techniques: true

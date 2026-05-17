@@ -1,11 +1,24 @@
 # Source: XG-NID Dual-Modality NID with HGT + LLM, 2024-2026.
 # Inspired config: very compact 1-layer HGT with hidden_dim 32 and 4 heads.
 # The paper uses 30 epochs (with early convergence around epoch 5 in their
-# loss curves), but local comparison fixes all HGT variants at 200 epochs for
-# a uniform training budget. Batch size remains 70 because the dual-modality
-# setup inflates per-batch VRAM footprint.
+# loss curves). Local comparison uses 100 epochs for a uniform training budget
+# across all paper variants. Batch size 70 matches the paper's per-batch VRAM
+# footprint for the dual-modality setup.
 # Note: this local model does not implement the LLM-fusion XAI head, so this
 # config only mirrors the HGT backbone capacity and training schedule.
+#
+# Fix applied (v2):
+#   - rev_matches_technique: 0 → 2: gradient from MITRE technique nodes was
+#     blocked, preventing the knowledge graph from contributing to flow embeddings.
+#     Same root cause as dlg_ids_sparse and relgt bugs.
+#   - Scheduler changed from onecycle to cosine_annealing: avoids premature LR
+#     decay before convergence; consistent with all other paper variants.
+#   - epochs: 30 → 100, patience: 10 → 30: uniform training budget for fair
+#     comparison; v1 run reached best_epoch=54 so 30 epochs was insufficient.
+#   - class_weight_cap: 10.0 added: prevents loss spikes from uncapped balanced
+#     weights on imbalanced datasets.
+#   - compile: true: torch.compile for ~15% throughput gain at same accuracy.
+#   - persistent_workers: true: avoids DataLoader worker respawn overhead.
 experiment:
   source_name: "XG-NID Dual-Modality NID (HGT backbone only)"
   citation_hint: "XG-NID: Dual-Modality Network Intrusion Detection using a Heterogeneous Graph Neural Network and Large Language Model, 2024"
@@ -31,26 +44,29 @@ model:
 
 train:
   output_dir: outputs/hgt_paper_variants/xgnid_dual_modal_l1_h32_h4
-  epochs: 30
+  epochs: 100
   batch_mode: neighbor_sampling
   batch_seed_flows: 70
   grad_accum_steps: 1
   lr: 0.001
   weight_decay: 0.00005
   grad_clip_norm: 1.0
-  scheduler: onecycle
-  scheduler_pct_start: 0.05
+  scheduler: cosine_annealing
+  scheduler_eta_min: 1.0e-5
   val_ratio: 0.1
   test_ratio: 0.1
-  patience: 10
+  patience: 30
   class_weight: balanced
+  class_weight_cap: 10.0
   seed: 42
   device: cuda
   monitor: val_macro_f1
   log_every: 1
+  stratified_batch_sampling: true
   amp: true
   amp_dtype: bfloat16
   activation_checkpointing: false
+  compile: true
 
 wandb:
   project: nt114-hgt-paper-variants
@@ -66,7 +82,7 @@ sampler:
   reverse_fanouts:
     rev_contains: 1
     rev_next_packet: 1
-    rev_matches_technique: 0
+    rev_matches_technique: 2
     rev_belongs_to_tactic: 0
   always_include_all_tactics: true
   always_include_all_techniques: true
@@ -75,3 +91,4 @@ dataloader:
   num_workers: 2
   prefetch_factor: 2
   pin_memory: true
+  persistent_workers: true
