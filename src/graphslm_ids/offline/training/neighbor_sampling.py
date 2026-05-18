@@ -519,10 +519,18 @@ class HeteroNeighborSampler:
             else:
                 existing_src = np.concatenate([c[0] for c in existing_chunks])
                 existing_dst = np.concatenate([c[1] for c in existing_chunks])
-            num_tactics = int(self.backend.num_tactics)
-            existing_keys = existing_src * np.int64(num_tactics) + existing_dst
-            new_keys = src_repeated * np.int64(num_tactics) + dst_arr
-            keep = ~np.isin(new_keys, existing_keys, assume_unique=False)
+            # Use structured void view for exact (src, dst) pair deduplication.
+            # The old approach (src * num_tactics + dst) collides when a tactic
+            # global ID >= num_tactics, which happens on sparse/non-contiguous IDs.
+            existing_pairs = np.stack([existing_src, existing_dst], axis=1).astype(np.int64)
+            new_pairs = np.stack([src_repeated, dst_arr], axis=1).astype(np.int64)
+            existing_void = np.ascontiguousarray(existing_pairs).view(
+                np.dtype((np.void, existing_pairs.dtype.itemsize * 2))
+            ).ravel()
+            new_void = np.ascontiguousarray(new_pairs).view(
+                np.dtype((np.void, new_pairs.dtype.itemsize * 2))
+            ).ravel()
+            keep = ~np.isin(new_void, existing_void, assume_unique=False)
             if not bool(keep.any()):
                 return
             src_repeated = src_repeated[keep]

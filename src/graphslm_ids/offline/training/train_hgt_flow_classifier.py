@@ -381,18 +381,21 @@ def _ddp_device(local_rank: int) -> torch.device:
     return torch.device(f"cuda:{local_rank}") if torch.cuda.is_available() else torch.device("cpu")
 
 
-def _maybe_compile(model: HeteroGraphTransformer, enabled: bool) -> HeteroGraphTransformer:
-    """Wrap the HGT in ``torch.compile`` when ``enabled`` is true.
+def _maybe_compile(model: torch.nn.Module, enabled: bool) -> torch.nn.Module:
+    """Wrap the model in ``torch.compile`` when ``enabled`` is true.
 
-    Falls back to eager on compile failure so a broken inductor build never
-    blocks training. Reduce-overhead mode is the safer default for
-    dynamic-shape neighbor batches than ``max-autotune``.
+    Must be called AFTER DDP wrapping. The DDPOptimizer inside dynamo tries to
+    split the compiled graph across gradient buckets, which breaks the AOT
+    autograd partitioner on AMP dtype-cast nodes. Disabling it lets dynamo
+    compile the DDP forward as one unit; gradient all-reduces still happen
+    correctly via DDP hooks.
     """
     if not enabled:
         return model
     try:
+        torch._dynamo.config.optimize_ddp = False  # disable DDPOptimizer
         compiled = torch.compile(model, mode="default", dynamic=True)
-        print("[torch.compile] HGT wrapped with mode='default' dynamic=True", flush=True)
+        print("[torch.compile] HGT wrapped with mode='default' dynamic=True (optimize_ddp=False)", flush=True)
         return compiled  # type: ignore[return-value]
     except Exception as exc:  # pragma: no cover - depends on installed PyTorch
         print(f"[torch.compile] skipped — {exc}", flush=True)
@@ -1506,6 +1509,14 @@ def train_neighbor_sampling(
                 last_logged_batches = batches_seen
 
         if pending_step:
+            # Trailing micro-batches used model.no_sync() so their gradients were
+            # never all-reduced across ranks. Without explicit sync here each rank
+            # would step on its own local gradients, causing weight divergence.
+            if is_ddp:
+                for p in model.parameters():
+                    if p.grad is not None:
+                        dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+                        p.grad.div_(world_size)
             scaler.unscale_(optimizer)
             if grad_clip_norm > 0.0:
                 total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
