@@ -391,8 +391,8 @@ def _maybe_compile(model: HeteroGraphTransformer, enabled: bool) -> HeteroGraphT
     if not enabled:
         return model
     try:
-        compiled = torch.compile(model, mode="default", dynamic=False)
-        print("[torch.compile] HGT wrapped with mode='default' dynamic=False", flush=True)
+        compiled = torch.compile(model, mode="default", dynamic=True)
+        print("[torch.compile] HGT wrapped with mode='default' dynamic=True", flush=True)
         return compiled  # type: ignore[return-value]
     except Exception as exc:  # pragma: no cover - depends on installed PyTorch
         print(f"[torch.compile] skipped — {exc}", flush=True)
@@ -545,9 +545,12 @@ def stratified_split(
             n_test = max(1, n_test)
         if n >= 3 and val_ratio > 0:
             n_val = max(1, n_val)
+        # Ensure at least 1 training sample per class: reduce val first, then test.
         if n_test + n_val >= n:
             overflow = n_test + n_val - n + 1
             n_val = max(0, n_val - overflow)
+        if n_test >= n:
+            n_test = max(0, n - 1)
 
         test_indices.extend(class_indices[:n_test].tolist())
         val_indices.extend(class_indices[n_test : n_test + n_val].tolist())
@@ -1066,7 +1069,7 @@ def evaluate_neighbor_sampling(
                     node_features, edge_index, edge_weight, seed_mask, seed_labels = to_torch_batch(
                         batch, edge_types, device, use_semantic_edge_weights,
                     )
-                    with torch.amp.autocast("cuda", enabled=use_amp):
+                    with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
                         logits = model(node_features, edge_index, edge_weight_dict=edge_weight)
                         seed_logits = logits[seed_mask]
                         loss = F.cross_entropy(seed_logits.float(), seed_labels, reduction="sum")
@@ -1275,22 +1278,31 @@ def train_neighbor_sampling(
         lr=float(config["train"]["lr"]),
         weight_decay=float(config["train"]["weight_decay"]),
     )
+    grad_accum_steps = max(1, int(config["train"].get("grad_accum_steps", 1)))
+    grad_clip_norm = float(config["train"].get("grad_clip_norm", 0.0))
+
     _scheduler_type = str(config["train"].get("scheduler", "onecycle")).lower()
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
+        # Scheduler must step once per optimizer step (every grad_accum_steps batches),
+        # not once per batch. Using len(train_loader) directly overstates the step count
+        # by grad_accum_steps, causing OneCycleLR to stretch 2× and CosineAnnealingLR
+        # to oscillate rapidly (T_max=epochs was far too small for per-step stepping).
+        _optimizer_steps_per_epoch = max(1, len(train_loader) // grad_accum_steps)
         if _scheduler_type == "onecycle":
             scheduler = torch.optim.lr_scheduler.OneCycleLR(
                 optimizer,
                 max_lr=float(config["train"]["lr"]),
-                steps_per_epoch=len(train_loader),
+                steps_per_epoch=_optimizer_steps_per_epoch,
                 epochs=int(config["train"]["epochs"]),
                 pct_start=float(config["train"].get("scheduler_pct_start", 0.05)),
             )
         elif _scheduler_type in {"cosine_annealing", "cosine"}:
+            _total_cosine_steps = _optimizer_steps_per_epoch * int(config["train"]["epochs"])
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer,
-                T_max=int(config["train"]["epochs"]),
+                T_max=_total_cosine_steps,
                 eta_min=float(config["train"].get("scheduler_eta_min", 1e-5)),
             )
     # GradScaler calls optimizer.step() internally, so PyTorch's order check
@@ -1309,6 +1321,8 @@ def train_neighbor_sampling(
     best_checkpoint = output_dir / "hgt_flow_best.pt"
     label_names = label_name_mapping(backend.manifest, labels_np)
     monitor = str(config["train"]["monitor"])
+    if monitor not in {"val_macro_f1", "val_loss"}:
+        raise ValueError(f"Unknown monitor metric {monitor!r}. Supported: 'val_macro_f1', 'val_loss'.")
     log_every = max(1, int(config["train"]["log_every"]))
     use_amp = bool(config["train"].get("amp", False)) and device.type == "cuda"
     amp_dtype = resolve_amp_dtype(config)
@@ -1322,8 +1336,6 @@ def train_neighbor_sampling(
     # detection for bfloat16 — that is handled by _grads_finite() below.
     scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and amp_dtype == torch.float16), init_scale=2**12)
     use_wandb = _wandb_init(config, rank)
-    grad_accum_steps = max(1, int(config["train"].get("grad_accum_steps", 1)))
-    grad_clip_norm = float(config["train"].get("grad_clip_norm", 0.0))
     use_semantic_edge_weights = bool(config["data"]["use_semantic_edge_weights"])
 
     best_score = -float("inf")
@@ -1414,7 +1426,7 @@ def train_neighbor_sampling(
                 )
                 with sync_ctx, torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
                     logits = model(nf, ei, edge_weight_dict=ew)
-                    seed_logits = logits[sm]
+                    seed_logits = logits[sm].float()
                     loss = F.cross_entropy(seed_logits, sl, weight=weight)
                 batch_count = int(sl.numel())
                 _loss_ok = bool(torch.isfinite(loss).item())
@@ -1557,7 +1569,11 @@ def train_neighbor_sampling(
         history.append(entry)
         _wandb_log(entry, use_wandb)
 
-        monitor_score = float(val_metrics["macro_f1"] if monitor == "val_macro_f1" else -val_metrics["loss"])
+        _val_loss = val_metrics["loss"]
+        monitor_score = float(
+            val_metrics["macro_f1"] if monitor == "val_macro_f1"
+            else -(_val_loss if _val_loss is not None else float("inf"))
+        )
         if monitor_score > best_score:
             best_score = monitor_score
             best_epoch = epoch
@@ -1596,7 +1612,7 @@ def train_neighbor_sampling(
         if rank == 0 and (epoch == 1 or epoch % log_every == 0):
             print(
                 f"Epoch {epoch:03d} | "
-                f"loss={float(train_metrics['loss'] or 0.0):.4f} "
+                f"loss={float(train_metrics['loss']) if train_metrics['loss'] is not None else float('nan'):.4f} "
                 f"val_acc={val_metrics['accuracy']:.4f} "
                 f"val_macro_f1={val_metrics['macro_f1']:.4f} "
                 f"avg_flow_nodes={avg_nodes.get('flow', 0.0):.1f} "
@@ -1626,9 +1642,19 @@ def train_neighbor_sampling(
         state_holder = raw_model.module if isinstance(raw_model, DDP) else raw_model
         state_holder = getattr(state_holder, "_orig_mod", state_holder)
         state_holder.load_state_dict(best_payload["model_state_dict"])
+        # In DDP mode, test_loader was built with DistributedSampler so rank 0 only
+        # holds 1/world_size of the test indices. Rebuild without DistributedSampler
+        # so rank 0 evaluates the complete test set.
+        if is_ddp:
+            test_loader_full, _ = make_neighbor_loader(
+                test_idx_np, sampler, config, shuffle=False,
+                n_gpus=1, world_size=1, rank=0, seed=seed,
+            )
+        else:
+            test_loader_full = test_loader
         test_metrics = evaluate_neighbor_sampling(
             model=state_holder,
-            loader=test_loader,
+            loader=test_loader_full,
             edge_types=edge_types,
             device=device,
             use_amp=use_amp,
