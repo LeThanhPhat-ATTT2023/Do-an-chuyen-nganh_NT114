@@ -1245,7 +1245,6 @@ def train_neighbor_sampling(
         ffn_multiplier=int(config["model"]["ffn_multiplier"]),
         activation_checkpointing=bool(config["train"].get("activation_checkpointing", False)),
     ).to(device)
-    raw_model = _maybe_compile(raw_model, bool(config["train"].get("compile", False)))
 
     if is_ddp:
         # find_unused_parameters=True is required: HGT carries per-relation
@@ -1272,6 +1271,11 @@ def train_neighbor_sampling(
         )
     else:
         model = raw_model
+
+    # Compile AFTER DDP so dynamo traces the full DDP graph as one unit.
+    # Compiling before DDP causes the DDPOptimizer to re-partition an already-compiled
+    # graph across buckets, which breaks the AOT autograd partitioner on dtype-cast nodes.
+    model = _maybe_compile(model, bool(config["train"].get("compile", False)))
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -1581,14 +1585,13 @@ def train_neighbor_sampling(
             if rank == 0:
                 # Always save the unwrapped (un-DDP, un-compile) state_dict so
                 # the runtime / inference path can load it without needing DDP
-                # or torch.compile installed. CPU-clone every tensor here BEFORE
-                # handing it off to the background thread — the optimizer's
-                # next step would otherwise race with the disk write on the
-                # same CUDA storage.
-                state_holder = model.module if isinstance(model, DDP) else model
-                state_holder = getattr(state_holder, "_orig_mod", state_holder)
+                # or torch.compile installed. raw_model is always the plain
+                # HeteroGraphTransformer regardless of DDP/compile wrapping.
+                # CPU-clone every tensor here BEFORE handing it off to the
+                # background thread — the optimizer's next step would otherwise
+                # race with the disk write on the same CUDA storage.
                 cpu_state = {
-                    k: v.detach().clone().cpu() for k, v in state_holder.state_dict().items()
+                    k: v.detach().clone().cpu() for k, v in raw_model.state_dict().items()
                 }
                 _save_checkpoint_bg(
                     {
