@@ -49,7 +49,7 @@ train:
   grad_accum_steps: 2     # effective batch 512 (256 × 2), same as Kaggle run
   lr: 0.0002
   weight_decay: 0.0001
-  grad_clip_norm: 0.5
+  grad_clip_norm: 1.0
   scheduler: cosine_annealing
   scheduler_eta_min: 1.0e-5
   val_ratio: 0.05         # 5% val is enough with millions of flows
@@ -63,8 +63,9 @@ train:
   log_every: 1
   stratified_batch_sampling: true
   amp: true
-  amp_dtype: bfloat16     # A100 native BF16 — no overflow risk at any scale
+  amp_dtype: auto         # A100 → native BF16; any non-BF16 GPU → safe FP32 fallback
   activation_checkpointing: true
+  compile: false          # disabled: torch.compile + DDP froze training
 
 sampler:
   hops: 4

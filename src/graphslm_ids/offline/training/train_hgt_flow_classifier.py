@@ -75,10 +75,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "activation_checkpointing": False,
         "batch_seed_flows": 256,
         "grad_accum_steps": 1,
-        "compile": True,
+        "compile": False,
         "tf32": True,
-        "scheduler": "onecycle",
+        "scheduler": "cosine_annealing",
         "scheduler_pct_start": 0.05,
+        "scheduler_eta_min": 1e-5,
+        "grad_clip_norm": 1.0,
+        "amp_dtype": "auto",
     },
     "sampler": {
         "hops": None,
@@ -107,16 +110,33 @@ DEFAULT_CONFIG: dict[str, Any] = {
 }
 
 
-def resolve_amp_dtype(config: dict) -> torch.dtype:
-    """Return bfloat16 if requested AND natively supported by the GPU, else float16.
+def resolve_amp(config: dict, device: torch.device) -> tuple[bool, torch.dtype]:
+    """Hardware-aware mixed-precision resolution.
 
-    Kaggle T4/P100 do not support bfloat16 natively, so this falls back to
-    float16 automatically — the same config YAML runs on both Kaggle and A100+.
+    Returns ``(use_amp, amp_dtype)``. The policy is deliberately conservative
+    so the SAME config runs correctly on any GPU without silent accuracy loss:
+
+      * CPU, or ``amp: false``                  -> (False, bfloat16-placeholder)
+      * GPU with native bfloat16 (A100/L4/H100) -> (True,  bfloat16)
+      * GPU WITHOUT bfloat16 (T4/P100/V100)     -> (False, ...)  i.e. pure FP32
+
+    float16 + GradScaler is intentionally NOT used: this HGT runs large
+    contraction matmuls inside relation attention (e.g. 768->hidden) whose
+    float16 accumulation overflows to inf, producing NaN loss and silently
+    frozen training. bfloat16 has FP32 exponent range so it never overflows;
+    when bfloat16 is unavailable we fall back to full FP32 (correct, a bit
+    slower) rather than the unsafe float16 path. The model is small enough
+    that FP32 throughput is acceptable even at 500GB-1TB dataset scale.
     """
-    cfg = str(config["train"].get("amp_dtype", "float16")).lower()
-    if cfg == "bfloat16" and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
-        return torch.bfloat16
-    return torch.float16
+    amp_dtype = torch.bfloat16  # always a valid dtype; only used when use_amp is True
+    if not bool(config["train"].get("amp", False)) or device.type != "cuda":
+        return False, amp_dtype
+    req = str(config["train"].get("amp_dtype", "auto")).lower()
+    bf16_ok = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    if req in {"auto", "bf16", "bfloat16"} and bf16_ok:
+        return True, torch.bfloat16
+    # bfloat16 unavailable, or float16 explicitly requested -> safe FP32 path.
+    return False, amp_dtype
 
 
 def _wandb_init(config: dict, rank: int) -> bool:
@@ -381,24 +401,28 @@ def _ddp_device(local_rank: int) -> torch.device:
     return torch.device(f"cuda:{local_rank}") if torch.cuda.is_available() else torch.device("cpu")
 
 
-def _maybe_compile(model: torch.nn.Module, enabled: bool) -> torch.nn.Module:
-    """Wrap the model in ``torch.compile`` when ``enabled`` is true.
+def _maybe_compile(model: torch.nn.Module, enabled: bool, rank: int = 0) -> torch.nn.Module:
+    """Wrap the plain HGT module in ``torch.compile`` when ``enabled`` is true.
 
-    Must be called AFTER DDP wrapping. The DDPOptimizer inside dynamo tries to
-    split the compiled graph across gradient buckets, which breaks the AOT
-    autograd partitioner on AMP dtype-cast nodes. Disabling it lets dynamo
-    compile the DDP forward as one unit; gradient all-reduces still happen
-    correctly via DDP hooks.
+    Must be called on the UN-wrapped module, BEFORE DDP — DDP then wraps the
+    compiled module, which is the combination PyTorch supports. (The previous
+    ``torch.compile(DDP(model))`` order silently broke gradient propagation
+    on neighbor-sampled, variable-shape batches.)
+
+    ``compile`` defaults to OFF in the configs: it trades a fragile dynamo +
+    DDP + activation-checkpointing interaction for a modest speedup. Enable it
+    only after a run has been confirmed to learn correctly without it.
     """
     if not enabled:
         return model
     try:
-        torch._dynamo.config.optimize_ddp = False  # disable DDPOptimizer
         compiled = torch.compile(model, mode="default", dynamic=True)
-        print("[torch.compile] HGT wrapped with mode='default' dynamic=True (optimize_ddp=False)", flush=True)
+        if rank == 0:
+            print("[torch.compile] HGT module compiled (mode='default', dynamic=True)", flush=True)
         return compiled  # type: ignore[return-value]
     except Exception as exc:  # pragma: no cover - depends on installed PyTorch
-        print(f"[torch.compile] skipped — {exc}", flush=True)
+        if rank == 0:
+            print(f"[torch.compile] skipped — {exc}", flush=True)
         return model
 
 
@@ -907,7 +931,8 @@ def make_neighbor_loader(
     }
     if world_size > 1:
         dist_sampler = DistributedSampler(
-            dataset, num_replicas=world_size, rank=rank, shuffle=bool(shuffle), seed=seed
+            dataset, num_replicas=world_size, rank=rank, shuffle=bool(shuffle), seed=seed,
+            drop_last=True,  # prevents padding duplicates that cause double-counting in all_reduce metrics
         )
         loader_kwargs["sampler"] = dist_sampler
         loader_kwargs["shuffle"] = False
@@ -1162,13 +1187,14 @@ def train_neighbor_sampling(
     if labels_np.size == 0:
         raise ValueError("Cannot train HGT: graph has no flow labels.")
     unique_labels, label_counts = np.unique(labels_np, return_counts=True)
-    print(
-        f"[diag] flow labels: unique={unique_labels.tolist()} "
-        f"counts={label_counts.tolist()} "
-        f"max={int(labels_np.max())} "
-        f"num_classes will be={int(labels_np.max()) + 1}",
-        flush=True,
-    )
+    if rank == 0:
+        print(
+            f"[diag] flow labels: unique={unique_labels.tolist()} "
+            f"counts={label_counts.tolist()} "
+            f"max={int(labels_np.max())} "
+            f"num_classes will be={int(labels_np.max()) + 1}",
+            flush=True,
+        )
     if labels_np.max() == 0:
         raise ValueError(
             "Cannot train HGT: all flow labels are 0 (only 1 class detected). "
@@ -1249,6 +1275,14 @@ def train_neighbor_sampling(
         activation_checkpointing=bool(config["train"].get("activation_checkpointing", False)),
     ).to(device)
 
+    # Compile the plain module FIRST, then wrap with DDP — this is the order
+    # PyTorch supports cleanly. torch.compile shares parameter storage with
+    # raw_model (no copy), so raw_model stays the canonical handle for
+    # state_dict save/load while ``core`` is what actually executes.
+    # ``raw_model`` itself is never DDP/compile-wrapped, so checkpointing the
+    # un-wrapped weights needs no _orig_mod / .module unwrapping.
+    core = _maybe_compile(raw_model, bool(config["train"].get("compile", False)), rank=rank)
+
     if is_ddp:
         # find_unused_parameters=True is required: HGT carries per-relation
         # parameters (relation_key/value/prior) that only receive gradient when
@@ -1266,19 +1300,14 @@ def train_neighbor_sampling(
         # avoids fragmenting the all-reduce across many tiny messages.
         device_ids = [local_rank] if device.type == "cuda" else None
         model: torch.nn.Module = DDP(
-            raw_model,
+            core,
             device_ids=device_ids,
             find_unused_parameters=True,
             gradient_as_bucket_view=True,
             bucket_cap_mb=int(config["train"].get("ddp_bucket_cap_mb", 25)),
         )
     else:
-        model = raw_model
-
-    # Compile AFTER DDP so dynamo traces the full DDP graph as one unit.
-    # Compiling before DDP causes the DDPOptimizer to re-partition an already-compiled
-    # graph across buckets, which breaks the AOT autograd partitioner on dtype-cast nodes.
-    model = _maybe_compile(model, bool(config["train"].get("compile", False)))
+        model = core
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -1292,11 +1321,13 @@ def train_neighbor_sampling(
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
-        # Scheduler must step once per optimizer step (every grad_accum_steps batches),
-        # not once per batch. Using len(train_loader) directly overstates the step count
-        # by grad_accum_steps, causing OneCycleLR to stretch 2× and CosineAnnealingLR
-        # to oscillate rapidly (T_max=epochs was far too small for per-step stepping).
-        _optimizer_steps_per_epoch = max(1, len(train_loader) // grad_accum_steps)
+        # Scheduler steps once per optimizer step (every grad_accum_steps batches).
+        # Use ceil, not floor: the trailing partial accumulation group at epoch end
+        # still performs one optimizer+scheduler step, so floor() would undercount
+        # by one step/epoch and slowly desync the LR curve over a long run.
+        _optimizer_steps_per_epoch = max(
+            1, -(-len(train_loader) // grad_accum_steps)
+        )
         if _scheduler_type == "onecycle":
             scheduler = torch.optim.lr_scheduler.OneCycleLR(
                 optimizer,
@@ -1331,17 +1362,25 @@ def train_neighbor_sampling(
     if monitor not in {"val_macro_f1", "val_loss"}:
         raise ValueError(f"Unknown monitor metric {monitor!r}. Supported: 'val_macro_f1', 'val_loss'.")
     log_every = max(1, int(config["train"]["log_every"]))
-    use_amp = bool(config["train"].get("amp", False)) and device.type == "cuda"
-    amp_dtype = resolve_amp_dtype(config)
-    # init_scale=2**12 instead of the default 2**16: with max class_weight=10 the
-    # worst-case loss is ~10*log(13)≈26; at 65536 that gives scaled_loss≈1.7M which
-    # overflows float16 gradients in 6-layer models before the scaler can adapt.
-    # BF16 has FP32 range so it never overflows, but GradScaler is kept for FP16
-    # compatibility; it auto-grows the scale and is a no-op when disabled.
-    # GradScaler is enabled only for float16 (bfloat16 has float32 range so no
-    # overflow scaling needed). However we still need non-finite gradient
-    # detection for bfloat16 — that is handled by _grads_finite() below.
-    scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and amp_dtype == torch.float16), init_scale=2**12)
+    use_amp, amp_dtype = resolve_amp(config, device)
+    if rank == 0:
+        _req = str(config["train"].get("amp_dtype", "auto")).lower()
+        if use_amp:
+            print("[AMP] enabled — dtype=bfloat16 (native, no GradScaler)", flush=True)
+        elif bool(config["train"].get("amp", False)) and device.type == "cuda":
+            print(
+                f"[AMP] disabled — running in FP32. Requested amp_dtype={_req!r} but this "
+                f"GPU has no native bfloat16 (torch.cuda.is_bf16_supported()=False); "
+                f"the float16 path is unsafe for this model, so FP32 is used.",
+                flush=True,
+            )
+        else:
+            print("[AMP] disabled — running in FP32.", flush=True)
+    # GradScaler is permanently disabled: we only ever run bfloat16 (FP32 range,
+    # no overflow) or pure FP32. Keeping a disabled scaler makes the
+    # scaler.scale()/step()/update() calls below pure pass-throughs, so the
+    # training loop needs no float16-specific branching.
+    scaler = torch.amp.GradScaler("cuda", enabled=False)
     use_wandb = _wandb_init(config, rank)
     use_semantic_edge_weights = bool(config["data"]["use_semantic_edge_weights"])
 
@@ -1373,6 +1412,9 @@ def train_neighbor_sampling(
         train_loss_sum_t = torch.zeros(1, dtype=torch.float64, device=device)
         train_examples_t = torch.zeros(1, dtype=torch.int64, device=device)
         pending_step = False
+        skipped_steps = 0
+        optimizer_steps = 0
+        nonfinite_loss_count = 0
         # Running sums avoid building O(N_batches) Python lists and calling np.mean at epoch end.
         sampled_node_sum: dict[str, int] = {}
         sampled_node_cnt: dict[str, int] = {}
@@ -1439,6 +1481,8 @@ def train_neighbor_sampling(
                 _loss_ok = bool(torch.isfinite(loss).item())
                 if _loss_ok:
                     scaler.scale(loss / grad_accum_steps).backward()
+                else:
+                    nonfinite_loss_count += 1
                 loss_val = float(loss.detach().item()) if _loss_ok else float("nan")
                 if step == 0 and epoch == 1 and rank == 0:
                     n_seeds_in_mask = int(sm.sum().item())
@@ -1478,13 +1522,49 @@ def train_neighbor_sampling(
                     # Discard NaN/inf gradients before step to avoid weight corruption.
                     optimizer.zero_grad(set_to_none=True)
                     scaler.update()
+                    skipped_steps += 1
                 else:
                     _scale_before = scaler.get_scale()
                     scaler.step(optimizer)
                     scaler.update()
                     optimizer.zero_grad(set_to_none=True)
-                    if scheduler is not None and scaler.get_scale() >= _scale_before:
-                        scheduler.step()
+                    if scaler.get_scale() < _scale_before:
+                        # scaler halved → step was skipped due to inf/NaN gradients
+                        skipped_steps += 1
+                        if rank == 0 and skipped_steps <= 5:
+                            print(
+                                f"[AMP] step skipped (inf/NaN grad) at batch {step+1}, "
+                                f"scale {_scale_before:.0f}→{scaler.get_scale():.0f}",
+                                flush=True,
+                            )
+                    else:
+                        optimizer_steps += 1
+                        if scheduler is not None:
+                            scheduler.step()
+                        # First-step learning-signal probe: a healthy run shows a
+                        # non-trivial gradient norm here. A norm of ~0 means the
+                        # backward graph is detached / weights will never move —
+                        # the fingerprint of a frozen-loss run.
+                        if epoch == 1 and optimizer_steps == 1 and rank == 0:
+                            _gn = (
+                                float(total_norm) if grad_clip_norm > 0.0
+                                else float(
+                                    torch.norm(
+                                        torch.stack([
+                                            p.grad.detach().norm()
+                                            for p in model.parameters()
+                                            if p.grad is not None
+                                        ])
+                                    )
+                                ) if any(p.grad is not None for p in model.parameters())
+                                else 0.0
+                            )
+                            _cur_lr = optimizer.param_groups[0]["lr"]
+                            print(
+                                f"[diag] first optimizer step | grad_norm={_gn:.4e} "
+                                f"lr={_cur_lr:.3e}",
+                                flush=True,
+                            )
                 pending_step = False
             step += 1
             batches_seen += len(batch_group)
@@ -1501,9 +1581,14 @@ def train_neighbor_sampling(
                     if train_batches_total else 0.0
                 )
                 elapsed = time.time() - epoch_start
+                _cur_scale = scaler.get_scale() if scaler.is_enabled() else 0.0
+                _skip_info = (
+                    f" | skip={skipped_steps} ok={optimizer_steps} scale={_cur_scale:.0f}"
+                    if scaler.is_enabled() else ""
+                )
                 print(
                     f"Epoch {epoch:03d} | train {batches_seen:>5}/{train_batches_total} "
-                    f"({pct:5.1f}%) | loss={running_loss:.4f} | {elapsed:6.1f}s",
+                    f"({pct:5.1f}%) | loss={running_loss:.4f}{_skip_info} | {elapsed:6.1f}s",
                     flush=True,
                 )
                 last_logged_batches = batches_seen
@@ -1623,6 +1708,14 @@ def train_neighbor_sampling(
         else:
             epochs_without_improvement += 1
 
+        if rank == 0 and nonfinite_loss_count > 0:
+            print(
+                f"[warn] Epoch {epoch:03d}: {nonfinite_loss_count} batch(es) had a "
+                f"non-finite (NaN/Inf) loss and were skipped — their gradients were "
+                f"never applied. Persistent non-finite loss freezes training; "
+                f"check AMP dtype and feature scaling.",
+                flush=True,
+            )
         if rank == 0 and (epoch == 1 or epoch % log_every == 0):
             print(
                 f"Epoch {epoch:03d} | "
@@ -1653,9 +1746,10 @@ def train_neighbor_sampling(
     if rank == 0:
         best_payload = load_checkpoint(best_checkpoint, device)
         # Load best weights and eval test set once — avoids per-epoch test leakage.
-        state_holder = raw_model.module if isinstance(raw_model, DDP) else raw_model
-        state_holder = getattr(state_holder, "_orig_mod", state_holder)
-        state_holder.load_state_dict(best_payload["model_state_dict"])
+        # raw_model is always the plain, un-wrapped HeteroGraphTransformer (DDP and
+        # torch.compile wrap a separate ``core`` handle that shares its parameters).
+        raw_model.load_state_dict(best_payload["model_state_dict"])
+        state_holder = raw_model
         # In DDP mode, test_loader was built with DistributedSampler so rank 0 only
         # holds 1/world_size of the test indices. Rebuild without DistributedSampler
         # so rank 0 evaluates the complete test set.

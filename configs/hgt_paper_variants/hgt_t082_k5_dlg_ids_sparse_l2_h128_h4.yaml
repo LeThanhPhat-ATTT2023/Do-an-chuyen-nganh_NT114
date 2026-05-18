@@ -61,9 +61,9 @@ train:
   log_every: 1
   stratified_batch_sampling: true
   amp: true
-  amp_dtype: bfloat16
+  amp_dtype: auto           # bf16 on supported GPUs, else safe FP32 — never unsafe float16
   activation_checkpointing: true
-  compile: true
+  compile: false            # disabled: torch.compile + DDP froze training
 
 wandb:
   project: nt114-hgt-paper-variants

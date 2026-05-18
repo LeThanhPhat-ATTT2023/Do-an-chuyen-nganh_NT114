@@ -586,6 +586,8 @@ def _stratified_split(
         if n_test + n_val >= n:
             overflow = n_test + n_val - n + 1
             n_val = max(0, n_val - overflow)
+        if n_test >= n:
+            n_test = max(0, n - 1)
         test_indices.extend(class_indices[:n_test].tolist())
         val_indices.extend(class_indices[n_test : n_test + n_val].tolist())
         train_indices.extend(class_indices[n_test + n_val :].tolist())
