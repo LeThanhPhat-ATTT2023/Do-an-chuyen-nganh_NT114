@@ -95,7 +95,8 @@ train:
   grad_accum_steps: 2
   lr: 0.0005
   weight_decay: 0.0001
-  grad_clip_norm: 0.5
+  grad_clip_norm: 1.0       # 0.5 was too aggressive for a 4-layer/256-hidden HGT and
+                            # crushed the gradient signal; 1.0 matches the working baseline.
   scheduler: cosine_annealing
   scheduler_eta_min: 1.0e-5
   val_ratio: 0.1
@@ -109,10 +110,13 @@ train:
   log_every: 1
   stratified_batch_sampling: true
   amp: true
-  amp_dtype: bfloat16
-  activation_checkpointing: true
-  compile: true
-  multi_gpu: true
+  amp_dtype: auto           # hardware-aware: native bfloat16 on A100/L4/H100, otherwise
+                            # falls back to pure FP32. The float16 path is never used —
+                            # it overflows this model's attention matmuls and froze training.
+  activation_checkpointing: true   # keeps activation memory low for 500GB-1TB scale runs.
+  compile: false            # torch.compile + DDP + variable-shape neighbour batches silently
+                            # broke gradient flow. Re-enable only after a run is confirmed to learn.
+  multi_gpu: true           # auto-uses every visible GPU (DDP via torchrun, or legacy replicate).
 
 sampler:
   hops: 4

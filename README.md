@@ -164,7 +164,7 @@ Các module chính:
 ├── notebooks/
 │   ├── train_hgt_official_full_pipeline_kaggle.ipynb
 │   └── training/
-│       ├── kaggle/                    # 01_distill_student_cnn, 02_train_hgt_flow_classifier
+│       ├── kaggle/                    # 01_distill_student_cnn, 02a_smoke, 02b_full_preview
 │       └── local/                    # 01_extract_payload, 02_export_embeddings, 03_build_graph
 ├── outputs/
 │   └── student_cnn/                   # student_cnn_best.pt, training_summary.json
@@ -401,7 +401,7 @@ Chạy train:
 graphslm-train-hgt --config "configs/hgt_t082_k5_l3_d01.yaml"
 ```
 
-Hoặc trên Kaggle GPU T4 x2 dùng notebook `notebooks/training/kaggle/02_train_hgt_flow_classifier.ipynb`.
+Hoặc trên Kaggle GPU T4 x2 chạy trước `notebooks/training/kaggle/02a_train_hgt_smoke_test.ipynb` (3 epochs), sau đó chạy `notebooks/training/kaggle/02b_train_hgt_full_preview.ipynb`.
 
 Output:
 
@@ -563,7 +563,8 @@ Chứa 6 config biến thể HGT dùng để so sánh trong báo cáo:
 | `notebooks/training/local/02_export_student_embeddings.ipynb` | Local | Export student embeddings sau khi train |
 | `notebooks/training/local/03_build_three_tier_graph.ipynb` | Local | Xây graph 3-tier từ artifact có sẵn |
 | `notebooks/training/kaggle/01_distill_student_cnn.ipynb` | Kaggle GPU | Train student 1D-CNN distillation |
-| `notebooks/training/kaggle/02_train_hgt_flow_classifier.ipynb` | Kaggle GPU | Train HGT từ graph artifact hoặc graph store |
+| `notebooks/training/kaggle/02a_train_hgt_smoke_test.ipynb` | Kaggle GPU | Smoke test HGT 3 epochs từ graph artifact hoặc graph store |
+| `notebooks/training/kaggle/02b_train_hgt_full_preview.ipynb` | Kaggle GPU T4x2 | Full preview HGT từ graph artifact hoặc graph store |
 | `notebooks/train_hgt_official_full_pipeline_kaggle.ipynb` | Kaggle GPU T4x2 | Pipeline đầy đủ: PCAP → HGT, hoặc chỉ train HGT từ graph NPZ có sẵn |
 
 Notebook Kaggle full pipeline hỗ trợ hai mode (chỉnh `PIPELINE_MODE`):
