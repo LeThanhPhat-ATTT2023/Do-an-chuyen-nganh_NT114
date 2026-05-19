@@ -111,26 +111,40 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 
 def resolve_amp(config: dict, device: torch.device) -> tuple[bool, torch.dtype]:
-    """Resolve mixed precision. CURRENTLY FORCED TO FP32 — see below.
+    """Resolve mixed precision settings based on config and hardware capability.
 
-    Returns ``(use_amp, amp_dtype)``; ``use_amp`` is always ``False``.
+    Returns ``(use_amp, amp_dtype)``.
 
-    Why AMP is force-disabled:
-      A Kaggle bfloat16 run of this HGT skipped EVERY optimizer step. The bf16
-      backward through the custom edge-softmax / scatter-add message passing
-      produced non-finite gradients, so ``clip_grad_norm_`` returned ``inf``,
-      every step was discarded, and the loss froze at ``ln(num_classes)``.
-      float16 is likewise unsafe (overflow). Until the bf16 message-passing
-      backward is fixed and verified, training runs in pure FP32 — correct and
-      only modestly slower for a model this small. The ``amp`` / ``amp_dtype``
-      config keys are intentionally IGNORED here.
+    Only bfloat16 is supported (float16 overflows in this model). AMP is
+    enabled only when:
+      1. config["train"]["amp"] is True, AND
+      2. the device natively supports bfloat16 (A100, A40, RTX 30xx+, etc.)
 
-    To re-enable AMP after fixing the numerics: restore the hardware-aware
-    logic (gate on ``config["train"]["amp"]`` + ``torch.cuda.is_bf16_supported``)
-    and confirm a smoke run logs a non-zero first-step grad norm.
+    The edge-softmax and attention norm layers in hgt.py contain explicit
+    float32 guards that prevent the non-finite-gradient issue seen on T4
+    (which lacks native bfloat16). On hardware with native bfloat16 these
+    guards keep those ops in float32 while the rest of the forward/backward
+    runs in bfloat16, giving speed + VRAM savings without numeric instability.
+
+    Confirm a smoke run logs ``[diag] first optimizer step | grad_norm=<non-zero>``
+    before committing to a full training run with AMP enabled.
     """
-    _ = (config, device)  # intentionally unused while AMP is force-disabled
-    return False, torch.bfloat16
+    if device.type != "cuda":
+        return False, torch.float32
+
+    want_amp = bool(config.get("train", {}).get("amp", False))
+    if not want_amp:
+        return False, torch.float32
+
+    if not torch.cuda.is_bf16_supported():
+        print(
+            "[AMP] bfloat16 not supported on this device — falling back to FP32.",
+            flush=True,
+        )
+        return False, torch.float32
+
+    print("[AMP] bfloat16 enabled (native hardware support detected).", flush=True)
+    return True, torch.bfloat16
 
 
 def _wandb_init(config: dict, rank: int) -> bool:
