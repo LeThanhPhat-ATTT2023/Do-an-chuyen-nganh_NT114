@@ -55,9 +55,8 @@ class OnDiskHeteroGraphStore:
         self.feature_dims = {str(k): int(v) for k, v in self.manifest["feature_dims"].items()}
         self.edge_types = [edge_name_to_key(name) for name in self.manifest["edge_files"]]
 
-        self.flow_features = self._memmap(
+        self.flow_features = self._memmap_node_features(
             self.manifest["node_files"]["flow"]["features"],
-            np.float32,
             (self.node_counts["flow"], self.feature_dims["flow"]),
         )
         self.flow_labels = self._memmap(
@@ -70,9 +69,8 @@ class OnDiskHeteroGraphStore:
             np.int64,
             (self.node_counts["flow"],),
         )
-        self.packet_features = self._memmap(
+        self.packet_features = self._memmap_node_features(
             self.manifest["node_files"]["packet"]["features"],
-            np.float32,
             (self.node_counts["packet"], self.feature_dims["packet"]),
         )
         self.packet_shard_index = self._optional_memmap(
@@ -80,9 +78,8 @@ class OnDiskHeteroGraphStore:
             np.int64,
             (self.node_counts["packet"],),
         )
-        self.technique_features = self._memmap(
+        self.technique_features = self._memmap_node_features(
             self.manifest["node_files"]["technique"]["features"],
-            np.float32,
             (self.node_counts["technique"], self.feature_dims["technique"]),
         )
         self.tactic_ids = self._memmap(
@@ -184,6 +181,31 @@ class OnDiskHeteroGraphStore:
         if int(np.prod(shape, dtype=np.int64)) == 0:
             return np.empty(shape, dtype=dtype)
         return np.memmap(self.root / rel_path, dtype=dtype, mode="r", shape=shape)
+
+    def _memmap_node_features(self, rel_path: str, shape: tuple[int, ...]) -> np.ndarray:
+        """Memory-map a float32 node-feature array, tolerant of two on-disk forms.
+
+        * Raw float32 dump (written by ``_write_raw``)  -> plain ``np.memmap``.
+        * A ``.npy`` file -> ``np.load(mmap_mode='r')``.
+
+        The second case matters because ``--symlink-packet-features`` points
+        ``nodes/packet/features.f32`` straight at the packet-semantic ``.npy``
+        sidecar. A ``.npy`` carries a 64-128 byte header; reading it with a raw
+        ``np.memmap`` would interpret that header as feature data and shift
+        EVERY packet row, silently corrupting the whole semantic tier.
+        ``np.load`` parses the header and returns a correctly-offset memmap.
+        """
+        path = self.root / rel_path
+        if int(np.prod(shape, dtype=np.int64)) == 0:
+            return np.empty(shape, dtype=np.float32)
+        with open(path, "rb") as handle:
+            is_npy = handle.read(6) == b"\x93NUMPY"
+        if is_npy:
+            arr = np.load(path, mmap_mode="r")
+            if tuple(arr.shape) != tuple(shape):
+                arr = arr.reshape(shape)
+            return arr
+        return np.memmap(path, dtype=np.float32, mode="r", shape=shape)
 
     def _optional_memmap(
         self,

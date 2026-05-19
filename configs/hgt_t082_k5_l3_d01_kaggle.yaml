@@ -74,8 +74,9 @@ train:
   monitor: val_macro_f1
   log_every: 1
   stratified_batch_sampling: true
-  amp: true
-  amp_dtype: auto          # T4/P100 → FP32; A100/L4 → bfloat16. Auto-detected, never float16.
+  amp: false               # FORCED FP32: a bf16 run skipped every optimizer step
+                           # (non-finite gradients) and froze the loss at ln(num_classes).
+  amp_dtype: auto          # ignored — AMP is force-disabled in code until bf16 numerics are fixed.
   activation_checkpointing: true
   compile: false
   multi_gpu: true

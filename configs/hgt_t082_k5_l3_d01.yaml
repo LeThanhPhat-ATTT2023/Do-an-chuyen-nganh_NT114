@@ -109,10 +109,9 @@ train:
   monitor: val_macro_f1
   log_every: 1
   stratified_batch_sampling: true
-  amp: true
-  amp_dtype: auto           # hardware-aware: native bfloat16 on A100/L4/H100, otherwise
-                            # falls back to pure FP32. The float16 path is never used —
-                            # it overflows this model's attention matmuls and froze training.
+  amp: false                # FORCED FP32: bf16 froze training — every optimizer step was
+                            # skipped for non-finite gradients. AMP is also force-disabled in code.
+  amp_dtype: auto           # ignored while amp is false.
   activation_checkpointing: true   # keeps activation memory low for 500GB-1TB scale runs.
   compile: false            # torch.compile + DDP + variable-shape neighbour batches silently
                             # broke gradient flow. Re-enable only after a run is confirmed to learn.
