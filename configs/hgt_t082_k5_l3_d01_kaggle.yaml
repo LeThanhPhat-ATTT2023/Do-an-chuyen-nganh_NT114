@@ -6,10 +6,12 @@
 # dataloader and file paths differ so a run completes inside the 12h window.
 #
 # ── Hardware notes ──────────────────────────────────────────────────────────
-#   Kaggle GPUs (T4 / P100) have NO native bfloat16. With amp_dtype: auto the
-#   trainer detects this and runs in pure FP32 — correct and safe (the float16
-#   path that previously froze training is never used). On the HPC A100 the
-#   SAME config auto-switches to bfloat16. No manual edits needed.
+#   A40 / A100 / RTX 30xx+: native bfloat16 → amp: true activates AMP.
+#     Edge-softmax and attention norms are guarded to float32 in hgt.py so
+#     the non-finite-gradient issue (seen on T4) does not occur.
+#     batch_seed_flows: 256 fits comfortably in 48 GB bfloat16.
+#   Kaggle T4 / P100: no native bfloat16 → resolve_amp() auto-falls back to
+#     FP32 even with amp: true. No manual edits needed when switching hardware.
 #
 # ── How to run ──────────────────────────────────────────────────────────────
 #   1) Build the graph store ONCE (reuse across sessions):
@@ -58,7 +60,7 @@ train:
   epochs: 12               # T4 FP32 on the 1.5M-flow graph: ~6-12 epochs fit in 12h
   patience: 5              # best checkpoint is saved continuously — safe if the 12h cap hits first
   batch_mode: neighbor_sampling
-  batch_seed_flows: 128    # 128 (not 256): FP32 activations need more VRAM on a 16GB T4
+  batch_seed_flows: 128    # safe on T4 16GB FP32; A40 48GB bf16 has ~4× headroom
   grad_accum_steps: 2      # effective batch 256/GPU (×2 GPUs via DDP = 512)
   lr: 0.0005
   weight_decay: 0.0001
@@ -74,9 +76,10 @@ train:
   monitor: val_macro_f1
   log_every: 1
   stratified_batch_sampling: true
-  amp: false               # FORCED FP32: a bf16 run skipped every optimizer step
-                           # (non-finite gradients) and froze the loss at ln(num_classes).
-  amp_dtype: auto          # ignored — AMP is force-disabled in code until bf16 numerics are fixed.
+  amp: true                # bfloat16 on A40/Ampere+ (native hw support). Falls back to FP32
+                           # automatically on T4/P100 (no native bf16). Edge-softmax and
+                           # attention norms are guarded to float32 in hgt.py — numeric fix verified.
+  amp_dtype: auto          # auto → bfloat16 on supported hw, float32 otherwise.
   activation_checkpointing: true
   compile: false
   multi_gpu: true

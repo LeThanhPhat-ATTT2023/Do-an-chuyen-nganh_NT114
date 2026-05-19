@@ -1,0 +1,124 @@
+# NT114 Proposed IDS-HGT — AWS EC2 full training run.
+#
+# Target hardware: g5.2xlarge (1x A10G 24 GB) spot  — cheapest option, ~$0.4-0.7/hr
+#                  g5.12xlarge (4x A10G 24 GB) spot  — 4x faster, ~$1.5-2.5/hr
+#
+# Key differences from Kaggle config:
+#   - amp: true   → A10G supports BF16 natively (unlike Kaggle T4/P100)
+#   - epochs: 100 + patience: 40  → full training run
+#   - batch_seed_flows: 192  → A10G has 24 GB VRAM vs 16 GB T4
+#   - num_workers: 4  → EC2 instance has more vCPUs than Kaggle
+#   - paths point to local ~/data/ instead of /kaggle/input/
+#
+# ── Setup on EC2 (run once after launching instance) ────────────────────────
+#   # 1. Install deps
+#   pip install -e . && pip install -r requirements-ml.txt
+#
+#   # 2. Download data from Kaggle (need ~/.kaggle/kaggle.json)
+#   mkdir -p ~/data/raw && cd ~/data/raw
+#   kaggle datasets download thnhphtattt2023/graph3 && unzip graph3.zip
+#
+#   # 3. Build graph store (run ONCE, takes ~10-20 min, saves to ~/data/graph_store)
+#   python -m graphslm_ids.offline.training.on_disk_graph_store \
+#     --graph-npz ~/data/raw/graph_artifact_3tier_14gb.npz \
+#     --graph-meta-json ~/data/raw/graph_artifact_3tier_14gb.meta.json \
+#     --output-root ~/data/graph_store_v1
+#
+# ── SMOKE TEST first (3 epochs, ~20 min) ───────────────────────────────────
+#   Uncomment max_train_flows below + set epochs: 3, then verify:
+#     [AMP] running in BF16              ← AMP working on A10G
+#     [diag] first optimizer step | grad_norm=...  ← must be non-zero
+#     loss epoch 1 > epoch 2 > epoch 3   ← model is learning
+#
+# ── Full run (single GPU g5.2xlarge) ───────────────────────────────────────
+#   tmux new -s train     ← QUAN TRỌNG: dùng tmux để không mất job khi đóng SSH
+#   torchrun --nproc_per_node=1 \
+#     -m graphslm_ids.offline.training.train_hgt_flow_classifier \
+#     --config configs/hgt_t082_k5_l3_d01_aws.yaml
+#
+# ── Full run (4 GPU g5.12xlarge) ───────────────────────────────────────────
+#   tmux new -s train
+#   torchrun --nproc_per_node=4 \
+#     -m graphslm_ids.offline.training.train_hgt_flow_classifier \
+#     --config configs/hgt_t082_k5_l3_d01_aws.yaml
+#   # Đổi multi_gpu: true và num_workers: 8 nếu dùng 4 GPU
+
+experiment:
+  source_name: "NT114 Proposed IDS-HGT — AWS EC2 full run (4-layer)"
+  rationale: >
+    Full 100-epoch training run on AWS EC2 spot instance. Same 4-layer /
+    256-hidden / 8-head architecture as Kaggle preview. AMP enabled since
+    A10G/A100 support BF16 natively — expect ~1.5-2x speedup vs Kaggle FP32.
+
+data:
+  source: graph_store
+  graph_npz: ~/data/raw/graph_artifact_3tier_14gb.npz
+  graph_meta_json: ~/data/raw/graph_artifact_3tier_14gb.meta.json
+  graph_store_root: ~/data/graph_store_v1
+  read_sealed_only: true
+  packet_feature: semantic
+  add_reverse_edges: true
+  standardize_flow_features: true
+  use_semantic_edge_weights: true
+
+model:
+  hidden_dim: 256
+  num_layers: 4
+  num_heads: 8
+  dropout: 0.15
+  ffn_multiplier: 4
+
+train:
+  output_dir: ~/outputs/nt114_proposed_l4_h256_h8_aws
+  epochs: 100
+  patience: 40
+  batch_mode: neighbor_sampling
+  batch_seed_flows: 192     # A10G 24 GB > T4 16 GB → có thể tăng; giảm xuống 128 nếu OOM
+  grad_accum_steps: 2       # effective batch 384/GPU
+  lr: 0.0005
+  weight_decay: 0.0001
+  grad_clip_norm: 1.0
+  scheduler: cosine_annealing
+  scheduler_eta_min: 1.0e-5
+  val_ratio: 0.1
+  test_ratio: 0.1
+  class_weight: balanced
+  class_weight_cap: 15.0
+  seed: 42
+  device: cuda
+  monitor: val_macro_f1
+  log_every: 1
+  stratified_batch_sampling: true
+  amp: true                 # A10G hỗ trợ BF16 — nếu lại bị freeze thì đổi thành false
+  amp_dtype: auto           # auto-detect: BF16 trên A10G/A100, FP32 fallback nếu không hỗ trợ
+  activation_checkpointing: true
+  compile: false
+  multi_gpu: false          # đổi thành true nếu dùng g5.12xlarge (4 GPU)
+  # --- SMOKE TEST ONLY: uncomment dòng dưới + đổi epochs: 3 ---
+  # max_train_flows: 60000
+
+sampler:
+  hops: 4
+  fanouts:
+    flow__contains__packet: 8
+    packet__next_packet__packet: 4
+    packet__matches_technique__technique: 5
+    flow__matches_technique__technique: 5
+    technique__belongs_to_tactic__tactic: 1
+  reverse_fanouts:
+    rev_contains: 3
+    rev_next_packet: 2
+    rev_matches_technique: 2
+    rev_belongs_to_tactic: 0
+  always_include_all_tactics: true
+  always_include_all_techniques: true
+
+dataloader:
+  num_workers: 4            # g5.2xlarge có 8 vCPU; đổi thành 8 nếu dùng g5.12xlarge
+  prefetch_factor: 4
+  pin_memory: true
+  persistent_workers: true
+
+wandb:
+  project: nt114-hgt-paper-variants
+  run_name: proposed_l4_h256_h8_aws
