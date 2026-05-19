@@ -111,32 +111,26 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 
 def resolve_amp(config: dict, device: torch.device) -> tuple[bool, torch.dtype]:
-    """Hardware-aware mixed-precision resolution.
+    """Resolve mixed precision. CURRENTLY FORCED TO FP32 — see below.
 
-    Returns ``(use_amp, amp_dtype)``. The policy is deliberately conservative
-    so the SAME config runs correctly on any GPU without silent accuracy loss:
+    Returns ``(use_amp, amp_dtype)``; ``use_amp`` is always ``False``.
 
-      * CPU, or ``amp: false``                  -> (False, bfloat16-placeholder)
-      * GPU with native bfloat16 (A100/L4/H100) -> (True,  bfloat16)
-      * GPU WITHOUT bfloat16 (T4/P100/V100)     -> (False, ...)  i.e. pure FP32
+    Why AMP is force-disabled:
+      A Kaggle bfloat16 run of this HGT skipped EVERY optimizer step. The bf16
+      backward through the custom edge-softmax / scatter-add message passing
+      produced non-finite gradients, so ``clip_grad_norm_`` returned ``inf``,
+      every step was discarded, and the loss froze at ``ln(num_classes)``.
+      float16 is likewise unsafe (overflow). Until the bf16 message-passing
+      backward is fixed and verified, training runs in pure FP32 — correct and
+      only modestly slower for a model this small. The ``amp`` / ``amp_dtype``
+      config keys are intentionally IGNORED here.
 
-    float16 + GradScaler is intentionally NOT used: this HGT runs large
-    contraction matmuls inside relation attention (e.g. 768->hidden) whose
-    float16 accumulation overflows to inf, producing NaN loss and silently
-    frozen training. bfloat16 has FP32 exponent range so it never overflows;
-    when bfloat16 is unavailable we fall back to full FP32 (correct, a bit
-    slower) rather than the unsafe float16 path. The model is small enough
-    that FP32 throughput is acceptable even at 500GB-1TB dataset scale.
+    To re-enable AMP after fixing the numerics: restore the hardware-aware
+    logic (gate on ``config["train"]["amp"]`` + ``torch.cuda.is_bf16_supported``)
+    and confirm a smoke run logs a non-zero first-step grad norm.
     """
-    amp_dtype = torch.bfloat16  # always a valid dtype; only used when use_amp is True
-    if not bool(config["train"].get("amp", False)) or device.type != "cuda":
-        return False, amp_dtype
-    req = str(config["train"].get("amp_dtype", "auto")).lower()
-    bf16_ok = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-    if req in {"auto", "bf16", "bfloat16"} and bf16_ok:
-        return True, torch.bfloat16
-    # bfloat16 unavailable, or float16 explicitly requested -> safe FP32 path.
-    return False, amp_dtype
+    _ = (config, device)  # intentionally unused while AMP is force-disabled
+    return False, torch.bfloat16
 
 
 def _wandb_init(config: dict, rank: int) -> bool:
@@ -1364,18 +1358,15 @@ def train_neighbor_sampling(
     log_every = max(1, int(config["train"]["log_every"]))
     use_amp, amp_dtype = resolve_amp(config, device)
     if rank == 0:
-        _req = str(config["train"].get("amp_dtype", "auto")).lower()
         if use_amp:
             print("[AMP] enabled — dtype=bfloat16 (native, no GradScaler)", flush=True)
-        elif bool(config["train"].get("amp", False)) and device.type == "cuda":
+        else:
             print(
-                f"[AMP] disabled — running in FP32. Requested amp_dtype={_req!r} but this "
-                f"GPU has no native bfloat16 (torch.cuda.is_bf16_supported()=False); "
-                f"the float16 path is unsafe for this model, so FP32 is used.",
+                "[AMP] disabled — running in FP32 "
+                "(AMP force-disabled in resolve_amp: bf16 froze training by skipping "
+                "every optimizer step on non-finite gradients).",
                 flush=True,
             )
-        else:
-            print("[AMP] disabled — running in FP32.", flush=True)
     # GradScaler is permanently disabled: we only ever run bfloat16 (FP32 range,
     # no overflow) or pure FP32. Keeping a disabled scaler makes the
     # scaler.scale()/step()/update() calls below pure pass-throughs, so the
@@ -1523,6 +1514,15 @@ def train_neighbor_sampling(
                     optimizer.zero_grad(set_to_none=True)
                     scaler.update()
                     skipped_steps += 1
+                    # Loud warning: a silently-skipped step is invisible, and if EVERY
+                    # step skips the model never learns (loss frozen at ln(num_classes)).
+                    if rank == 0 and skipped_steps <= 5:
+                        print(
+                            f"[warn] optimizer step skipped — non-finite grad norm "
+                            f"(total_norm={float(total_norm):.3e}) at epoch {epoch} batch {step+1}. "
+                            f"Persistent skips freeze training; run in FP32 (amp: false) if this repeats.",
+                            flush=True,
+                        )
                 else:
                     _scale_before = scaler.get_scale()
                     scaler.step(optimizer)
@@ -1611,13 +1611,28 @@ def train_neighbor_sampling(
             if _bad_grads:
                 optimizer.zero_grad(set_to_none=True)
                 scaler.update()
+                skipped_steps += 1
             else:
                 _scale_before = scaler.get_scale()
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
-                if scheduler is not None and scaler.get_scale() >= _scale_before:
-                    scheduler.step()
+                if scaler.get_scale() >= _scale_before:
+                    optimizer_steps += 1
+                    if scheduler is not None:
+                        scheduler.step()
+
+        # Fail fast: if no optimizer step succeeded this epoch, every gradient was
+        # non-finite — the model is frozen. Aborting now saves hours vs. silently
+        # producing a checkpoint that never learned.
+        if optimizer_steps == 0:
+            raise RuntimeError(
+                f"Epoch {epoch}: 0 optimizer steps succeeded ({skipped_steps} skipped for "
+                f"non-finite gradients) — the model cannot learn, weights stay frozen. "
+                f"This is almost always AMP/bfloat16 numerical instability; train in FP32 "
+                f"(amp: false). resolve_amp() already force-disables AMP — if you see this, "
+                f"investigate the gradient path."
+            )
 
         # All-reduce train metrics so every rank reports the global epoch view.
         if is_ddp:
