@@ -1,42 +1,45 @@
-# NT114 Proposed IDS-HGT v6 — Evidence-driven optimization with SOTA imbalance handling.
-# Target: 1× L40S 48GB (AWS g6e.2xlarge spot).
+# NT114 Proposed IDS-HGT v6 — FULL TRAINING config (100 epochs, full ~960k train).
+# Target: 1× L40S 48GB (AWS g6e.2xlarge spot ~$0.60/hr). Expected runtime 25-40h.
 #
-# Three composing imbalance techniques (replaces v5 LDAM that collapsed):
-#   1. Class-Balanced weights (Cui et al. CVPR 2019): (1 - β)/(1 - β^n) per class.
-#      Effective-number-of-samples formula; stable under severe long-tail vs inverse freq.
-#   2. cb_focal loss: focal-loss with CB weights — paper-recommended pairing.
-#   3. DRW Schedule (Cao et al. NeurIPS 2019, LDAM paper): train unweighted for first 70%
-#      of epochs (feature learning), then activate CB weights for last 30% (refine tail).
-#   4. Logit Adjustment (Menon et al. ICLR 2021): subtract τ·log(prior) at eval to debias
-#      argmax toward minority. τ=1.0 paper default.
+# Imbalance handling stack (validated by smoke_v6):
+#   1. cb_focal loss: focal-loss (Lin et al. 2017) with Class-Balanced weights.
+#   2. CB weights (Cui et al. CVPR 2019): (1 - β)/(1 - β^n) per class. Self-regularizing
+#      for severe long-tail; ratio max/min ~1.1x under our distribution (vs inverse 269x).
+#   3. DRW Schedule (Cao et al. NeurIPS 2019): train unweighted (focal-only) for first 70
+#      epochs (better feature learning), activate CB weights last 30 epochs (refine tail).
+#   4. Logit Adjustment DISABLED (logit_adjustment=0.0): smoke evidence showed τ=1.0
+#      collapses val_acc on natural-distribution val (LA assumes balanced test set).
 #
-# Evidence base (5ep smoke, full data, CE-only baseline):
-#   - val_acc Ep5 = 0.190, val_macro_f1 Ep5 = 0.124 (pipeline healthy, learning slowly)
-#   - At full 100ep with peak LR sustained Ep5-15 + DRW + CB-Focal: projected F1 = 0.45-0.65
-#
-# Setup (one-time):
+# Setup (one-time on server):
 #   pip install -e . && pip install -r requirements-ml.txt
 #   python -m graphslm_ids.offline.training.on_disk_graph_store \
 #     --graph-npz /home/ubuntu/dataset/graph3/graph_artifact_3tier_14gb.npz \
 #     --graph-meta-json /home/ubuntu/dataset/graph3/graph_artifact_3tier_14gb.meta.json \
 #     --output-root /home/ubuntu/dataset/graph_store_v1
 #
-# Run (full training):
+# Smoke verify FIRST (mandatory, ~25 min):
+#   tmux new -s smoke
+#   python -m graphslm_ids.offline.training.train_hgt_flow_classifier \
+#     --config configs/hgt_smoke_v6.yaml 2>&1 | tee /home/ubuntu/outputs/smoke_v6.log
+#   # Pass criteria: val_macro_f1 Ep5 >= 0.18, val_acc Ep5 >= 0.30
+#
+# Full run (only after smoke passes):
 #   tmux new -s train
 #   python -m graphslm_ids.offline.training.train_hgt_flow_classifier \
-#     --config configs/hgt_t082_k5_l3_d01_server_v6.yaml
+#     --config configs/hgt_t082_k5_l3_d01_server_v6.yaml \
+#     2>&1 | tee /home/ubuntu/outputs/train_v6.log
 #
-# Smoke variant: copy this file, set epochs=5, max_train_flows=200000, drw_start_pct=0.0.
+# Expected convergence (full): val_macro_f1 ~0.45-0.60 at best epoch.
 
 experiment:
-  source_name: "NT114 Proposed IDS-HGT — v6 (CB-Focal + DRW + Logit Adjustment)"
+  source_name: "NT114 Proposed IDS-HGT — v6 (CB-Focal + DRW)"
   rationale: >
-    Full training with three SOTA imbalanced-classification techniques composing cleanly:
+    Full training with two SOTA imbalanced-classification techniques composing cleanly:
     Class-Balanced weights replace inverse frequency; DRW schedule defers weighting until
-    epoch 70/100 for better feature learning; Logit Adjustment debiases inference by
-    subtracting log(prior). Architecture identical to v5: 4-layer HGT, 384 hidden, 12
-    heads, 4-hop neighbor sampling. Evidence-driven: 5ep smoke confirmed pipeline; LDAM
-    scale=30 from v5 caused decision boundary collapse (val_acc 0.016) — replaced.
+    epoch 70/100 for better feature learning. Architecture identical to v5: 4-layer HGT,
+    384 hidden, 12 heads, 4-hop neighbor sampling. Evidence-driven config: smoke verified
+    pipeline; LDAM scale=30 from v5 caused boundary collapse (replaced with cb_focal);
+    Logit Adjustment τ=1.0 caused val collapse on natural-distribution val set (disabled).
 
 data:
   source: graph_store
@@ -57,9 +60,9 @@ model:
   ffn_multiplier: 4
 
 train:
-  output_dir: /home/ubuntu/outputs/nt114_proposed_v6_cb_drw
+  output_dir: /home/ubuntu/outputs/train_v6
   epochs: 100
-  max_train_flows: 0
+  max_train_flows: 0              # 0 = use full train set (~960k flows)
   patience: 30
   # Batch
   batch_mode: neighbor_sampling
@@ -80,25 +83,25 @@ train:
   test_ratio: 0.1
   # Class imbalance — Class-Balanced weights (Cui et al. 2019).
   class_weight: balanced
-  class_weight_method: cb        # 'inverse' | 'cb'. CB = (1-β)/(1-β^n) per class.
-  cb_beta: 0.999                 # CB paper default. Higher β → closer to inverse freq.
-  class_weight_cap: 3.0          # Looser cap since CB is self-regularizing (vs cap 1.5 needed for inverse).
+  class_weight_method: cb         # 'inverse' | 'cb'. CB = (1-β)/(1-β^n) per class.
+  cb_beta: 0.999                  # CB paper default.
+  class_weight_cap: 3.0           # Safety cap (rarely hit with CB).
   stratified_batch_sampling: false
-  # DRW schedule (Cao et al. 2019). 0.7 = train unweighted for first 70 epochs, then
-  # activate CB weights for last 30. Better feature learning, then refine rare classes.
+  # DRW schedule (Cao et al. 2019). Train unweighted Ep1-70 (focal only); activate
+  # CB weights Ep70-100 to refine rare-class predictions.
   drw_start_pct: 0.7
-  # Loss — Class-Balanced Focal. γ=2 default; CB weights handle imbalance.
+  # Loss — Class-Balanced Focal.
   loss_type: cb_focal
   focal_gamma: 2.0
   label_smoothing: 0.1
-  ldam_max_m: 0.5                # unused when loss_type=cb_focal
-  ldam_scale: 30.0               # unused
-  # Logit Adjustment (Menon et al. ICLR 2021): τ·log(prior) subtraction at eval.
-  logit_adjustment: 1.0          # τ=1.0 paper default. Set 0.0 to disable.
+  ldam_max_m: 0.5                 # unused
+  ldam_scale: 30.0                # unused
+  # Logit Adjustment DISABLED — smoke proved τ=1.0 too aggressive on imbalanced val.
+  logit_adjustment: 0.0
   # Regularization
   drop_edge_prob: 0.05
-  ema_enabled: true
-  ema_decay: 0.999               # ~1000 step window; warms up well within 100 epochs.
+  ema_enabled: true               # Warms up well within 100 epochs (decay 0.999)
+  ema_decay: 0.999
   # Runtime
   seed: 42
   device: cuda
@@ -135,4 +138,4 @@ dataloader:
 
 wandb:
   project: nt114-hgt-paper-variants
-  run_name: proposed_v6_cb_drw
+  run_name: train_v6
