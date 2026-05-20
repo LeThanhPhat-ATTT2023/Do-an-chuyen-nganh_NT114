@@ -4,11 +4,24 @@
 #                  RTX 5090 32 GB  $0.99/hr  (fastest, Medium availability)
 #                  A100 80 GB  $1.39/hr  (overkill, Low availability)
 #
+# ── FIX 2026-05-20: Root cause của model collapse (test acc 0.67%, F1 0.011) ──
+#   Run trước với epochs=3, max_train_flows=60k, class_weight_cap=15,
+#   stratified_batch_sampling=true → "double balancing" → model bỏ qua hoàn toàn
+#   5 class lớn nhất (Benign, VulnScan, Recon-*) chiếm 95% test set, F1=0.
+#   Đồng thời nếu batch_seed_flows bị override lên 512 → collapse (obs 181).
+#
+#   Các fix áp dụng:
+#     1. class_weight_cap: 15.0 → 5.0      (giảm bias minority)
+#     2. stratified_batch_sampling: true → false  (tắt double-balancing)
+#     3. patience: 40 → 20                 (fail-fast)
+#     4. Giữ batch_seed_flows = 256, KHÔNG override lên 512 lúc train
+#     5. Smoke test: max_train_flows 60k → 200k, epochs 3 → 5
+#
 # Key differences from Kaggle config:
 #   - amp: true  → Ampere/Blackwell GPUs support native bfloat16
 #   - batch_seed_flows: 256  → 48 GB VRAM + bfloat16 ~4× headroom vs T4 FP32
 #   - grad_accum_steps: 1   → no accumulation needed at batch 256
-#   - epochs: 100 + patience: 40  → full training run
+#   - epochs: 100 + patience: 20  → full training run
 #   - num_workers: 4  → server has more vCPUs than Kaggle
 #   - paths: /workspace/  (Vast.ai / RunPod convention)
 #
@@ -25,11 +38,15 @@
 #     --graph-meta-json /workspace/data/raw/graph_artifact_3tier_14gb.meta.json \
 #     --output-root /workspace/data/graph_store_v1
 #
-# ── SMOKE TEST (3 epochs, ~15 phút) ─────────────────────────────────────────
-#   Uncomment max_train_flows + đổi epochs: 3, xác nhận log:
+# ── SMOKE TEST (5 epochs, ~30 phút) ─────────────────────────────────────────
+#   Uncomment max_train_flows + epochs trong block `train:`, xác nhận log:
 #     [AMP] bfloat16 enabled (native hardware support detected.)
 #     [diag] first optimizer step | grad_norm=<số khác 0>
-#     loss epoch 1 > epoch 2 > epoch 3
+#     loss epoch 1 > epoch 2 > ... > epoch 5
+#   Expected sau 5 epochs (200k train flows, không double-balancing):
+#     train_acc ≥ 40%, val_acc ≥ 25%, F1 các class lớn (Benign, VulnScan) > 0
+#   Nếu val_acc vẫn ~0.6% như run trước → vấn đề ở graph_artifact / model, không
+#   phải training config. Lúc đó cần inspect graph_store_v1 manifest và labels.
 #
 # ── Full run (2× A40) ────────────────────────────────────────────────────────
 #   tmux new -s train
@@ -72,9 +89,10 @@ model:
 train:
   output_dir: /workspace/outputs/nt114_proposed_l4_h256_h8_server
   epochs: 100
-  patience: 40
+  patience: 20             # FIX: giảm từ 40 → 20 để fail-fast nếu collapse
   batch_mode: neighbor_sampling
   batch_seed_flows: 256     # A40 48 GB + bfloat16: ~4× headroom vs T4 FP32 16 GB
+                            # FIX: KHÔNG override lên 512 — đã gây model collapse (obs 181).
                             # RTX 5090 32 GB: giảm xuống 192 nếu OOM
   grad_accum_steps: 1       # effective batch 256/GPU (×2 GPUs via DDP = 512)
   lr: 0.0005
@@ -85,19 +103,27 @@ train:
   val_ratio: 0.1
   test_ratio: 0.1
   class_weight: balanced
-  class_weight_cap: 15.0
+  class_weight_cap: 5.0    # FIX: giảm từ 15.0 → 5.0. Cap=15 quá cao, model spam predict
+                            # minority class → Benign/VulnScan/Recon-* bị bỏ qua hoàn toàn
+                            # (F1=0). Cap=5 vẫn boost minority nhưng không làm sụp majority.
   seed: 42
   device: cuda
   monitor: val_macro_f1
   log_every: 1
-  stratified_batch_sampling: true
+  stratified_batch_sampling: false  # FIX: tắt double-balancing. Khi đã có class_weight
+                                     # balanced trong loss, thêm stratified sampling tạo
+                                     # bias gấp đôi → minority recall cao nhưng precision ~1%.
   amp: true                 # bfloat16 trên A40/RTX5090/A100; tự về FP32 nếu GPU không hỗ trợ
   amp_dtype: auto
   activation_checkpointing: true
   compile: false
   multi_gpu: true           # 2× A40 với torchrun --nproc_per_node=2
-  # --- SMOKE TEST ONLY: uncomment dòng dưới + đổi epochs: 3 ---
-  # max_train_flows: 60000
+  # --- SMOKE TEST ONLY ---
+  # Bước 1: COMMENT dòng `epochs: 100` ở trên (YAML không cho duplicate key).
+  # Bước 2: Uncomment 2 dòng dưới:
+  # max_train_flows: 200000   # FIX: tăng từ 60k → 200k (16% data thay vì 4%)
+  # epochs: 5                 # FIX: tăng từ 3 → 5 cho đủ tín hiệu hội tụ
+  # Bước 3: Sau smoke test PASS → revert: uncomment `epochs: 100`, comment 2 dòng trên.
 
 sampler:
   hops: 4
