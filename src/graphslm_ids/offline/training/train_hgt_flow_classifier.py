@@ -725,7 +725,19 @@ def class_weights_from_backend(
     train_idx: np.ndarray,
     num_classes: int,
     max_weight: float = float("inf"),
+    weight_method: str = "inverse",
+    cb_beta: float = 0.999,
 ) -> torch.Tensor:
+    """Compute per-class loss weights from training labels.
+
+    weight_method:
+      - "inverse": w_c = N / (K * n_c), classic inverse frequency.
+      - "cb": Class-Balanced (Cui et al. CVPR 2019), w_c = (1 - β) / (1 - β^n_c).
+        Approximates effective number of samples; less aggressive on extreme-tail
+        classes than inverse frequency, more stable under severe imbalance.
+
+    Weights are normalized so mean = 1.0 (loss scale comparable to unweighted CE).
+    """
     manifest_weights = (backend.manifest or {}).get("class_weights")
     if isinstance(manifest_weights, list) and len(manifest_weights) >= num_classes:
         weights = np.array(manifest_weights[:num_classes], dtype=np.float32)
@@ -733,10 +745,19 @@ def class_weights_from_backend(
             weights = np.minimum(weights, max_weight)
         return torch.from_numpy(weights)
     labels = backend.get_flow_labels(np.asarray(train_idx, dtype=np.int64))
-    counts = np.bincount(labels, minlength=num_classes).astype(np.float32)
-    weights = np.zeros(num_classes, dtype=np.float32)
-    nonzero = counts > 0
-    weights[nonzero] = counts[nonzero].sum() / (float(num_classes) * counts[nonzero])
+    counts = np.bincount(labels, minlength=num_classes).astype(np.float64)
+    if weight_method == "cb":
+        effective_num = 1.0 - np.power(cb_beta, np.maximum(counts, 1.0))
+        weights = (1.0 - cb_beta) / np.maximum(effective_num, 1e-12)
+    else:
+        weights = np.zeros(num_classes, dtype=np.float64)
+        nonzero = counts > 0
+        weights[nonzero] = counts[nonzero].sum() / (float(num_classes) * counts[nonzero])
+    nonzero_weights = weights[weights > 0]
+    weight_mean = float(nonzero_weights.mean()) if nonzero_weights.size > 0 else 1.0
+    if weight_mean > 0:
+        weights = weights / weight_mean
+    weights = weights.astype(np.float32)
     if max_weight < float("inf"):
         weights = np.minimum(weights, max_weight)
     return torch.from_numpy(weights)
@@ -778,7 +799,10 @@ def _compute_train_loss(
 
     Eval loss must stay plain CE (no smoothing/margin) for raw loss comparability.
     """
-    if loss_type == "focal":
+    if loss_type in ("focal", "cb_focal"):
+        # Focal loss (Lin et al. ICCV 2017): FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t).
+        # cb_focal is identical at the function level; the behavioral difference is
+        # that cb_focal expects `weight` to come from Class-Balanced method (Cui et al. 2019).
         log_probs = F.log_softmax(logits, dim=-1)
         targets = labels.unsqueeze(-1)
         log_p_t = log_probs.gather(dim=-1, index=targets).squeeze(-1)
@@ -1213,6 +1237,7 @@ def evaluate_neighbor_sampling(
     split_name: str = "eval",
     devices: list[torch.device] | None = None,
     is_ddp: bool = False,
+    logit_adjustment: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     """Three paths:
       1. DDP (``is_ddp=True``): each rank evaluates its DistributedSampler shard,
@@ -1250,7 +1275,10 @@ def evaluate_neighbor_sampling(
                     loss = F.cross_entropy(seed_logits.float(), seed_labels, reduction="sum")
                 loss_sum_t += loss.detach().to(torch.float64)
                 examples_t += seed_labels.numel()
-                pred = seed_logits.detach().float().argmax(dim=1)
+                _logits_for_pred = seed_logits.detach().float()
+                if logit_adjustment is not None:
+                    _logits_for_pred = _logits_for_pred - logit_adjustment.to(_logits_for_pred.device)
+                pred = _logits_for_pred.argmax(dim=1)
                 counts_acc += _per_class_counts_tensor(pred, seed_labels, num_classes)
                 if progress_every and (i - last_logged >= progress_every or i == total_batches):
                     if not dist.is_initialized() or dist.get_rank() == 0:
@@ -1301,7 +1329,10 @@ def evaluate_neighbor_sampling(
                         seed_logits = logits[seed_mask]
                         loss = F.cross_entropy(seed_logits.float(), seed_labels, reduction="sum")
                     loss_sum += float(loss.item())
-                    preds.append(seed_logits.detach().float().argmax(dim=1).cpu().numpy())
+                    _logits_for_pred = seed_logits.detach().float()
+                    if logit_adjustment is not None:
+                        _logits_for_pred = _logits_for_pred - logit_adjustment.to(_logits_for_pred.device)
+                    preds.append(_logits_for_pred.argmax(dim=1).cpu().numpy())
                     labels.append(seed_labels.detach().cpu().numpy())
                 batches_seen += len(batch_group)
                 if progress_every and (
@@ -1329,7 +1360,10 @@ def evaluate_neighbor_sampling(
                     seed_logits = logits[seed_mask]
                     loss = F.cross_entropy(seed_logits.float(), seed_labels, reduction="sum")
                 loss_sum += float(loss.item())
-                preds.append(seed_logits.detach().float().argmax(dim=1).cpu().numpy())
+                _logits_for_pred = seed_logits.detach().float()
+                if logit_adjustment is not None:
+                    _logits_for_pred = _logits_for_pred - logit_adjustment.to(_logits_for_pred.device)
+                preds.append(_logits_for_pred.argmax(dim=1).cpu().numpy())
                 labels.append(seed_labels.detach().cpu().numpy())
                 if progress_every and (i - last_logged >= progress_every or i == total_batches):
                     pct = 100.0 * i / total_batches
@@ -1552,10 +1586,28 @@ def train_neighbor_sampling(
         message="Detected call of `lr_scheduler.step\\(\\)` before `optimizer.step\\(\\)`",
         category=UserWarning,
     )
-    weight = None
+    # --- Class weight setup with optional DRW (Deferred Re-Weighting, Cao et al. 2019) ---
+    # DRW trains with no class weight for the first drw_start_pct of epochs (better
+    # feature learning), then activates weights for the remainder (refines rare classes).
+    # drw_start_pct=0.0 → weight active from epoch 1 (no deferral).
+    # drw_start_pct=1.0 → weight never applied (pure unweighted training).
+    target_weight: torch.Tensor | None = None
+    _weight_method = "off"
+    _cb_beta_used: float | None = None
     if str(config["train"]["class_weight"]).lower() == "balanced":
         _max_w = float(config["train"].get("class_weight_cap", float("inf")))
-        weight = class_weights_from_backend(backend, train_idx_np, num_classes, max_weight=_max_w).to(device)
+        _weight_method = str(config["train"].get("class_weight_method", "inverse")).lower()
+        _cb_beta_used = float(config["train"].get("cb_beta", 0.999))
+        target_weight = class_weights_from_backend(
+            backend, train_idx_np, num_classes,
+            max_weight=_max_w,
+            weight_method=_weight_method,
+            cb_beta=_cb_beta_used,
+        ).to(device)
+    drw_start_pct = float(config["train"].get("drw_start_pct", 0.0))
+    drw_start_epoch = max(1, int(int(config["train"]["epochs"]) * drw_start_pct))
+    # Active weight is selected per-epoch in the training loop based on DRW gate.
+    weight = None
 
     # QUALITY v4: Configurable loss type for severe class imbalance.
     # - 'ce' (default): F.cross_entropy with optional label_smoothing (0.1 typical)
@@ -1566,20 +1618,51 @@ def train_neighbor_sampling(
     focal_gamma = float(config["train"].get("focal_gamma", 2.0))
     ldam_max_m = float(config["train"].get("ldam_max_m", 0.5))
     ldam_scale = float(config["train"].get("ldam_scale", 30.0))
-    if loss_type not in {"ce", "focal", "ldam"}:
-        raise ValueError(f"Unknown loss_type {loss_type!r}. Supported: 'ce', 'focal', 'ldam'.")
+    if loss_type not in {"ce", "focal", "cb_focal", "ldam"}:
+        raise ValueError(
+            f"Unknown loss_type {loss_type!r}. Supported: 'ce', 'focal', 'cb_focal', 'ldam'."
+        )
     ldam_margins = None
     if loss_type == "ldam":
         train_labels_np = backend.get_flow_labels(np.asarray(train_idx_np, dtype=np.int64))
         train_class_counts = np.bincount(train_labels_np, minlength=num_classes).astype(np.float64)
         ldam_margins = _compute_ldam_margins(train_class_counts, max_m=ldam_max_m).to(device)
     if rank == 0:
+        _drw_msg = (
+            f"drw_start_epoch={drw_start_epoch}/{int(config['train']['epochs'])}"
+            if target_weight is not None and drw_start_pct > 0.0
+            else "drw=off"
+        )
         print(
             f"[loss] type={loss_type} label_smoothing={label_smoothing} "
             f"focal_gamma={focal_gamma} ldam_max_m={ldam_max_m} ldam_scale={ldam_scale} "
-            f"class_weight={'on' if weight is not None else 'off'}",
+            f"class_weight_method={_weight_method} "
+            f"cb_beta={_cb_beta_used if _cb_beta_used is not None else 'n/a'} "
+            f"{_drw_msg}",
             flush=True,
         )
+
+    # Logit Adjustment (Menon et al. ICLR 2021): subtract τ·log(prior) from eval
+    # logits to debias inference toward rare classes. τ=1.0 paper default. Set 0
+    # to disable.
+    logit_adjustment_tau = float(config["train"].get("logit_adjustment", 0.0))
+    eval_logit_adjustment: torch.Tensor | None = None
+    if logit_adjustment_tau > 0.0:
+        _train_labels_for_prior = backend.get_flow_labels(
+            np.asarray(train_idx_np, dtype=np.int64)
+        )
+        _prior_counts = np.bincount(_train_labels_for_prior, minlength=num_classes).astype(np.float64)
+        _prior = np.maximum(_prior_counts / max(_prior_counts.sum(), 1.0), 1e-12)
+        eval_logit_adjustment = torch.from_numpy(
+            (logit_adjustment_tau * np.log(_prior)).astype(np.float32)
+        ).to(device)
+        if rank == 0:
+            print(
+                f"[logit_adjustment] tau={logit_adjustment_tau} "
+                f"adj_min={eval_logit_adjustment.min().item():.3f} "
+                f"adj_max={eval_logit_adjustment.max().item():.3f}",
+                flush=True,
+            )
 
     drop_edge_prob = float(config["train"].get("drop_edge_prob", 0.0))
     if rank == 0 and drop_edge_prob > 0.0:
@@ -1638,6 +1721,17 @@ def train_neighbor_sampling(
         )
 
     for epoch in range(1, int(config["train"]["epochs"]) + 1):
+        # DRW gate — activate class weights only after drw_start_epoch.
+        if target_weight is not None and epoch >= drw_start_epoch:
+            if weight is None and rank == 0 and drw_start_pct > 0.0:
+                print(
+                    f"[DRW] Activating class weights at epoch {epoch} "
+                    f"(start_pct={drw_start_pct:.2f}).",
+                    flush=True,
+                )
+            weight = target_weight
+        else:
+            weight = None
         if train_dist_sampler is not None:
             # Reshuffle the DistributedSampler so each epoch sees a different
             # rank-to-flow assignment — critical for SGD on sharded data.
@@ -1935,6 +2029,7 @@ def train_neighbor_sampling(
                 split_name="val",
                 devices=devices if (n_gpus > 1 and not is_ddp) else None,
                 is_ddp=is_ddp,
+                logit_adjustment=eval_logit_adjustment,
             )
         else:
             val_metrics = {
@@ -2076,6 +2171,7 @@ def train_neighbor_sampling(
             label_names=label_names,
             split_name="test",
             is_ddp=False,
+            logit_adjustment=eval_logit_adjustment,
         )
         device_str = (
             f"{device} x{world_size}" if is_ddp else
