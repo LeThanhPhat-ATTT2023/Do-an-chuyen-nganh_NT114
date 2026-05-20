@@ -94,27 +94,38 @@ data:
   use_semantic_edge_weights: true
 
 model:
-  hidden_dim: 256
+  # QUALITY v3 2026-05-20: hidden_dim 256 → 384. Sau 3 run hyperparam tuning,
+  # macro F1 vẫn plateau ~0.09 ở epoch 5 → bottleneck là MODEL CAPACITY, không
+  # phải hyperparams. 13-class imbalance cần nhiều params hơn để học pattern.
+  # L40S 48GB chứa được hidden=384 với batch=256 (peak ~22 GB).
+  hidden_dim: 384
   num_layers: 4
   num_heads: 8
   dropout: 0.15
   ffn_multiplier: 4
 
 train:
-  output_dir: /home/ubuntu/outputs/nt114_proposed_l4_h256_h8_server   # AWS path; đổi /workspace/... nếu dùng Vast.ai/RunPod
+  output_dir: /home/ubuntu/outputs/nt114_proposed_l4_h384_h8_v3   # QUALITY v3: hidden 384, OneCycleLR
   epochs: 100
-  patience: 20             # FIX: giảm từ 40 → 20 để fail-fast nếu collapse
+  patience: 30             # QUALITY v3: 20 → 30. Hidden_dim lớn hơn cần thêm epoch
+                            # để converge. Với onecycle warmup, model học chậm hơn ở
+                            # đầu nhưng ổn định hơn cuối → patience cao hơn cần thiết.
   batch_mode: neighbor_sampling
-  batch_seed_flows: 256     # A40 48 GB + bfloat16: ~4× headroom vs T4 FP32 16 GB
-                            # FIX: KHÔNG override lên 512 — đã gây model collapse (obs 181).
-                            # RTX 5090 32 GB: giảm xuống 192 nếu OOM
+  batch_seed_flows: 320     # OPT v3 2026-05-20: 256 → 320. Tận dụng VRAM L40S 48GB
+                            # (peak ~26 GB với hidden 384). Vẫn an toàn dưới ngưỡng
+                            # collapse 384+. RTX 5090 32 GB: giảm xuống 224 nếu OOM.
   grad_accum_steps: 1       # effective batch 256/GPU (×2 GPUs via DDP = 512)
-  lr: 0.0007                # OPT v2 2026-05-20: 0.001 → 0.0007. lr=0.001 gây dao động
-                            # val_acc (15.6 → 13.5) trong 2 epoch đầu. 0.0007 là compromise:
-                            # nhanh hơn 0.0005 cũ nhưng không gây instability.
+  lr: 0.001                 # QUALITY v3: 0.0007 → 0.001 là PEAK lr cho OneCycleLR.
+                            # OneCycleLR sẽ warmup từ lr/25 (=0.00004) tăng dần tới
+                            # peak 0.001 ở 5% steps, rồi giảm cosine → eta_min.
+                            # Khác với cosine_annealing không warmup → ổn định hơn.
   weight_decay: 0.0001
   grad_clip_norm: 1.0
-  scheduler: cosine_annealing
+  scheduler: onecycle       # QUALITY v3: cosine_annealing → onecycle. OneCycleLR có
+                            # warmup built-in (5% đầu) → giải quyết dao động val_acc
+                            # (run v2 dao động 12% giữa epoch). Warmup cũng giúp model
+                            # với class imbalance ổn định gradient giai đoạn đầu.
+  scheduler_pct_start: 0.05 # 5% steps đầu là warmup, 95% sau là cosine decay
   scheduler_eta_min: 1.0e-5
   val_ratio: 0.1
   test_ratio: 0.1
@@ -133,9 +144,10 @@ train:
   amp_dtype: auto
   activation_checkpointing: false  # FIX: L40S/A40 48GB đủ chứa batch 256 — tắt để nhanh hơn 20-30%.
                                     # Bật lại nếu OOM (chỉ xảy ra khi tăng batch ≥ 512 hoặc hidden ≥ 512).
-  compile: true             # OPT 2026-05-20: false → true. PyTorch 2.x kernel fusion trên
-                            # L40S Ada Lovelace cho ~10-15% speedup. Nếu compile fail (HGT
-                            # có dynamic shapes), tự fallback eager — không crash.
+  compile: false            # QUALITY v3: true → false. torch.compile trên HGT bị
+                            # fallback eager vì dynamic shapes (subgraph khác nhau mỗi
+                            # batch) → user xác nhận run v2 không nhanh hơn. Tắt để
+                            # tiết kiệm 60-120s compile overhead ở startup.
   multi_gpu: false          # FIX: mặc định false cho SINGLE GPU (L40S/A40 đơn).
                             # Đổi true CHỈ KHI có ≥ 2 GPU + chạy qua torchrun --nproc_per_node=N.
                             # Single GPU + multi_gpu=true có thể gây DDP init mismatch (như run nt114_l40s).
@@ -147,17 +159,18 @@ train:
   # Bước 3: Sau smoke test PASS → revert: uncomment `epochs: 100`, comment 2 dòng trên.
 
 sampler:
-  # OPT v2 2026-05-20: Giữ fanout giảm nhưng REVERT hops 3 → 4. HGT 4-layer cần
-  # hops=4 để layer cuối có receptive field đầy đủ. Hops=3 + 4-layer model = underfit.
+  # QUALITY v3 2026-05-20: REVERT toàn bộ fanouts về giá trị gốc.
+  # Run v2 với fanout 6/3 không nhanh hơn nhưng quality tương đương → speed
+  # tradeoff không có lợi. Quay về 8/4 cho subgraph đầy đủ ngữ cảnh.
   hops: 4
   fanouts:
-    flow__contains__packet: 6        # OPT: 8 → 6 (giảm packet/flow trong subgraph)
-    packet__next_packet__packet: 3   # OPT: 4 → 3 (subgraph compact hơn)
+    flow__contains__packet: 8        # QUALITY v3: 6 → 8 (revert — đầy đủ context)
+    packet__next_packet__packet: 4   # QUALITY v3: 3 → 4 (revert — sequence context)
     packet__matches_technique__technique: 5
     flow__matches_technique__technique: 5
     technique__belongs_to_tactic__tactic: 1
   reverse_fanouts:
-    rev_contains: 2                  # OPT: 3 → 2 (cân với forward fanout giảm)
+    rev_contains: 3                  # QUALITY v3: 2 → 3 (revert — back-edge đầy đủ)
     rev_next_packet: 2
     rev_matches_technique: 2
     rev_belongs_to_tactic: 0
@@ -168,8 +181,9 @@ dataloader:
   num_workers: 8            # FIX: 4 → 8. L40S server (Vast.ai/RunPod) thường có 16+ vCPU.
                             # Neighbor sampling CPU-bound → workers ít gây GPU đói data.
                             # Giảm về 4 nếu server <8 vCPU (kiểm tra: `nproc`).
-  prefetch_factor: 6        # OPT 2026-05-20: 4 → 6. Sampling nhanh hơn (do hops giảm)
-                            # nên prefetch nhiều batch trước để GPU không phải chờ.
+  prefetch_factor: 10       # OPT v3 2026-05-20: 6 → 10. Tăng queue prefetch để GPU
+                            # không phải chờ CPU sampling (sampling là bottleneck chính).
+                            # Với 8 workers x 10 = 80 batches buffered → GPU ăn liên tục.
   pin_memory: true
   persistent_workers: true
 
