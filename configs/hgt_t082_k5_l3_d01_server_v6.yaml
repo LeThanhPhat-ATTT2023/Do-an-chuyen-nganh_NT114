@@ -1,0 +1,138 @@
+# NT114 Proposed IDS-HGT v6 — Evidence-driven optimization with SOTA imbalance handling.
+# Target: 1× L40S 48GB (AWS g6e.2xlarge spot).
+#
+# Three composing imbalance techniques (replaces v5 LDAM that collapsed):
+#   1. Class-Balanced weights (Cui et al. CVPR 2019): (1 - β)/(1 - β^n) per class.
+#      Effective-number-of-samples formula; stable under severe long-tail vs inverse freq.
+#   2. cb_focal loss: focal-loss with CB weights — paper-recommended pairing.
+#   3. DRW Schedule (Cao et al. NeurIPS 2019, LDAM paper): train unweighted for first 70%
+#      of epochs (feature learning), then activate CB weights for last 30% (refine tail).
+#   4. Logit Adjustment (Menon et al. ICLR 2021): subtract τ·log(prior) at eval to debias
+#      argmax toward minority. τ=1.0 paper default.
+#
+# Evidence base (5ep smoke, full data, CE-only baseline):
+#   - val_acc Ep5 = 0.190, val_macro_f1 Ep5 = 0.124 (pipeline healthy, learning slowly)
+#   - At full 100ep with peak LR sustained Ep5-15 + DRW + CB-Focal: projected F1 = 0.45-0.65
+#
+# Setup (one-time):
+#   pip install -e . && pip install -r requirements-ml.txt
+#   python -m graphslm_ids.offline.training.on_disk_graph_store \
+#     --graph-npz /home/ubuntu/dataset/graph3/graph_artifact_3tier_14gb.npz \
+#     --graph-meta-json /home/ubuntu/dataset/graph3/graph_artifact_3tier_14gb.meta.json \
+#     --output-root /home/ubuntu/dataset/graph_store_v1
+#
+# Run (full training):
+#   tmux new -s train
+#   python -m graphslm_ids.offline.training.train_hgt_flow_classifier \
+#     --config configs/hgt_t082_k5_l3_d01_server_v6.yaml
+#
+# Smoke variant: copy this file, set epochs=5, max_train_flows=200000, drw_start_pct=0.0.
+
+experiment:
+  source_name: "NT114 Proposed IDS-HGT — v6 (CB-Focal + DRW + Logit Adjustment)"
+  rationale: >
+    Full training with three SOTA imbalanced-classification techniques composing cleanly:
+    Class-Balanced weights replace inverse frequency; DRW schedule defers weighting until
+    epoch 70/100 for better feature learning; Logit Adjustment debiases inference by
+    subtracting log(prior). Architecture identical to v5: 4-layer HGT, 384 hidden, 12
+    heads, 4-hop neighbor sampling. Evidence-driven: 5ep smoke confirmed pipeline; LDAM
+    scale=30 from v5 caused decision boundary collapse (val_acc 0.016) — replaced.
+
+data:
+  source: graph_store
+  graph_npz: /home/ubuntu/dataset/graph3/graph_artifact_3tier_14gb.npz
+  graph_meta_json: /home/ubuntu/dataset/graph3/graph_artifact_3tier_14gb.meta.json
+  graph_store_root: /home/ubuntu/dataset/graph_store_v1
+  read_sealed_only: true
+  packet_feature: semantic
+  add_reverse_edges: true
+  standardize_flow_features: true
+  use_semantic_edge_weights: true
+
+model:
+  hidden_dim: 384
+  num_layers: 4
+  num_heads: 12
+  dropout: 0.20
+  ffn_multiplier: 4
+
+train:
+  output_dir: /home/ubuntu/outputs/nt114_proposed_v6_cb_drw
+  epochs: 100
+  max_train_flows: 0
+  patience: 30
+  # Batch
+  batch_mode: neighbor_sampling
+  batch_seed_flows: 256
+  grad_accum_steps: 1
+  # Optimizer (BF16-stable)
+  lr: 0.001
+  weight_decay: 0.0003
+  grad_clip_norm: 1.0
+  adamw_eps: 1.0e-6
+  adamw_betas: [0.9, 0.95]
+  # Scheduler — OneCycleLR with 5% warmup; ~5 epochs of peak LR over 100ep run.
+  scheduler: onecycle
+  scheduler_pct_start: 0.05
+  scheduler_eta_min: 1.0e-5
+  # Split
+  val_ratio: 0.1
+  test_ratio: 0.1
+  # Class imbalance — Class-Balanced weights (Cui et al. 2019).
+  class_weight: balanced
+  class_weight_method: cb        # 'inverse' | 'cb'. CB = (1-β)/(1-β^n) per class.
+  cb_beta: 0.999                 # CB paper default. Higher β → closer to inverse freq.
+  class_weight_cap: 3.0          # Looser cap since CB is self-regularizing (vs cap 1.5 needed for inverse).
+  stratified_batch_sampling: false
+  # DRW schedule (Cao et al. 2019). 0.7 = train unweighted for first 70 epochs, then
+  # activate CB weights for last 30. Better feature learning, then refine rare classes.
+  drw_start_pct: 0.7
+  # Loss — Class-Balanced Focal. γ=2 default; CB weights handle imbalance.
+  loss_type: cb_focal
+  focal_gamma: 2.0
+  label_smoothing: 0.1
+  ldam_max_m: 0.5                # unused when loss_type=cb_focal
+  ldam_scale: 30.0               # unused
+  # Logit Adjustment (Menon et al. ICLR 2021): τ·log(prior) subtraction at eval.
+  logit_adjustment: 1.0          # τ=1.0 paper default. Set 0.0 to disable.
+  # Regularization
+  drop_edge_prob: 0.05
+  ema_enabled: true
+  ema_decay: 0.999               # ~1000 step window; warms up well within 100 epochs.
+  # Runtime
+  seed: 42
+  device: cuda
+  monitor: val_macro_f1
+  log_every: 1
+  amp: true
+  amp_dtype: auto
+  activation_checkpointing: false
+  compile: false
+  multi_gpu: false
+  skip_val_first_epoch: true
+
+sampler:
+  hops: 4
+  fanouts:
+    flow__contains__packet: 8
+    packet__next_packet__packet: 4
+    packet__matches_technique__technique: 5
+    flow__matches_technique__technique: 5
+    technique__belongs_to_tactic__tactic: 1
+  reverse_fanouts:
+    rev_contains: 3
+    rev_next_packet: 2
+    rev_matches_technique: 2
+    rev_belongs_to_tactic: 0
+  always_include_all_tactics: true
+  always_include_all_techniques: true
+
+dataloader:
+  num_workers: 8
+  prefetch_factor: 10
+  pin_memory: true
+  persistent_workers: true
+
+wandb:
+  project: nt114-hgt-paper-variants
+  run_name: proposed_v6_cb_drw

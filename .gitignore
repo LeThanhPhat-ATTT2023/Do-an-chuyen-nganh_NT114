@@ -43,3 +43,4 @@ logs/
 !/data/interim/.gitkeep
 !/data/processed/.gitkeep
 !/data/mitre/.gitkeep
+docs/superpowers/
