@@ -69,7 +69,9 @@ train:
   # Class imbalance — CB weights active immediately (DRW disabled for smoke).
   class_weight: balanced
   class_weight_method: cb
-  cb_beta: 0.999
+  cb_beta: 0.9999                 # Tuned for 269:1 imbalance. β=0.999 gave only 1.08x ratio
+                                  # (smoke v6 Ep5: val_F1=0.114, below 0.18 target).
+                                  # β=0.9999 → ratio 4.4x (Class 10: 2.29 vs Class 11: 0.52).
   class_weight_cap: 3.0
   stratified_batch_sampling: false
   drw_start_pct: 0.0              # SMOKE: weights active from Ep1 (heaviest test)
