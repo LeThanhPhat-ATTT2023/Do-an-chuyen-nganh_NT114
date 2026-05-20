@@ -84,8 +84,10 @@ train:
   # Class imbalance — Class-Balanced weights (Cui et al. 2019).
   class_weight: balanced
   class_weight_method: cb         # 'inverse' | 'cb'. CB = (1-β)/(1-β^n) per class.
-  cb_beta: 0.999                  # CB paper default.
-  class_weight_cap: 3.0           # Safety cap (rarely hit with CB).
+  cb_beta: 0.9999                 # Tuned for 269:1 imbalance. β=0.999 (paper default for
+                                  # moderate imbalance) gave only 1.08x ratio on our data;
+                                  # β=0.9999 gives 4.4x (Class 10 weight 2.29 vs Class 11 0.52).
+  class_weight_cap: 3.0           # Safety cap (max raw weight ~2.3 with β=0.9999).
   stratified_batch_sampling: false
   # DRW schedule (Cao et al. 2019). Train unweighted Ep1-70 (focal only); activate
   # CB weights Ep70-100 to refine rare-class predictions.
