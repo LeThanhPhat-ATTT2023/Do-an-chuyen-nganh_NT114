@@ -1,86 +1,27 @@
-# NT114 Proposed IDS-HGT — Cloud GPU Server (AWS / Vast.ai / RunPod).
-# ★ Đây là CONFIG CHÍNH THỨC cho training trên server (thay thế _aws.yaml).
+# NT114 Proposed IDS-HGT — Single-GPU cloud server (AWS / Vast.ai / RunPod).
+# Target: 1× L40S 48GB (AWS g6e.2xlarge spot ~$0.60/hr) or equivalent Ampere+.
 #
-# Target hardware: L40S 48 GB  $0.80-1.20/hr  ⭐ RECOMMENDED — Ada Lovelace, 1.7× A40
-#                  A40 48 GB  $0.44/hr  (rẻ hơn, Medium availability)
-#                  RTX 5090 32 GB  $0.99/hr  (fastest single, Medium availability)
-#                  A100 80 GB  $1.39/hr  (overkill, Low availability)
-#                  AWS g6e.2xlarge (L40S spot) $0.60/hr  — recommended cloud
-#                  AWS g5.2xlarge (A10G spot)  $0.50/hr  — cheaper fallback
-#
-# ── FIX 2026-05-20: Root cause của model collapse (test acc 0.67%, F1 0.011) ──
-#   Run trước với epochs=3, max_train_flows=60k, class_weight_cap=15,
-#   stratified_batch_sampling=true → "double balancing" → model bỏ qua hoàn toàn
-#   5 class lớn nhất (Benign, VulnScan, Recon-*) chiếm 95% test set, F1=0.
-#   Đồng thời nếu batch_seed_flows bị override lên 512 → collapse (obs 181).
-#
-#   Các fix áp dụng:
-#     1. class_weight_cap: 15.0 → 5.0      (giảm bias minority)
-#     2. stratified_batch_sampling: true → false  (tắt double-balancing)
-#     3. patience: 40 → 20                 (fail-fast)
-#     4. Giữ batch_seed_flows = 256, KHÔNG override lên 512 lúc train
-#     5. Smoke test: max_train_flows 60k → 200k, epochs 3 → 5
-#
-# Key differences from Kaggle config:
-#   - amp: true  → Ampere/Blackwell GPUs support native bfloat16
-#   - batch_seed_flows: 256  → 48 GB VRAM + bfloat16 ~4× headroom vs T4 FP32
-#   - grad_accum_steps: 1   → no accumulation needed at batch 256
-#   - epochs: 100 + patience: 20  → full training run
-#   - num_workers: 4  → server has more vCPUs than Kaggle
-#   - paths: /workspace/  (Vast.ai / RunPod convention)
-#
-# ── Setup (run once after provisioning) ─────────────────────────────────────
+# Setup (one-time):
 #   pip install -e . && pip install -r requirements-ml.txt
-#
-#   # NPZ đã có sẵn tại /home/ubuntu/dataset/graph3/ (AWS) — verify:
-#   ls -lh /home/ubuntu/dataset/graph3/graph_artifact_3tier_14gb.npz
-#   ls -lh /home/ubuntu/dataset/graph3/graph_artifact_3tier_14gb.meta.json
-#
-#   # Build graph store CSR (BẮT BUỘC — chạy 1 lần, ~10-20 phút, ~5-10 GB disk):
 #   python -m graphslm_ids.offline.training.on_disk_graph_store \
 #     --graph-npz /home/ubuntu/dataset/graph3/graph_artifact_3tier_14gb.npz \
 #     --graph-meta-json /home/ubuntu/dataset/graph3/graph_artifact_3tier_14gb.meta.json \
 #     --output-root /home/ubuntu/dataset/graph_store_v1
 #
-#   # Verify graph store đã build:
-#   ls /home/ubuntu/dataset/graph_store_v1/manifest.json
-#
-#   # Nếu chạy trên Vast.ai/RunPod (path /workspace/...) — đổi data block bên dưới:
-#   #   graph_npz: /workspace/dataset/graph3/graph_artifact_3tier_14gb.npz
-#   #   graph_store_root: /workspace/dataset/graph_store_v1
-#
-# ── SMOKE TEST (5 epochs, ~30 phút) ─────────────────────────────────────────
-#   Uncomment max_train_flows + epochs trong block `train:`, xác nhận log:
-#     [AMP] bfloat16 enabled (native hardware support detected.)
-#     [diag] first optimizer step | grad_norm=<số khác 0>
-#     loss epoch 1 > epoch 2 > ... > epoch 5
-#   Expected sau 5 epochs (200k train flows, không double-balancing):
-#     train_acc ≥ 40%, val_acc ≥ 25%, F1 các class lớn (Benign, VulnScan) > 0
-#   Nếu val_acc vẫn ~0.6% như run trước → vấn đề ở graph_artifact / model, không
-#   phải training config. Lúc đó cần inspect graph_store_v1 manifest và labels.
-#
-# ── Full run (1× L40S — RECOMMENDED) ─────────────────────────────────────────
+# Train:
 #   tmux new -s train
 #   python -m graphslm_ids.offline.training.train_hgt_flow_classifier \
 #     --config configs/hgt_t082_k5_l3_d01_server.yaml
-#   # multi_gpu: false (default) — chạy trực tiếp với python, không qua torchrun.
-#   # Expected: ~6-8 giờ / 100 epochs (L40S ~1.7× A40).
 #
-# ── Full run (2× A40 / 2× L40S, multi-GPU DDP) ──────────────────────────────
-#   # Đổi multi_gpu: true trong config train trước!
-#   tmux new -s train
-#   torchrun --nproc_per_node=2 \
-#     -m graphslm_ids.offline.training.train_hgt_flow_classifier \
-#     --config configs/hgt_t082_k5_l3_d01_server.yaml
-#   # CẢNH BÁO: 2 GPU × batch 256 = effective 512 → đã gây collapse (obs 181)!
-#   # Bắt buộc giảm batch_seed_flows: 128 khi multi-GPU.
+# Smoke test:
+#   Set epochs=5, max_train_flows=200000 in train block below. Expected F1 >= 0.12.
 
 experiment:
-  source_name: "NT114 Proposed IDS-HGT — Cloud Server full run (4-layer)"
+  source_name: "NT114 Proposed IDS-HGT — v5 (LDAM + EMA + DropEdge + stratified)"
   rationale: >
-    Full 100-epoch training run on cloud GPU server (A40/RTX5090/A100).
-    Same 4-layer / 256-hidden / 8-head architecture. bfloat16 AMP enabled —
-    auto-fallback to FP32 nếu GPU không hỗ trợ native bf16.
+    Full training run on cloud GPU server. 4-layer / 384-hidden / 12-head HGT
+    with OneCycleLR, LDAM loss, stratified batch sampling, EMA model weights,
+    DropEdge regularization, and BF16-stable AdamW.
 
 data:
   source: graph_store
@@ -94,83 +35,70 @@ data:
   use_semantic_edge_weights: true
 
 model:
-  # QUALITY v3 2026-05-20: hidden_dim 256 → 384. Sau 3 run hyperparam tuning,
-  # macro F1 vẫn plateau ~0.09 ở epoch 5 → bottleneck là MODEL CAPACITY, không
-  # phải hyperparams. 13-class imbalance cần nhiều params hơn để học pattern.
-  # L40S 48GB chứa được hidden=384 với batch=256 (peak ~22 GB).
   hidden_dim: 384
   num_layers: 4
-  num_heads: 8
-  dropout: 0.15
+  num_heads: 12             # head_dim = 32
+  dropout: 0.20
   ffn_multiplier: 4
 
 train:
-  output_dir: /home/ubuntu/outputs/nt114_proposed_l4_h384_h8_v3   # QUALITY v3: hidden 384, OneCycleLR
+  output_dir: /home/ubuntu/outputs/nt114_proposed_l4_h384_h12_v5
   epochs: 100
-  patience: 30             # QUALITY v3: 20 → 30. Hidden_dim lớn hơn cần thêm epoch
-                            # để converge. Với onecycle warmup, model học chậm hơn ở
-                            # đầu nhưng ổn định hơn cuối → patience cao hơn cần thiết.
+  max_train_flows: 0        # 0 = full train set. Set 200000 for smoke test.
+  patience: 30
+  # Batch
   batch_mode: neighbor_sampling
-  batch_seed_flows: 320     # OPT v3 2026-05-20: 256 → 320. Tận dụng VRAM L40S 48GB
-                            # (peak ~26 GB với hidden 384). Vẫn an toàn dưới ngưỡng
-                            # collapse 384+. RTX 5090 32 GB: giảm xuống 224 nếu OOM.
-  grad_accum_steps: 1       # effective batch 256/GPU (×2 GPUs via DDP = 512)
-  lr: 0.001                 # QUALITY v3: 0.0007 → 0.001 là PEAK lr cho OneCycleLR.
-                            # OneCycleLR sẽ warmup từ lr/25 (=0.00004) tăng dần tới
-                            # peak 0.001 ở 5% steps, rồi giảm cosine → eta_min.
-                            # Khác với cosine_annealing không warmup → ổn định hơn.
-  weight_decay: 0.0001
-  grad_clip_norm: 1.0
-  scheduler: onecycle       # QUALITY v3: cosine_annealing → onecycle. OneCycleLR có
-                            # warmup built-in (5% đầu) → giải quyết dao động val_acc
-                            # (run v2 dao động 12% giữa epoch). Warmup cũng giúp model
-                            # với class imbalance ổn định gradient giai đoạn đầu.
-  scheduler_pct_start: 0.05 # 5% steps đầu là warmup, 95% sau là cosine decay
+  batch_seed_flows: 256     # peak VRAM ~22 GB on L40S. Cap at 256 (>=384 collapses).
+  grad_accum_steps: 1
+  # Optimizer (BF16-stable)
+  lr: 0.001                 # OneCycleLR peak; warmup from lr/25 over 5% of steps
+  weight_decay: 0.0003
+  grad_clip_norm: 0.5
+  adamw_eps: 1.0e-6
+  adamw_betas: [0.9, 0.95]
+  # Scheduler
+  scheduler: onecycle
+  scheduler_pct_start: 0.05
   scheduler_eta_min: 1.0e-5
+  # Split
   val_ratio: 0.1
   test_ratio: 0.1
+  # Class imbalance handling
   class_weight: balanced
-  class_weight_cap: 5.0    # OPT v2 2026-05-20: REVERT 3.0 → 5.0. Cap=3 làm model thiên về
-                            # majority (val_acc cao hơn nhưng macro F1 GIẢM 0.072 → 0.054).
-                            # Cap=5 là sweet spot — boost đủ minority mà không noisy.
+  class_weight_cap: 2.0     # soft loss-weight; stratified sampling does main balancing
+  stratified_batch_sampling: true
+  # Loss
+  loss_type: ldam           # 'ce' | 'focal' | 'ldam' — LDAM best for severe imbalance
+  ldam_max_m: 0.5
+  ldam_scale: 30.0
+  label_smoothing: 0.1
+  focal_gamma: 2.0          # only used when loss_type=focal
+  # Regularization (graph + weights)
+  drop_edge_prob: 0.10      # DropEdge (Rong et al. 2020). 0.0 disables.
+  ema_enabled: true
+  ema_decay: 0.999
+  # Runtime
   seed: 42
   device: cuda
   monitor: val_macro_f1
   log_every: 1
-  stratified_batch_sampling: false  # FIX: tắt double-balancing. Khi đã có class_weight
-                                     # balanced trong loss, thêm stratified sampling tạo
-                                     # bias gấp đôi → minority recall cao nhưng precision ~1%.
-  amp: true                 # bfloat16 trên L40S/A40/RTX5090/A100; tự về FP32 nếu không hỗ trợ
+  amp: true
   amp_dtype: auto
-  activation_checkpointing: false  # FIX: L40S/A40 48GB đủ chứa batch 256 — tắt để nhanh hơn 20-30%.
-                                    # Bật lại nếu OOM (chỉ xảy ra khi tăng batch ≥ 512 hoặc hidden ≥ 512).
-  compile: false            # QUALITY v3: true → false. torch.compile trên HGT bị
-                            # fallback eager vì dynamic shapes (subgraph khác nhau mỗi
-                            # batch) → user xác nhận run v2 không nhanh hơn. Tắt để
-                            # tiết kiệm 60-120s compile overhead ở startup.
-  multi_gpu: false          # FIX: mặc định false cho SINGLE GPU (L40S/A40 đơn).
-                            # Đổi true CHỈ KHI có ≥ 2 GPU + chạy qua torchrun --nproc_per_node=N.
-                            # Single GPU + multi_gpu=true có thể gây DDP init mismatch (như run nt114_l40s).
-  # --- SMOKE TEST ONLY ---
-  # Bước 1: COMMENT dòng `epochs: 100` ở trên (YAML không cho duplicate key).
-  # Bước 2: Uncomment 2 dòng dưới:
-  # max_train_flows: 200000   # FIX: tăng từ 60k → 200k (16% data thay vì 4%)
-  # epochs: 5                 # FIX: tăng từ 3 → 5 cho đủ tín hiệu hội tụ
-  # Bước 3: Sau smoke test PASS → revert: uncomment `epochs: 100`, comment 2 dòng trên.
+  activation_checkpointing: false
+  compile: false            # torch.compile falls back eager on HGT dynamic shapes
+  multi_gpu: false          # WARNING: multi-GPU multiplies effective batch — risk of collapse
+  skip_val_first_epoch: true
 
 sampler:
-  # QUALITY v3 2026-05-20: REVERT toàn bộ fanouts về giá trị gốc.
-  # Run v2 với fanout 6/3 không nhanh hơn nhưng quality tương đương → speed
-  # tradeoff không có lợi. Quay về 8/4 cho subgraph đầy đủ ngữ cảnh.
   hops: 4
   fanouts:
-    flow__contains__packet: 8        # QUALITY v3: 6 → 8 (revert — đầy đủ context)
-    packet__next_packet__packet: 4   # QUALITY v3: 3 → 4 (revert — sequence context)
+    flow__contains__packet: 8
+    packet__next_packet__packet: 4
     packet__matches_technique__technique: 5
     flow__matches_technique__technique: 5
     technique__belongs_to_tactic__tactic: 1
   reverse_fanouts:
-    rev_contains: 3                  # QUALITY v3: 2 → 3 (revert — back-edge đầy đủ)
+    rev_contains: 3
     rev_next_packet: 2
     rev_matches_technique: 2
     rev_belongs_to_tactic: 0
@@ -178,15 +106,11 @@ sampler:
   always_include_all_techniques: true
 
 dataloader:
-  num_workers: 8            # FIX: 4 → 8. L40S server (Vast.ai/RunPod) thường có 16+ vCPU.
-                            # Neighbor sampling CPU-bound → workers ít gây GPU đói data.
-                            # Giảm về 4 nếu server <8 vCPU (kiểm tra: `nproc`).
-  prefetch_factor: 10       # OPT v3 2026-05-20: 6 → 10. Tăng queue prefetch để GPU
-                            # không phải chờ CPU sampling (sampling là bottleneck chính).
-                            # Với 8 workers x 10 = 80 batches buffered → GPU ăn liên tục.
+  num_workers: 8
+  prefetch_factor: 10
   pin_memory: true
   persistent_workers: true
 
 wandb:
   project: nt114-hgt-paper-variants
-  run_name: proposed_l4_h256_h8_server
+  run_name: proposed_l4_h384_h12_v5
