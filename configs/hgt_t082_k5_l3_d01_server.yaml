@@ -1,7 +1,8 @@
-# NT114 Proposed IDS-HGT — Cloud GPU Server (A40 / RTX 5090 / A100).
+# NT114 Proposed IDS-HGT — Cloud GPU Server (L40S / A40 / RTX 5090 / A100).
 #
-# Target hardware: A40 48 GB  $0.44/hr  (recommended — Medium availability)
-#                  RTX 5090 32 GB  $0.99/hr  (fastest, Medium availability)
+# Target hardware: L40S 48 GB  $0.80-1.20/hr  ⭐ RECOMMENDED — Ada Lovelace, 1.7× A40
+#                  A40 48 GB  $0.44/hr  (rẻ hơn, Medium availability)
+#                  RTX 5090 32 GB  $0.99/hr  (fastest single, Medium availability)
 #                  A100 80 GB  $1.39/hr  (overkill, Low availability)
 #
 # ── FIX 2026-05-20: Root cause của model collapse (test acc 0.67%, F1 0.011) ──
@@ -48,18 +49,21 @@
 #   Nếu val_acc vẫn ~0.6% như run trước → vấn đề ở graph_artifact / model, không
 #   phải training config. Lúc đó cần inspect graph_store_v1 manifest và labels.
 #
-# ── Full run (2× A40) ────────────────────────────────────────────────────────
+# ── Full run (1× L40S — RECOMMENDED) ─────────────────────────────────────────
+#   tmux new -s train
+#   python -m graphslm_ids.offline.training.train_hgt_flow_classifier \
+#     --config configs/hgt_t082_k5_l3_d01_server.yaml
+#   # multi_gpu: false (default) — chạy trực tiếp với python, không qua torchrun.
+#   # Expected: ~6-8 giờ / 100 epochs (L40S ~1.7× A40).
+#
+# ── Full run (2× A40 / 2× L40S, multi-GPU DDP) ──────────────────────────────
+#   # Đổi multi_gpu: true trong config train trước!
 #   tmux new -s train
 #   torchrun --nproc_per_node=2 \
 #     -m graphslm_ids.offline.training.train_hgt_flow_classifier \
 #     --config configs/hgt_t082_k5_l3_d01_server.yaml
-#
-# ── Full run (1 GPU) ─────────────────────────────────────────────────────────
-#   tmux new -s train
-#   torchrun --nproc_per_node=1 \
-#     -m graphslm_ids.offline.training.train_hgt_flow_classifier \
-#     --config configs/hgt_t082_k5_l3_d01_server.yaml
-#   # Đổi multi_gpu: false nếu dùng 1 GPU
+#   # CẢNH BÁO: 2 GPU × batch 256 = effective 512 → đã gây collapse (obs 181)!
+#   # Bắt buộc giảm batch_seed_flows: 128 khi multi-GPU.
 
 experiment:
   source_name: "NT114 Proposed IDS-HGT — Cloud Server full run (4-layer)"
@@ -113,11 +117,14 @@ train:
   stratified_batch_sampling: false  # FIX: tắt double-balancing. Khi đã có class_weight
                                      # balanced trong loss, thêm stratified sampling tạo
                                      # bias gấp đôi → minority recall cao nhưng precision ~1%.
-  amp: true                 # bfloat16 trên A40/RTX5090/A100; tự về FP32 nếu GPU không hỗ trợ
+  amp: true                 # bfloat16 trên L40S/A40/RTX5090/A100; tự về FP32 nếu không hỗ trợ
   amp_dtype: auto
-  activation_checkpointing: true
+  activation_checkpointing: false  # FIX: L40S/A40 48GB đủ chứa batch 256 — tắt để nhanh hơn 20-30%.
+                                    # Bật lại nếu OOM (chỉ xảy ra khi tăng batch ≥ 512 hoặc hidden ≥ 512).
   compile: false
-  multi_gpu: true           # 2× A40 với torchrun --nproc_per_node=2
+  multi_gpu: false          # FIX: mặc định false cho SINGLE GPU (L40S/A40 đơn).
+                            # Đổi true CHỈ KHI có ≥ 2 GPU + chạy qua torchrun --nproc_per_node=N.
+                            # Single GPU + multi_gpu=true có thể gây DDP init mismatch (như run nt114_l40s).
   # --- SMOKE TEST ONLY ---
   # Bước 1: COMMENT dòng `epochs: 100` ở trên (YAML không cho duplicate key).
   # Bước 2: Uncomment 2 dòng dưới:
@@ -142,7 +149,9 @@ sampler:
   always_include_all_techniques: true
 
 dataloader:
-  num_workers: 4            # tăng lên 8 nếu server có ≥16 vCPU
+  num_workers: 8            # FIX: 4 → 8. L40S server (Vast.ai/RunPod) thường có 16+ vCPU.
+                            # Neighbor sampling CPU-bound → workers ít gây GPU đói data.
+                            # Giảm về 4 nếu server <8 vCPU (kiểm tra: `nproc`).
   prefetch_factor: 4
   pin_memory: true
   persistent_workers: true
