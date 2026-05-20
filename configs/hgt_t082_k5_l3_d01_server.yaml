@@ -1,9 +1,12 @@
-# NT114 Proposed IDS-HGT — Cloud GPU Server (L40S / A40 / RTX 5090 / A100).
+# NT114 Proposed IDS-HGT — Cloud GPU Server (AWS / Vast.ai / RunPod).
+# ★ Đây là CONFIG CHÍNH THỨC cho training trên server (thay thế _aws.yaml).
 #
 # Target hardware: L40S 48 GB  $0.80-1.20/hr  ⭐ RECOMMENDED — Ada Lovelace, 1.7× A40
 #                  A40 48 GB  $0.44/hr  (rẻ hơn, Medium availability)
 #                  RTX 5090 32 GB  $0.99/hr  (fastest single, Medium availability)
 #                  A100 80 GB  $1.39/hr  (overkill, Low availability)
+#                  AWS g6e.2xlarge (L40S spot) $0.60/hr  — recommended cloud
+#                  AWS g5.2xlarge (A10G spot)  $0.50/hr  — cheaper fallback
 #
 # ── FIX 2026-05-20: Root cause của model collapse (test acc 0.67%, F1 0.011) ──
 #   Run trước với epochs=3, max_train_flows=60k, class_weight_cap=15,
@@ -29,15 +32,22 @@
 # ── Setup (run once after provisioning) ─────────────────────────────────────
 #   pip install -e . && pip install -r requirements-ml.txt
 #
-#   # Download data (cần ~/.kaggle/kaggle.json)
-#   mkdir -p /workspace/data/raw && cd /workspace/data/raw
-#   kaggle datasets download thnhphtattt2023/graph3 && unzip graph3.zip
+#   # NPZ đã có sẵn tại /home/ubuntu/dataset/graph3/ (AWS) — verify:
+#   ls -lh /home/ubuntu/dataset/graph3/graph_artifact_3tier_14gb.npz
+#   ls -lh /home/ubuntu/dataset/graph3/graph_artifact_3tier_14gb.meta.json
 #
-#   # Build graph store (chạy 1 lần, ~10-20 phút)
+#   # Build graph store CSR (BẮT BUỘC — chạy 1 lần, ~10-20 phút, ~5-10 GB disk):
 #   python -m graphslm_ids.offline.training.on_disk_graph_store \
-#     --graph-npz /workspace/data/raw/graph_artifact_3tier_14gb.npz \
-#     --graph-meta-json /workspace/data/raw/graph_artifact_3tier_14gb.meta.json \
-#     --output-root /workspace/data/graph_store_v1
+#     --graph-npz /home/ubuntu/dataset/graph3/graph_artifact_3tier_14gb.npz \
+#     --graph-meta-json /home/ubuntu/dataset/graph3/graph_artifact_3tier_14gb.meta.json \
+#     --output-root /home/ubuntu/dataset/graph_store_v1
+#
+#   # Verify graph store đã build:
+#   ls /home/ubuntu/dataset/graph_store_v1/manifest.json
+#
+#   # Nếu chạy trên Vast.ai/RunPod (path /workspace/...) — đổi data block bên dưới:
+#   #   graph_npz: /workspace/dataset/graph3/graph_artifact_3tier_14gb.npz
+#   #   graph_store_root: /workspace/dataset/graph_store_v1
 #
 # ── SMOKE TEST (5 epochs, ~30 phút) ─────────────────────────────────────────
 #   Uncomment max_train_flows + epochs trong block `train:`, xác nhận log:
@@ -74,9 +84,9 @@ experiment:
 
 data:
   source: graph_store
-  graph_npz: /workspace/data/raw/graph_artifact_3tier_14gb.npz
-  graph_meta_json: /workspace/data/raw/graph_artifact_3tier_14gb.meta.json
-  graph_store_root: /workspace/data/graph_store_v1
+  graph_npz: /home/ubuntu/dataset/graph3/graph_artifact_3tier_14gb.npz
+  graph_meta_json: /home/ubuntu/dataset/graph3/graph_artifact_3tier_14gb.meta.json
+  graph_store_root: /home/ubuntu/dataset/graph_store_v1
   read_sealed_only: true
   packet_feature: semantic
   add_reverse_edges: true
@@ -91,7 +101,7 @@ model:
   ffn_multiplier: 4
 
 train:
-  output_dir: /workspace/outputs/nt114_proposed_l4_h256_h8_server
+  output_dir: /home/ubuntu/outputs/nt114_proposed_l4_h256_h8_server   # AWS path; đổi /workspace/... nếu dùng Vast.ai/RunPod
   epochs: 100
   patience: 20             # FIX: giảm từ 40 → 20 để fail-fast nếu collapse
   batch_mode: neighbor_sampling
