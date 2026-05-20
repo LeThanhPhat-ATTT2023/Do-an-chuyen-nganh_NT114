@@ -109,8 +109,9 @@ train:
                             # FIX: KHÔNG override lên 512 — đã gây model collapse (obs 181).
                             # RTX 5090 32 GB: giảm xuống 192 nếu OOM
   grad_accum_steps: 1       # effective batch 256/GPU (×2 GPUs via DDP = 512)
-  lr: 0.001                 # OPT 2026-05-20: 0.0005 → 0.001. Epoch 1-5 macro_f1 tăng quá chậm
-                            # (7.2% → 9.1%). lr cao hơn để thoát plateau imbalance nhanh hơn.
+  lr: 0.0007                # OPT v2 2026-05-20: 0.001 → 0.0007. lr=0.001 gây dao động
+                            # val_acc (15.6 → 13.5) trong 2 epoch đầu. 0.0007 là compromise:
+                            # nhanh hơn 0.0005 cũ nhưng không gây instability.
   weight_decay: 0.0001
   grad_clip_norm: 1.0
   scheduler: cosine_annealing
@@ -118,9 +119,9 @@ train:
   val_ratio: 0.1
   test_ratio: 0.1
   class_weight: balanced
-  class_weight_cap: 3.0    # OPT 2026-05-20: 5.0 → 3.0. Cap=5 vẫn tạo gradient noisy từ
-                            # minority class boost ×5 → học chậm. Cap=3 cân bằng tốt hơn:
-                            # vẫn ưu tiên class hiếm nhưng gradient ổn định hơn.
+  class_weight_cap: 5.0    # OPT v2 2026-05-20: REVERT 3.0 → 5.0. Cap=3 làm model thiên về
+                            # majority (val_acc cao hơn nhưng macro F1 GIẢM 0.072 → 0.054).
+                            # Cap=5 là sweet spot — boost đủ minority mà không noisy.
   seed: 42
   device: cuda
   monitor: val_macro_f1
@@ -146,10 +147,9 @@ train:
   # Bước 3: Sau smoke test PASS → revert: uncomment `epochs: 100`, comment 2 dòng trên.
 
 sampler:
-  # OPT 2026-05-20: Giảm hops 4→3 và fanouts để subgraph nhỏ hơn ~40%.
-  # avg_packet_nodes hiện ~1153 quá lớn → bottleneck CPU sampling.
-  # HGT 4-layer model + hops=3 vẫn cover được 12-edge paths (đủ cho IDS).
-  hops: 3
+  # OPT v2 2026-05-20: Giữ fanout giảm nhưng REVERT hops 3 → 4. HGT 4-layer cần
+  # hops=4 để layer cuối có receptive field đầy đủ. Hops=3 + 4-layer model = underfit.
+  hops: 4
   fanouts:
     flow__contains__packet: 6        # OPT: 8 → 6 (giảm packet/flow trong subgraph)
     packet__next_packet__packet: 3   # OPT: 4 → 3 (subgraph compact hơn)
