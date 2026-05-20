@@ -109,7 +109,8 @@ train:
                             # FIX: KHÔNG override lên 512 — đã gây model collapse (obs 181).
                             # RTX 5090 32 GB: giảm xuống 192 nếu OOM
   grad_accum_steps: 1       # effective batch 256/GPU (×2 GPUs via DDP = 512)
-  lr: 0.0005
+  lr: 0.001                 # OPT 2026-05-20: 0.0005 → 0.001. Epoch 1-5 macro_f1 tăng quá chậm
+                            # (7.2% → 9.1%). lr cao hơn để thoát plateau imbalance nhanh hơn.
   weight_decay: 0.0001
   grad_clip_norm: 1.0
   scheduler: cosine_annealing
@@ -117,9 +118,9 @@ train:
   val_ratio: 0.1
   test_ratio: 0.1
   class_weight: balanced
-  class_weight_cap: 5.0    # FIX: giảm từ 15.0 → 5.0. Cap=15 quá cao, model spam predict
-                            # minority class → Benign/VulnScan/Recon-* bị bỏ qua hoàn toàn
-                            # (F1=0). Cap=5 vẫn boost minority nhưng không làm sụp majority.
+  class_weight_cap: 3.0    # OPT 2026-05-20: 5.0 → 3.0. Cap=5 vẫn tạo gradient noisy từ
+                            # minority class boost ×5 → học chậm. Cap=3 cân bằng tốt hơn:
+                            # vẫn ưu tiên class hiếm nhưng gradient ổn định hơn.
   seed: 42
   device: cuda
   monitor: val_macro_f1
@@ -131,7 +132,9 @@ train:
   amp_dtype: auto
   activation_checkpointing: false  # FIX: L40S/A40 48GB đủ chứa batch 256 — tắt để nhanh hơn 20-30%.
                                     # Bật lại nếu OOM (chỉ xảy ra khi tăng batch ≥ 512 hoặc hidden ≥ 512).
-  compile: false
+  compile: true             # OPT 2026-05-20: false → true. PyTorch 2.x kernel fusion trên
+                            # L40S Ada Lovelace cho ~10-15% speedup. Nếu compile fail (HGT
+                            # có dynamic shapes), tự fallback eager — không crash.
   multi_gpu: false          # FIX: mặc định false cho SINGLE GPU (L40S/A40 đơn).
                             # Đổi true CHỈ KHI có ≥ 2 GPU + chạy qua torchrun --nproc_per_node=N.
                             # Single GPU + multi_gpu=true có thể gây DDP init mismatch (như run nt114_l40s).
@@ -143,15 +146,18 @@ train:
   # Bước 3: Sau smoke test PASS → revert: uncomment `epochs: 100`, comment 2 dòng trên.
 
 sampler:
-  hops: 4
+  # OPT 2026-05-20: Giảm hops 4→3 và fanouts để subgraph nhỏ hơn ~40%.
+  # avg_packet_nodes hiện ~1153 quá lớn → bottleneck CPU sampling.
+  # HGT 4-layer model + hops=3 vẫn cover được 12-edge paths (đủ cho IDS).
+  hops: 3
   fanouts:
-    flow__contains__packet: 8
-    packet__next_packet__packet: 4
+    flow__contains__packet: 6        # OPT: 8 → 6 (giảm packet/flow trong subgraph)
+    packet__next_packet__packet: 3   # OPT: 4 → 3 (subgraph compact hơn)
     packet__matches_technique__technique: 5
     flow__matches_technique__technique: 5
     technique__belongs_to_tactic__tactic: 1
   reverse_fanouts:
-    rev_contains: 3
+    rev_contains: 2                  # OPT: 3 → 2 (cân với forward fanout giảm)
     rev_next_packet: 2
     rev_matches_technique: 2
     rev_belongs_to_tactic: 0
@@ -162,7 +168,8 @@ dataloader:
   num_workers: 8            # FIX: 4 → 8. L40S server (Vast.ai/RunPod) thường có 16+ vCPU.
                             # Neighbor sampling CPU-bound → workers ít gây GPU đói data.
                             # Giảm về 4 nếu server <8 vCPU (kiểm tra: `nproc`).
-  prefetch_factor: 4
+  prefetch_factor: 6        # OPT 2026-05-20: 4 → 6. Sampling nhanh hơn (do hops giảm)
+                            # nên prefetch nhiều batch trước để GPU không phải chờ.
   pin_memory: true
   persistent_workers: true
 
