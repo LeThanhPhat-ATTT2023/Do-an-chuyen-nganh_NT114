@@ -4,6 +4,7 @@ import argparse
 from contextlib import nullcontext as _nullcontext
 from copy import deepcopy
 from datetime import datetime, timezone
+import math
 import os
 from pathlib import Path
 import random
@@ -82,6 +83,22 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "scheduler_eta_min": 1e-5,
         "grad_clip_norm": 1.0,
         "amp_dtype": "auto",
+        # Loss function configurability
+        "loss_type": "ce",           # 'ce' | 'focal' | 'ldam'
+        "label_smoothing": 0.0,      # 0.0-0.2 (CE/LDAM only). 0.1 recommended.
+        "focal_gamma": 2.0,          # focal loss focusing parameter
+        "ldam_max_m": 0.5,           # LDAM max margin (paper default)
+        "ldam_scale": 30.0,          # LDAM logit scale (paper default)
+        # QUALITY v4: EMA model weights for smoother validation
+        "ema_enabled": False,        # set true for +1-3% F1 on imbalanced data
+        "ema_decay": 0.999,          # 0.999 = effective window ~1000 steps
+        # DropEdge regularization (training-only graph augmentation)
+        "drop_edge_prob": 0.0,       # 0.0-0.2. 0.1 typical for GNN regularization.
+        # Optimizer numerics (BF16-stable defaults)
+        "adamw_eps": 1.0e-6,
+        "adamw_betas": (0.9, 0.95),
+        # Skip val eval at epoch 1 (OneCycle warmup → near-random val anyway)
+        "skip_val_first_epoch": False,
     },
     "sampler": {
         "hops": None,
@@ -453,6 +470,12 @@ def _multi_gpu_train_step(
     scaler: torch.amp.GradScaler,
     use_semantic_edge_weights: bool,
     grad_accum_steps: int,
+    loss_type: str = "ce",
+    label_smoothing: float = 0.0,
+    focal_gamma: float = 2.0,
+    drop_edge_prob: float = 0.0,
+    ldam_margins: torch.Tensor | None = None,
+    ldam_scale: float = 30.0,
 ) -> tuple[float, int, list[np.ndarray], list[np.ndarray], dict[str, list[int]], dict[str, list[int]]]:
     """Forward-backward across multiple GPUs using parallel_apply, then sync gradients to primary model."""
     import torch.nn.parallel as P
@@ -470,6 +493,8 @@ def _multi_gpu_train_step(
 
     for batch, device in zip(batch_group[:n], devices[:n]):
         nf, ei, ew, sm, sl = to_torch_batch(batch, edge_types, device, use_semantic_edge_weights)
+        if drop_edge_prob > 0.0:
+            ei, ew = _drop_edges(ei, ew, drop_edge_prob)
         inputs_args.append((nf, ei))
         inputs_kwargs.append({"edge_weight_dict": ew})
         masks.append(sm)
@@ -486,7 +511,15 @@ def _multi_gpu_train_step(
     for logits, sm, sl, device in zip(all_logits, masks, all_labels, devices[:n]):
         seed_logits = logits[sm].float()
         w = weight.to(device) if weight is not None else None
-        loss = F.cross_entropy(seed_logits, sl, weight=w)
+        m = ldam_margins.to(device) if ldam_margins is not None else None
+        loss = _compute_train_loss(
+            seed_logits, sl, w,
+            loss_type=loss_type,
+            label_smoothing=label_smoothing,
+            focal_gamma=focal_gamma,
+            ldam_margins=m,
+            ldam_scale=ldam_scale,
+        )
         if not torch.isfinite(loss):
             continue
         gpu_losses.append(loss)
@@ -707,6 +740,164 @@ def class_weights_from_backend(
     if max_weight < float("inf"):
         weights = np.minimum(weights, max_weight)
     return torch.from_numpy(weights)
+
+
+def _compute_ldam_margins(
+    class_counts: np.ndarray, max_m: float = 0.5
+) -> torch.Tensor:
+    """Per-class margins for LDAM loss (Cao et al. NeurIPS 2019).
+
+    Δ_y = max_m / n_y^(1/4) (normalized so max margin = max_m).
+    Minority classes get larger margins → push their decision boundaries
+    further → better generalization on long-tail.
+    """
+    counts = np.maximum(class_counts.astype(np.float64), 1.0)
+    margins = 1.0 / np.power(counts, 0.25)
+    margins = margins * (max_m / margins.max())
+    return torch.from_numpy(margins.astype(np.float32))
+
+
+def _compute_train_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    weight: torch.Tensor | None,
+    loss_type: str = "ce",
+    label_smoothing: float = 0.0,
+    focal_gamma: float = 2.0,
+    ldam_margins: torch.Tensor | None = None,
+    ldam_scale: float = 30.0,
+) -> torch.Tensor:
+    """Unified training loss: CE | Focal | LDAM.
+
+    - 'ce': F.cross_entropy with optional label_smoothing. Best for mild imbalance.
+    - 'focal': FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t). Down-weights easy
+      examples. Designed for severe imbalance. Paper default focal_gamma=2.0.
+    - 'ldam': Label-Distribution-Aware Margin (Cao et al. 2019). Per-class margin
+      Δ_y = max_m / n_y^(1/4) — minority classes get larger margins → better
+      generalization on long-tail. State-of-art for severe imbalance.
+
+    Eval loss must stay plain CE (no smoothing/margin) for raw loss comparability.
+    """
+    if loss_type == "focal":
+        log_probs = F.log_softmax(logits, dim=-1)
+        targets = labels.unsqueeze(-1)
+        log_p_t = log_probs.gather(dim=-1, index=targets).squeeze(-1)
+        p_t = log_p_t.exp()
+        focal_factor = (1.0 - p_t).pow(focal_gamma)
+        loss = -focal_factor * log_p_t
+        if weight is not None:
+            alpha_t = weight.gather(dim=0, index=labels)
+            loss = alpha_t * loss
+        return loss.mean()
+    if loss_type == "ldam":
+        if ldam_margins is None:
+            raise ValueError("loss_type='ldam' requires ldam_margins tensor.")
+        target_margins = ldam_margins.to(logits.device).gather(dim=0, index=labels)
+        adjustment = torch.zeros_like(logits)
+        adjustment.scatter_(1, labels.unsqueeze(1), target_margins.unsqueeze(1))
+        adjusted_logits = (logits - adjustment) * ldam_scale
+        return F.cross_entropy(
+            adjusted_logits, labels,
+            weight=weight,
+            label_smoothing=label_smoothing,
+        )
+    return F.cross_entropy(
+        logits, labels,
+        weight=weight,
+        label_smoothing=label_smoothing,
+    )
+
+
+def _drop_edges(
+    edge_index: dict[tuple[str, str, str], torch.Tensor],
+    edge_weight: dict[tuple[str, str, str], torch.Tensor] | None,
+    drop_prob: float,
+) -> tuple[
+    dict[tuple[str, str, str], torch.Tensor],
+    dict[tuple[str, str, str], torch.Tensor] | None,
+]:
+    """Random edge dropout (DropEdge) for graph regularization.
+
+    Drops a fraction of edges uniformly at random per edge type. Only applied
+    during training — eval/test paths see the full graph. Standard regularization
+    for GNN that reduces over-smoothing and over-fitting on dense subgraphs.
+
+    Returns new dicts; original tensors are not modified in-place.
+    """
+    if drop_prob <= 0.0:
+        return edge_index, edge_weight
+    new_ei: dict[tuple[str, str, str], torch.Tensor] = {}
+    new_ew: dict[tuple[str, str, str], torch.Tensor] | None = (
+        {} if edge_weight is not None else None
+    )
+    keep_prob = 1.0 - drop_prob
+    for et, ei in edge_index.items():
+        if ei.numel() == 0:
+            new_ei[et] = ei
+            if new_ew is not None and et in edge_weight:
+                new_ew[et] = edge_weight[et]
+            continue
+        mask = torch.rand(ei.shape[1], device=ei.device) < keep_prob
+        new_ei[et] = ei[:, mask]
+        if new_ew is not None and et in edge_weight:
+            new_ew[et] = edge_weight[et][mask]
+    return new_ei, new_ew
+
+
+class EMA:
+    """Exponential Moving Average of model weights.
+
+    Maintains a shadow copy of trainable parameters, updated after each optimizer
+    step: shadow = decay * shadow + (1 - decay) * param. Validation uses the EMA
+    weights which are smoother → +1-3% F1 on imbalanced classification typically.
+
+    Usage:
+        ema = EMA(model, decay=0.999)
+        # training loop:
+        for batch in loader:
+            optimizer.step()
+            ema.update(model)
+        # before eval:
+        ema.apply_shadow(model)
+        val_metrics = evaluate(model)
+        ema.restore(model)
+
+    The shadow tensors live on the same device as model parameters. Memory
+    overhead = 1× model size in params (plus another 1× during apply_shadow
+    via backup). For 8M params @ fp32, ~64 MB — negligible on L40S 48GB.
+    """
+
+    def __init__(self, model: torch.nn.Module, decay: float = 0.999) -> None:
+        self.decay = decay
+        self.shadow: dict[str, torch.Tensor] = {}
+        self.backup: dict[str, torch.Tensor] = {}
+        for name, p in model.named_parameters():
+            if p.requires_grad:
+                self.shadow[name] = p.detach().clone()
+
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module) -> None:
+        for name, p in model.named_parameters():
+            if p.requires_grad and name in self.shadow:
+                self.shadow[name].mul_(self.decay).add_(p.detach(), alpha=1.0 - self.decay)
+
+    @torch.no_grad()
+    def apply_shadow(self, model: torch.nn.Module) -> None:
+        """Swap live params with shadow (EMA) params. Caller MUST call restore() later."""
+        if self.backup:
+            raise RuntimeError("EMA.apply_shadow() called twice without restore() — backup not empty.")
+        for name, p in model.named_parameters():
+            if p.requires_grad and name in self.shadow:
+                self.backup[name] = p.detach().clone()
+                p.data.copy_(self.shadow[name])
+
+    @torch.no_grad()
+    def restore(self, model: torch.nn.Module) -> None:
+        """Restore live params from backup. Must be called after apply_shadow()."""
+        for name, p in model.named_parameters():
+            if p.requires_grad and name in self.backup:
+                p.data.copy_(self.backup[name])
+        self.backup = {}
 
 
 def _to_device(value: Any, device: torch.device, non_blocking: bool, dtype: Any = None) -> torch.Tensor:
@@ -1321,6 +1512,9 @@ def train_neighbor_sampling(
         model.parameters(),
         lr=float(config["train"]["lr"]),
         weight_decay=float(config["train"]["weight_decay"]),
+        eps=float(config["train"].get("adamw_eps", 1e-6)),
+        betas=tuple(config["train"].get("adamw_betas", (0.9, 0.95))),
+        fused=(device.type == "cuda"),
     )
     grad_accum_steps = max(1, int(config["train"].get("grad_accum_steps", 1)))
     grad_clip_norm = float(config["train"].get("grad_clip_norm", 0.0))
@@ -1362,6 +1556,45 @@ def train_neighbor_sampling(
     if str(config["train"]["class_weight"]).lower() == "balanced":
         _max_w = float(config["train"].get("class_weight_cap", float("inf")))
         weight = class_weights_from_backend(backend, train_idx_np, num_classes, max_weight=_max_w).to(device)
+
+    # QUALITY v4: Configurable loss type for severe class imbalance.
+    # - 'ce' (default): F.cross_entropy with optional label_smoothing (0.1 typical)
+    # - 'focal': Focal Loss with focal_gamma (2.0 paper default). Down-weights
+    #   easy examples → focus on hard misclassified minority class.
+    loss_type = str(config["train"].get("loss_type", "ce")).lower()
+    label_smoothing = float(config["train"].get("label_smoothing", 0.0))
+    focal_gamma = float(config["train"].get("focal_gamma", 2.0))
+    ldam_max_m = float(config["train"].get("ldam_max_m", 0.5))
+    ldam_scale = float(config["train"].get("ldam_scale", 30.0))
+    if loss_type not in {"ce", "focal", "ldam"}:
+        raise ValueError(f"Unknown loss_type {loss_type!r}. Supported: 'ce', 'focal', 'ldam'.")
+    ldam_margins = None
+    if loss_type == "ldam":
+        train_labels_np = backend.get_flow_labels(np.asarray(train_idx_np, dtype=np.int64))
+        train_class_counts = np.bincount(train_labels_np, minlength=num_classes).astype(np.float64)
+        ldam_margins = _compute_ldam_margins(train_class_counts, max_m=ldam_max_m).to(device)
+    if rank == 0:
+        print(
+            f"[loss] type={loss_type} label_smoothing={label_smoothing} "
+            f"focal_gamma={focal_gamma} ldam_max_m={ldam_max_m} ldam_scale={ldam_scale} "
+            f"class_weight={'on' if weight is not None else 'off'}",
+            flush=True,
+        )
+
+    drop_edge_prob = float(config["train"].get("drop_edge_prob", 0.0))
+    if rank == 0 and drop_edge_prob > 0.0:
+        print(f"[drop_edge] prob={drop_edge_prob}", flush=True)
+
+    skip_val_first_epoch = bool(config["train"].get("skip_val_first_epoch", False))
+
+    # QUALITY v4: EMA setup. Shadow weights tracked on raw_model (unwrapped, no
+    # DDP/compile). update() called after each successful optimizer step. eval
+    # uses shadow via apply_shadow()/restore() bracket.
+    ema_enabled = bool(config["train"].get("ema_enabled", False))
+    ema_decay = float(config["train"].get("ema_decay", 0.999))
+    ema = EMA(raw_model, decay=ema_decay) if ema_enabled else None
+    if rank == 0 and ema_enabled:
+        print(f"[ema] enabled — decay={ema_decay} (shadow tracks ~{int(1/(1-ema_decay))} steps)", flush=True)
 
     output_dir = ensure_dir(Path(config["train"]["output_dir"])) if rank == 0 else Path(config["train"]["output_dir"])
     best_checkpoint = output_dir / "hgt_flow_best.pt"
@@ -1450,6 +1683,12 @@ def train_neighbor_sampling(
                 ls, ex, bp, bl, ns, es = _multi_gpu_train_step(
                     model, batch_group, devices, edge_types, weight,
                     scaler, use_semantic_edge_weights, grad_accum_steps,
+                    loss_type=loss_type,
+                    label_smoothing=label_smoothing,
+                    focal_gamma=focal_gamma,
+                    drop_edge_prob=drop_edge_prob,
+                    ldam_margins=ldam_margins,
+                    ldam_scale=ldam_scale,
                 )
                 train_loss_sum_t += float(ls)
                 train_examples_t += int(ex)
@@ -1478,10 +1717,19 @@ def train_neighbor_sampling(
                     if is_ddp and (step + 1) % grad_accum_steps != 0
                     else _nullcontext()
                 )
+                if drop_edge_prob > 0.0:
+                    ei, ew = _drop_edges(ei, ew, drop_edge_prob)
                 with sync_ctx, torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
                     logits = model(nf, ei, edge_weight_dict=ew)
                     seed_logits = logits[sm].float()
-                    loss = F.cross_entropy(seed_logits, sl, weight=weight)
+                    loss = _compute_train_loss(
+                        seed_logits, sl, weight,
+                        loss_type=loss_type,
+                        label_smoothing=label_smoothing,
+                        focal_gamma=focal_gamma,
+                        ldam_margins=ldam_margins,
+                        ldam_scale=ldam_scale,
+                    )
                 batch_count = int(sl.numel())
                 _loss_ok = bool(torch.isfinite(loss).item())
                 if _loss_ok:
@@ -1555,6 +1803,8 @@ def train_neighbor_sampling(
                         optimizer_steps += 1
                         if scheduler is not None:
                             scheduler.step()
+                        if ema is not None:
+                            ema.update(raw_model)
                         # First-step learning-signal probe: a healthy run shows a
                         # non-trivial gradient norm here. A norm of ~0 means the
                         # backward graph is detached / weights will never move —
@@ -1635,6 +1885,8 @@ def train_neighbor_sampling(
                     optimizer_steps += 1
                     if scheduler is not None:
                         scheduler.step()
+                    if ema is not None:
+                        ema.update(raw_model)
 
         # Fail fast: if no optimizer step succeeded this epoch, every gradient was
         # non-finite — the model is frozen. Aborting now saves hours vs. silently
@@ -1661,21 +1913,39 @@ def train_neighbor_sampling(
             float(train_loss_sum_t.item()) if train_examples else None,
             train_examples,
         )
-        val_metrics = evaluate_neighbor_sampling(
-            model=model,
-            loader=val_loader,
-            edge_types=edge_types,
-            device=device,
-            use_amp=use_amp,
-            amp_dtype=amp_dtype,
-            use_semantic_edge_weights=use_semantic_edge_weights,
-            num_classes=num_classes,
-            label_names=label_names,
-            epoch=epoch,
-            split_name="val",
-            devices=devices if (n_gpus > 1 and not is_ddp) else None,
-            is_ddp=is_ddp,
-        )
+        # EMA shadow weights for eval. apply_shadow stays active until restore() below
+        # so checkpoint save (if best) snapshots EMA weights from raw_model.state_dict().
+        # During OneCycle warmup epoch 1, lr is near-zero → val is near-random → optionally
+        # skip to save ~30 min on long runs.
+        do_val = not (epoch == 1 and skip_val_first_epoch)
+        if do_val and ema is not None:
+            ema.apply_shadow(raw_model)
+        if do_val:
+            val_metrics = evaluate_neighbor_sampling(
+                model=model,
+                loader=val_loader,
+                edge_types=edge_types,
+                device=device,
+                use_amp=use_amp,
+                amp_dtype=amp_dtype,
+                use_semantic_edge_weights=use_semantic_edge_weights,
+                num_classes=num_classes,
+                label_names=label_names,
+                epoch=epoch,
+                split_name="val",
+                devices=devices if (n_gpus > 1 and not is_ddp) else None,
+                is_ddp=is_ddp,
+            )
+        else:
+            val_metrics = {
+                "accuracy": float("nan"),
+                "macro_f1": float("nan"),
+                "loss": None,
+                "per_class": {},
+                "count": 0,
+            }
+            if rank == 0:
+                print(f"Epoch {epoch:03d} | val SKIPPED (skip_val_first_epoch=true, warmup)", flush=True)
         avg_nodes = {
             nt: sampled_node_sum[nt] / sampled_node_cnt[nt]
             for nt in sampled_node_sum
@@ -1703,7 +1973,7 @@ def train_neighbor_sampling(
             val_metrics["macro_f1"] if monitor == "val_macro_f1"
             else -(_val_loss if _val_loss is not None else float("inf"))
         )
-        if monitor_score > best_score:
+        if do_val and monitor_score > best_score and not math.isnan(monitor_score):
             best_score = monitor_score
             best_epoch = epoch
             epochs_without_improvement = 0
@@ -1734,8 +2004,13 @@ def train_neighbor_sampling(
                     },
                     best_checkpoint,
                 )
-        else:
+        elif do_val:
             epochs_without_improvement += 1
+
+        # Restore live (optimizer-tracked) weights AFTER potential checkpoint save.
+        # If val was skipped, apply_shadow wasn't called so nothing to restore.
+        if do_val and ema is not None:
+            ema.restore(raw_model)
 
         if rank == 0 and nonfinite_loss_count > 0:
             print(
