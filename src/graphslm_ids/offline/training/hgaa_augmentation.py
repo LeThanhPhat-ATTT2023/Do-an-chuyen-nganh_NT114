@@ -32,6 +32,40 @@ import numpy as np
 EdgeKey = tuple[str, str, str]
 
 
+def _ensure_numpy_subgraph(subgraph: Any) -> Any:
+    """Return a shallow-copy subgraph with node/edge dicts materialized as numpy.
+
+    ``MiniBatchSubgraph.pin_memory()`` (called by the DataLoader pin thread)
+    converts ``node_features``, ``edge_index``, ``edge_attr`` to pinned torch
+    tensors. The HGAA operators in this module are written for numpy arrays
+    (use ``.copy()``, ``np.dtype``, ``np.concatenate``...) and crash with
+    ``AttributeError: 'Tensor' object has no attribute 'copy'`` or
+    ``Cannot interpret 'torch.int64' as a data type`` when given tensors.
+
+    We convert each dict's values back to numpy via ``.cpu().numpy()`` only
+    when augmentation actually fires (after the probabilistic gate), so the
+    non-augmented fast-path keeps the pin_memory optimization intact.
+
+    Downstream ``to_torch_batch`` accepts both numpy and torch via
+    ``_to_device`` so re-transferring augmented numpy back to GPU works.
+    """
+    out = copy(subgraph)
+
+    def _dict_to_numpy(d: dict[Any, Any]) -> dict[Any, np.ndarray]:
+        result: dict[Any, np.ndarray] = {}
+        for key, value in d.items():
+            if hasattr(value, "cpu"):
+                result[key] = value.cpu().numpy()
+            else:
+                result[key] = np.asarray(value)
+        return result
+
+    out.node_features = _dict_to_numpy(subgraph.node_features)
+    out.edge_index = _dict_to_numpy(subgraph.edge_index)
+    out.edge_attr = _dict_to_numpy(subgraph.edge_attr)
+    return out
+
+
 @dataclass
 class AugmentedSubgraph:
     """Result of an augmentation op.
@@ -512,8 +546,14 @@ class HGAAPipeline:
         if target_class is None:
             return subgraph
         op = self.selector.sample_op(class_id=target_class, rng=self._rng)
+        # Operators are written for numpy arrays (use .copy(), np.dtype, etc.).
+        # MiniBatchSubgraph.pin_memory() converts node_features / edge_index /
+        # edge_attr to pinned torch tensors in the DataLoader pin thread. We
+        # need to materialize them back as numpy for the operators; downstream
+        # ``to_torch_batch`` accepts both numpy and tensor and re-transfers.
+        subgraph_for_op = _ensure_numpy_subgraph(subgraph)
         try:
-            aug = self._apply_op(subgraph, op=op, target_class=target_class, labels=labels_np)
+            aug = self._apply_op(subgraph_for_op, op=op, target_class=target_class, labels=labels_np)
         except Exception as exc:  # pragma: no cover - augmentation should not fail in practice
             # Fail-open: log and proceed with un-augmented batch rather than crash training.
             print(f"[hgaa] augmentation '{op}' failed: {exc} — proceeding without augmentation",
