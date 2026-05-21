@@ -35,8 +35,14 @@ data:
   add_reverse_edges: true
   standardize_flow_features: true
   use_semantic_edge_weights: true
-  # Phase 3 — Laplacian PE
-  laplacian_pe_path: /home/ubuntu/dataset/graph_store_v1/laplacian_pe_flow.npy
+  # Phase 3 — Laplacian PE DEFERRED for this run.
+  # NT114 graph schema has 1:1 packet→flow membership (each packet belongs to
+  # exactly one flow), so the "flows share packets" connectivity produces
+  # zero edges, yielding a degenerate Laplacian. Proper flow-flow definition
+  # (e.g., via shared MITRE techniques or 5-tuple hashing) needs schema-aware
+  # redesign + validation. Defer to v8. Setting to null makes the per-batch
+  # PE concat hook a no-op (verified in train_hgt_flow_classifier.py:1032).
+  laplacian_pe_path: null
 
 model:
   hidden_dim: 384

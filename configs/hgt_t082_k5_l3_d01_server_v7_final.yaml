@@ -40,7 +40,9 @@ data:
   add_reverse_edges: true
   standardize_flow_features: true
   use_semantic_edge_weights: true
-  laplacian_pe_path: /home/ubuntu/dataset/graph_store_v1/laplacian_pe_flow.npy
+  # Phase 3 Laplacian PE DEFERRED — see hgt_smoke_v7_final.yaml comment for
+  # rationale (NT114 packet-flow membership is 1:1 → degenerate Laplacian).
+  laplacian_pe_path: null
 
 model:
   hidden_dim: 384
