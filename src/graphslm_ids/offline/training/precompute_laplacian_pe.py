@@ -42,10 +42,15 @@ def build_flow_flow_edges_via_packets(store: OnDiskHeteroGraphStore) -> np.ndarr
         ``(2, E)`` int64 array of flow-flow edges (no self-loops, deduplicated).
     """
     edge_key = ("flow", "contains", "packet")
-    csr_indptr, csr_indices, _ = store.csr_for_edge(edge_key)
+    if edge_key not in store._edge_csr:
+        raise KeyError(
+            f"Edge type {edge_key} not found in graph store. "
+            f"Available: {list(store._edge_csr.keys())}"
+        )
+    csr_indptr, csr_indices, _ = store._edge_csr[edge_key]
     # csr_indptr: per-flow offsets into csr_indices (which lists packet IDs).
 
-    num_packets = store.manifest.get("num_packets") or int(csr_indices.max() + 1)
+    num_packets = int(store.node_counts.get("packet", 0)) or int(csr_indices.max() + 1)
     # Inverse mapping: packet → list of flows.
     flow_for_packet: list[list[int]] = [[] for _ in range(num_packets)]
     num_flows = len(csr_indptr) - 1
@@ -93,7 +98,7 @@ def main() -> None:
     args = parser.parse_args()
 
     store = OnDiskHeteroGraphStore(Path(args.graph_store_root))
-    num_flows = int(store.manifest["num_flows"])
+    num_flows = int(store.num_flows)
     print(f"[pe] graph store: num_flows={num_flows}", flush=True)
 
     print("[pe] building flow-flow edges via shared packets ...", flush=True)
