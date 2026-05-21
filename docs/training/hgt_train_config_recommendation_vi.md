@@ -76,6 +76,35 @@ Các metric cần ghi:
 | Sampler | avg subgraph nodes/edges theo relation |
 | Ổn định | OOM, fallback CPU, early stopping |
 
+## v7 Phase 1 — Speed-up Configs (2026-05)
+
+Hai config mới được thêm cho lineage v7:
+
+| File | Mục tiêu | Khác v6 |
+|---|---|---|
+| `configs/hgt_smoke_v7_p1.yaml` | Smoke 5 epochs validate Phase 1 speed-ups | compile on; batch 512; workers 16; prefetch 16 |
+| `configs/hgt_t082_k5_l3_d01_server_v7.yaml` | Full 100 epochs với Phase 1 speed-ups | (same as smoke + ema_enabled, drw_start_pct=0.7) |
+
+Phase 1 KHÔNG thay model logic. Mục tiêu: giảm wall time 25-40h → 18-25h trên L40S.
+
+Speed-ups áp dụng:
+
+- Bật `torch.compile(mode="default", dynamic=True)` qua flag `train.compile: true`. Infrastructure đã sẵn ở [_maybe_compile](../../src/graphslm_ids/offline/training/train_hgt_flow_classifier.py#L429-L451) — chỉ flip config flag. Compile mode `default` (không phải `reduce-overhead`) để xử lý variable subgraph shapes từ neighbor sampling.
+- Tăng `batch_seed_flows` 256 → 512: L40S 48GB còn dư VRAM, batch lớn → step ít hơn → wall time giảm.
+- Tăng `dataloader.num_workers` 8 → 16, `prefetch_factor` 10 → 16: cải thiện H2D overlap.
+- Thêm log `[diag] epoch=N | wall=X.Xs | peak_vram_gb=Y.YY` mỗi epoch để track speed gains + verify VRAM ≤ 42GB.
+
+Phase 1 KHÔNG đụng vào [hgt.py](../../src/graphslm_ids/models/hgt.py) — FP32 fallback trong post-aggregation block được giữ lại pending CUDA verification trên L40S. Có characterization test ở `tests/models/test_hgt_amp_numerics.py` làm baseline để future engineer có thể remove FP32 fallback nếu cần thêm ~15-25% speed.
+
+Acceptance criteria (smoke pass trước khi full run):
+
+- val_macro_f1 ở epoch 5 trong khoảng ±0.02 của v6 smoke baseline.
+- Wall time per epoch giảm ≥ 25%.
+- Peak VRAM ≤ 42GB.
+- Không có NaN losses.
+
+Reference: `docs/superpowers/specs/2026-05-21-hgaa-multiclass-hgt-v7-design.md` §3.1.
+
 ## Lưu Ý Về Phạm Vi
 
 Các YAML 2024-2026 chỉ chuyển phần backbone và lịch train tương thích với trainer hiện tại. Những thành phần chưa nằm trong code vẫn không được giả vờ là đã có:

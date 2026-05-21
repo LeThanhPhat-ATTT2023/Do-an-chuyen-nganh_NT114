@@ -225,6 +225,33 @@ def _auto_dataloader_workers(num_workers_arg: int, n_gpus: int) -> int:
     return workers_per_gpu
 
 
+def _log_epoch_diagnostics(
+    epoch: int,
+    elapsed_seconds: float,
+    device: torch.device,
+    rank: int = 0,
+) -> None:
+    """Emit one-line per-epoch diagnostic for Phase 1 speed-up tracking.
+
+    Format: ``[diag] epoch=N | wall=X.Xs | peak_vram_gb=Y.YY``
+
+    Peak VRAM is queried from ``torch.cuda.max_memory_allocated()`` then
+    reset via ``reset_peak_memory_stats()`` so each epoch reports its OWN
+    peak, not a monotonic high-water mark across the full run.
+
+    Only emits on rank 0 — DDP non-rank-0 ranks stay silent.
+    """
+    if rank != 0:
+        return
+    parts = [f"epoch={epoch}", f"wall={elapsed_seconds:.1f}s"]
+    if device.type == "cuda":
+        peak_bytes = torch.cuda.max_memory_allocated(device)
+        peak_gb = peak_bytes / (1024 ** 3)
+        parts.append(f"peak_vram_gb={peak_gb:.2f}")
+        torch.cuda.reset_peak_memory_stats(device)
+    print(f"[diag] {' | '.join(parts)}", flush=True)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train a compact HGT-style flow classifier on the selected t082 three-tier graph artifact."
@@ -2061,6 +2088,12 @@ def train_neighbor_sampling(
             },
         }
         history.append(entry)
+        _log_epoch_diagnostics(
+            epoch=epoch,
+            elapsed_seconds=time.time() - epoch_start,
+            device=device,
+            rank=rank,
+        )
         _wandb_log(entry, use_wandb)
 
         _val_loss = val_metrics["loss"]

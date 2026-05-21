@@ -1,0 +1,108 @@
+# Phase 1 Speed-ups Smoke Test (5 epochs, 200k subsample).
+# Purpose: Validate torch.compile + batch/worker tweaks + peak VRAM logging
+# do NOT degrade val_macro_f1 or cause NaN. Compare against hgt_smoke_v6.yaml baseline.
+#
+# Pass criteria (Ep5):
+#   - val_macro_f1 within ±0.02 of v6 smoke baseline (cùng seed=42)
+#   - No NaN losses
+#   - epoch wall-time DECREASE ≥ 25% so với v6 smoke
+#   - peak VRAM ≤ 42GB
+#
+# Fail criteria → revert and report.
+
+experiment:
+  source_name: "NT114 HGT v7-p1 SMOKE — torch.compile + batch tweaks + peak VRAM log"
+  rationale: >
+    Phase 1 verification. Enable existing torch.compile infrastructure
+    (compile: true), bump batch_seed_flows 256→512, num_workers 8→16,
+    prefetch_factor 10→16. Model logic unchanged. Validate against
+    hgt_smoke_v6.yaml baseline.
+
+data:
+  source: graph_store
+  graph_npz: /home/ubuntu/dataset/graph3/graph_artifact_3tier_14gb.npz
+  graph_meta_json: /home/ubuntu/dataset/graph3/graph_artifact_3tier_14gb.meta.json
+  graph_store_root: /home/ubuntu/dataset/graph_store_v1
+  read_sealed_only: true
+  packet_feature: semantic
+  add_reverse_edges: true
+  standardize_flow_features: true
+  use_semantic_edge_weights: true
+
+model:
+  hidden_dim: 384
+  num_layers: 4
+  num_heads: 12
+  dropout: 0.20
+  ffn_multiplier: 4
+
+train:
+  output_dir: /home/ubuntu/outputs/smoke_v7_p1
+  epochs: 5
+  max_train_flows: 200000
+  patience: 5
+  # Batch — Phase 1 changes
+  batch_mode: neighbor_sampling
+  batch_seed_flows: 512        # was 256
+  grad_accum_steps: 1
+  # Optimizer (kế thừa v6)
+  lr: 0.001
+  weight_decay: 0.0003
+  grad_clip_norm: 1.0
+  adamw_eps: 1.0e-6
+  adamw_betas: [0.9, 0.95]
+  scheduler: onecycle
+  scheduler_pct_start: 0.05
+  scheduler_eta_min: 1.0e-5
+  val_ratio: 0.1
+  test_ratio: 0.1
+  # Class imbalance (kế thừa v6 smoke)
+  class_weight: balanced
+  class_weight_method: cb
+  cb_beta: 0.9999
+  class_weight_cap: 3.0
+  stratified_batch_sampling: false
+  drw_start_pct: 0.0
+  loss_type: cb_focal
+  focal_gamma: 2.0
+  label_smoothing: 0.1
+  logit_adjustment: 0.0
+  drop_edge_prob: 0.05
+  ema_enabled: false
+  ema_decay: 0.999
+  seed: 42
+  device: cuda
+  monitor: val_macro_f1
+  log_every: 1
+  amp: true
+  amp_dtype: auto
+  activation_checkpointing: false
+  compile: true                 # Phase 1 KEY CHANGE — was false
+  multi_gpu: false
+  skip_val_first_epoch: true
+
+sampler:
+  hops: 4
+  fanouts:
+    flow__contains__packet: 8
+    packet__next_packet__packet: 4
+    packet__matches_technique__technique: 5
+    flow__matches_technique__technique: 5
+    technique__belongs_to_tactic__tactic: 1
+  reverse_fanouts:
+    rev_contains: 3
+    rev_next_packet: 2
+    rev_matches_technique: 2
+    rev_belongs_to_tactic: 0
+  always_include_all_tactics: true
+  always_include_all_techniques: true
+
+dataloader:
+  num_workers: 16               # was 8
+  prefetch_factor: 16           # was 10
+  pin_memory: true
+  persistent_workers: true
+
+wandb:
+  project: nt114-hgt-paper-variants
+  run_name: smoke_v7_p1
