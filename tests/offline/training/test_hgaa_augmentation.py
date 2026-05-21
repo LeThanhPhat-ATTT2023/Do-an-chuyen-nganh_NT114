@@ -402,6 +402,59 @@ def test_hgaa_pipeline_p_aug_one_always_augments():
     assert augmented_count == 20
 
 
+def test_hgaa_pipeline_handles_tensor_inputs_from_pin_memory():
+    """Regression: MiniBatchSubgraph.pin_memory() converts batch fields to
+    torch tensors; HGAA operators were silently failing with AttributeError
+    ('Tensor' object has no attribute 'copy') and TypeError ('Cannot interpret
+    torch.int64 as a data type') for every batch in real training.
+
+    The pipeline must transparently handle a subgraph whose node_features,
+    edge_index, edge_attr dicts hold torch tensors instead of numpy arrays.
+    """
+    torch = pytest.importorskip("torch")
+
+    from graphslm_ids.offline.training.hgaa_augmentation import (
+        AdaptiveOpSelector,
+        GraphAugmentor,
+        HGAAPipeline,
+    )
+
+    sg_np = _make_fake_subgraph()
+    # Mimic what pin_memory() produces: int64 edge_index, float32 edge_attr,
+    # bool seed_mask, int64 seed_labels, float32 node_features.
+    sg_np.node_features = {k: torch.from_numpy(v) for k, v in sg_np.node_features.items()}
+    sg_np.edge_index = {
+        k: torch.from_numpy(v.astype(np.int64)) for k, v in sg_np.edge_index.items()
+    }
+    sg_np.edge_attr = {
+        k: torch.from_numpy(v.astype(np.float32)) for k, v in sg_np.edge_attr.items()
+    }
+    sg_np.seed_mask = torch.from_numpy(sg_np.seed_mask.astype(bool))
+    sg_np.seed_labels = torch.from_numpy(sg_np.seed_labels.astype(np.int64))
+
+    pipeline = HGAAPipeline(
+        augmentor=GraphAugmentor(eta=0.2, rng=np.random.default_rng(0)),
+        selector=AdaptiveOpSelector(
+            num_classes=13,
+            op_names=["edge_addition", "node_feature_swap", "edge_direction_swap", "edge_perturbation"],
+        ),
+        p_aug=1.0,
+        seed=42,
+    )
+
+    # 20 calls — none should fall back to raw_batch via the exception handler.
+    # If any operator crashed, stats_snapshot()["augmented"] would be < 20.
+    for _ in range(20):
+        out = pipeline.maybe_augment(sg_np)
+        assert out is not None
+    snap = pipeline.stats_snapshot()
+    assert snap["considered"] == 20
+    assert snap["augmented"] == 20, (
+        f"Expected all 20 augmentations to succeed, but got {snap['augmented']}. "
+        f"op_counts={snap['op_counts']}"
+    )
+
+
 def test_hgaa_pipeline_preserves_seed_labels_and_seed_mask():
     """Augmentation must not alter labels — loss computation depends on them."""
     from graphslm_ids.offline.training.hgaa_augmentation import (
