@@ -1,0 +1,133 @@
+# NT114 HGT v7-p2 — FULL TRAINING config (100 epochs, full ~1.2M train).
+# v7-p1 + HGAA adaptive augmentation (multiclass adaptation of Zhao et al.
+# Symmetry 2025, 17, 1623).
+#
+# Phase 2 changes vs v7-p1:
+#   - train.hgaa.enabled: true
+#   - 4 augmentation ops (skip type-swap to preserve flow→packet→technique semantics)
+#   - eta_per_op=0.1 (paper default)
+#   - aug_ratio_in_batch=0.5 (paper §3.3.1)
+#   - bias_top_k_rarest=3 (auto-detect from train labels, NO hardcoded class IDs)
+#   - bias_factor_T=0.5 (force preferred op 50% time for tail classes)
+#   - bias_preferred_op=node_feature_swap (in-class oversampling for rare classes)
+#
+# Filter network: NOT enabled in this first cut — v7-p3 will add it once v7-p1
+# checkpoint is available as teacher. The augmentation pipeline runs without
+# filter (no quality gating beyond the adaptive op success-rate weighting).
+#
+# Target macro_f1 at convergence: 0.65-0.78 (vs v7-p1 expected ~0.45-0.60).
+# Target runtime: 22-30h on L40S (~10-15% overhead vs v7-p1 from augmentation cost).
+#
+# Prereq: smoke_v7_p2 must pass:
+#   - val_macro_f1 epoch 5 >= v7-p1 smoke baseline (0.118)
+#   - hgaa stats show aug_rate ~0.5 and bias_classes auto-detected
+#   - No NaN
+
+experiment:
+  source_name: "NT114 IDS-HGT v7-p2 — Phase 1 speed-ups + HGAA augmentation"
+  rationale: >
+    Phase 1 speed-ups (compile, batch 512, BF16) + Phase 2 HGAA adaptive
+    augmentation. 4 operators applied probabilistically per-batch with
+    per-class success-rate weighting. Tail classes (top-3 rarest, auto-
+    detected) receive bias-factor boost toward node_feature_swap (in-class
+    oversampling). Pipeline dataset-portable: zero hardcoded class IDs.
+
+data:
+  source: graph_store
+  graph_npz: /home/ubuntu/dataset/graph3/graph_artifact_3tier_14gb.npz
+  graph_meta_json: /home/ubuntu/dataset/graph3/graph_artifact_3tier_14gb.meta.json
+  graph_store_root: /home/ubuntu/dataset/graph_store_v1
+  read_sealed_only: true
+  packet_feature: semantic
+  add_reverse_edges: true
+  standardize_flow_features: true
+  use_semantic_edge_weights: true
+
+model:
+  hidden_dim: 384
+  num_layers: 4
+  num_heads: 12
+  dropout: 0.20
+  ffn_multiplier: 4
+
+train:
+  output_dir: /home/ubuntu/outputs/train_v7_p2
+  epochs: 100
+  max_train_flows: 0
+  patience: 30
+  batch_mode: neighbor_sampling
+  batch_seed_flows: 512
+  grad_accum_steps: 1
+  lr: 0.001
+  weight_decay: 0.0003
+  grad_clip_norm: 1.0
+  adamw_eps: 1.0e-6
+  adamw_betas: [0.9, 0.95]
+  scheduler: onecycle
+  scheduler_pct_start: 0.05
+  scheduler_eta_min: 1.0e-5
+  val_ratio: 0.1
+  test_ratio: 0.1
+  class_weight: balanced
+  class_weight_method: cb
+  cb_beta: 0.9999
+  class_weight_cap: 3.0
+  stratified_batch_sampling: false
+  drw_start_pct: 0.7
+  loss_type: cb_focal
+  focal_gamma: 2.0
+  label_smoothing: 0.1
+  ldam_max_m: 0.5
+  ldam_scale: 30.0
+  logit_adjustment: 0.0
+  drop_edge_prob: 0.05
+  ema_enabled: true
+  ema_decay: 0.999
+  seed: 42
+  device: cuda
+  monitor: val_macro_f1
+  log_every: 1
+  amp: true
+  amp_dtype: auto
+  activation_checkpointing: false
+  compile: true
+  multi_gpu: false
+  skip_val_first_epoch: true
+  # === Phase 2 HGAA — dataset-portable, no hardcoded class IDs ===
+  hgaa:
+    enabled: true
+    ops: [edge_addition, node_feature_swap, edge_direction_swap, edge_perturbation]
+    eta_per_op: 0.1
+    aug_ratio_in_batch: 0.5
+    smoothing: 1.0
+    bias_selection_method: top_k
+    bias_top_k_rarest: 3
+    bias_min_class_freq: 0.01
+    bias_factor_T: 0.5
+    bias_preferred_op: node_feature_swap
+
+sampler:
+  hops: 4
+  fanouts:
+    flow__contains__packet: 8
+    packet__next_packet__packet: 4
+    packet__matches_technique__technique: 5
+    flow__matches_technique__technique: 5
+    technique__belongs_to_tactic__tactic: 1
+  reverse_fanouts:
+    rev_contains: 3
+    rev_next_packet: 2
+    rev_matches_technique: 2
+    rev_belongs_to_tactic: 0
+  always_include_all_tactics: true
+  always_include_all_techniques: true
+
+dataloader:
+  num_workers: 8                  # L40S has 8 vCPUs
+  prefetch_factor: 16
+  pin_memory: true
+  persistent_workers: true
+
+wandb:
+  project: nt114-hgt-paper-variants
+  run_name: train_v7_p2

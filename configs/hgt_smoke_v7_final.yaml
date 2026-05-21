@@ -1,0 +1,126 @@
+# NT114 HGT v7-FINAL SMOKE — All Phase 1+2+3 enabled at once.
+# Train ONE run instead of 3 sequential phases. Use this if you don't
+# need per-phase ablation data for the thesis.
+#
+# Combines:
+#   - Phase 1: torch.compile + batch 512 + workers 8 + peak VRAM log
+#   - Phase 2: HGAA adaptive augmentation (4 ops + bias-aware + auto-detect)
+#   - Phase 3: HPE Laplacian Positional Encoding (k=16)
+#
+# Prereq (one-time precompute):
+#   python -m graphslm_ids.offline.training.precompute_laplacian_pe \
+#     --graph-store-root /home/ubuntu/dataset/graph_store_v1 \
+#     --output-path /home/ubuntu/dataset/graph_store_v1/laplacian_pe_flow.npy \
+#     --k 16
+#
+# Pass criteria (Ep5):
+#   - val_macro_f1 >= 0.118 (v6 smoke baseline floor)
+#   - [hgaa] enabled + [hpe] Loaded logs both appear
+#   - No NaN, no crash
+
+experiment:
+  source_name: "NT114 HGT v7-FINAL SMOKE — all 3 phases combined"
+  rationale: >
+    Single-config alternative to sequential v7-p1/p2/p3 runs. Useful when
+    ablation per-phase isn't required (e.g. thesis only needs v6 vs v7-final
+    comparison). Compresses 90h compute into ~30h.
+
+data:
+  source: graph_store
+  graph_npz: /home/ubuntu/dataset/graph3/graph_artifact_3tier_14gb.npz
+  graph_meta_json: /home/ubuntu/dataset/graph3/graph_artifact_3tier_14gb.meta.json
+  graph_store_root: /home/ubuntu/dataset/graph_store_v1
+  read_sealed_only: true
+  packet_feature: semantic
+  add_reverse_edges: true
+  standardize_flow_features: true
+  use_semantic_edge_weights: true
+  # Phase 3 — Laplacian PE
+  laplacian_pe_path: /home/ubuntu/dataset/graph_store_v1/laplacian_pe_flow.npy
+
+model:
+  hidden_dim: 384
+  num_layers: 4
+  num_heads: 12
+  dropout: 0.20
+  ffn_multiplier: 4
+
+train:
+  output_dir: /home/ubuntu/outputs/smoke_v7_final
+  epochs: 5
+  max_train_flows: 200000
+  patience: 5
+  batch_mode: neighbor_sampling
+  batch_seed_flows: 512        # Phase 1
+  grad_accum_steps: 1
+  lr: 0.001
+  weight_decay: 0.0003
+  grad_clip_norm: 1.0
+  adamw_eps: 1.0e-6
+  adamw_betas: [0.9, 0.95]
+  scheduler: onecycle
+  scheduler_pct_start: 0.05
+  scheduler_eta_min: 1.0e-5
+  val_ratio: 0.1
+  test_ratio: 0.1
+  class_weight: balanced
+  class_weight_method: cb
+  cb_beta: 0.9999
+  class_weight_cap: 3.0
+  stratified_batch_sampling: false
+  drw_start_pct: 0.0           # smoke: weights from ep1
+  loss_type: cb_focal
+  focal_gamma: 2.0
+  label_smoothing: 0.1
+  logit_adjustment: 0.0
+  drop_edge_prob: 0.05
+  ema_enabled: false           # smoke: disabled for clean signal
+  ema_decay: 0.999
+  seed: 42
+  device: cuda
+  monitor: val_macro_f1
+  log_every: 1
+  amp: true
+  amp_dtype: auto
+  activation_checkpointing: false
+  compile: true                # Phase 1
+  multi_gpu: false
+  skip_val_first_epoch: true
+  # === Phase 2 HGAA ===
+  hgaa:
+    enabled: true
+    ops: [edge_addition, node_feature_swap, edge_direction_swap, edge_perturbation]
+    eta_per_op: 0.1
+    aug_ratio_in_batch: 0.5
+    smoothing: 1.0
+    bias_selection_method: top_k
+    bias_top_k_rarest: 3
+    bias_min_class_freq: 0.01
+    bias_factor_T: 0.5
+    bias_preferred_op: node_feature_swap
+
+sampler:
+  hops: 4
+  fanouts:
+    flow__contains__packet: 8
+    packet__next_packet__packet: 4
+    packet__matches_technique__technique: 5
+    flow__matches_technique__technique: 5
+    technique__belongs_to_tactic__tactic: 1
+  reverse_fanouts:
+    rev_contains: 3
+    rev_next_packet: 2
+    rev_matches_technique: 2
+    rev_belongs_to_tactic: 0
+  always_include_all_tactics: true
+  always_include_all_techniques: true
+
+dataloader:
+  num_workers: 8
+  prefetch_factor: 16
+  pin_memory: true
+  persistent_workers: true
+
+wandb:
+  project: nt114-hgt-paper-variants
+  run_name: smoke_v7_final
