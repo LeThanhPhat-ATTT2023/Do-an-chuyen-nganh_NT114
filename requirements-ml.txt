@@ -2,3 +2,4 @@
 torch>=2.2
 transformers>=4.42
 onnxruntime>=1.18
+scipy>=1.11
