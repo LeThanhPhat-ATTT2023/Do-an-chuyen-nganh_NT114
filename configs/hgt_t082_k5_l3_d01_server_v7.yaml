@@ -1,0 +1,128 @@
+# NT114 HGT v7 (Phase 1) — FULL TRAINING config (100 epochs, full ~960k train).
+# Identical to v6 except for Phase 1 speed-ups (no logic change).
+#
+# Phase 1 changes vs v6:
+#   1. compile: false → true     # enable existing torch.compile infrastructure
+#   2. batch_seed_flows: 256 → 512
+#   3. dataloader.num_workers: 8 → 16
+#   4. dataloader.prefetch_factor: 10 → 16
+#   5. Peak VRAM logged each epoch via `[diag] epoch=N | wall=Xs | peak_vram_gb=Y.YY`
+#
+# Phase 1 does NOT touch hgt.py — the existing FP32 fallback in post-aggregation
+# block is retained pending CUDA-side verification of BF16 safety (see
+# tests/models/test_hgt_amp_numerics.py characterization tests).
+#
+# Target runtime: 18-25h (was 25-40h for v6) — modestly less aggressive than
+# the spec's 15-22h target since hgt.py FP32 fallback retained.
+#
+# Prereq: smoke_v7_p1 must pass:
+#   - val_macro_f1 within ±0.02 of v6 smoke
+#   - no NaN losses
+#   - wall time per epoch ≥ 25% faster than v6 smoke
+#   - peak VRAM ≤ 42GB
+#
+# Run:
+#   tmux new -s train_v7_p1
+#   python -m graphslm_ids.offline.training.train_hgt_flow_classifier \
+#     --config configs/hgt_t082_k5_l3_d01_server_v7.yaml \
+#     2>&1 | tee /home/ubuntu/outputs/train_v7_p1.log
+
+experiment:
+  source_name: "NT114 IDS-HGT v7 Phase 1 — CB-Focal + DRW + speed-ups"
+  rationale: >
+    Same imbalance stack as v6 (CB-Focal + DRW + EMA, no logit adjustment).
+    Phase 1 ONLY adds speed-ups: torch.compile on, larger batch (512 seeds),
+    16 dataloader workers, BF16 path where existing fallbacks already permit.
+    Model logic and loss unchanged. Used as baseline for Phase 2 (HGAA
+    augmentation) ablation.
+
+data:
+  source: graph_store
+  graph_npz: /home/ubuntu/dataset/graph3/graph_artifact_3tier_14gb.npz
+  graph_meta_json: /home/ubuntu/dataset/graph3/graph_artifact_3tier_14gb.meta.json
+  graph_store_root: /home/ubuntu/dataset/graph_store_v1
+  read_sealed_only: true
+  packet_feature: semantic
+  add_reverse_edges: true
+  standardize_flow_features: true
+  use_semantic_edge_weights: true
+
+model:
+  hidden_dim: 384
+  num_layers: 4
+  num_heads: 12
+  dropout: 0.20
+  ffn_multiplier: 4
+
+train:
+  output_dir: /home/ubuntu/outputs/train_v7_p1
+  epochs: 100
+  max_train_flows: 0
+  patience: 30
+  # Batch — Phase 1 changes
+  batch_mode: neighbor_sampling
+  batch_seed_flows: 512        # was 256
+  grad_accum_steps: 1
+  # Optimizer (identical to v6)
+  lr: 0.001
+  weight_decay: 0.0003
+  grad_clip_norm: 1.0
+  adamw_eps: 1.0e-6
+  adamw_betas: [0.9, 0.95]
+  scheduler: onecycle
+  scheduler_pct_start: 0.05
+  scheduler_eta_min: 1.0e-5
+  val_ratio: 0.1
+  test_ratio: 0.1
+  # Class imbalance (identical to v6)
+  class_weight: balanced
+  class_weight_method: cb
+  cb_beta: 0.9999
+  class_weight_cap: 3.0
+  stratified_batch_sampling: false
+  drw_start_pct: 0.7
+  loss_type: cb_focal
+  focal_gamma: 2.0
+  label_smoothing: 0.1
+  ldam_max_m: 0.5
+  ldam_scale: 30.0
+  logit_adjustment: 0.0
+  drop_edge_prob: 0.05
+  ema_enabled: true
+  ema_decay: 0.999
+  seed: 42
+  device: cuda
+  monitor: val_macro_f1
+  log_every: 1
+  amp: true
+  amp_dtype: auto
+  activation_checkpointing: false
+  compile: true                # Phase 1 KEY CHANGE
+  multi_gpu: false
+  skip_val_first_epoch: true
+
+sampler:
+  hops: 4
+  fanouts:
+    flow__contains__packet: 8
+    packet__next_packet__packet: 4
+    packet__matches_technique__technique: 5
+    flow__matches_technique__technique: 5
+    technique__belongs_to_tactic__tactic: 1
+  reverse_fanouts:
+    rev_contains: 3
+    rev_next_packet: 2
+    rev_matches_technique: 2
+    rev_belongs_to_tactic: 0
+  always_include_all_tactics: true
+  always_include_all_techniques: true
+
+dataloader:
+  num_workers: 16              # was 8
+  prefetch_factor: 16          # was 10
+  pin_memory: true
+  persistent_workers: true
+
+wandb:
+  project: nt114-hgt-paper-variants
+  run_name: train_v7_p1
