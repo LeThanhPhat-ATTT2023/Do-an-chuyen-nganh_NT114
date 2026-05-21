@@ -76,49 +76,41 @@ Các metric cần ghi:
 | Sampler | avg subgraph nodes/edges theo relation |
 | Ổn định | OOM, fallback CPU, early stopping |
 
-## v7 Phase 3 — HPE Laplacian Positional Encoding (2026-05)
+## v7-final — Unified Training Config (2026-05)
 
-Hai config mới cho lineage v7-p3:
+Lần train chính thức của thesis dùng **2 config duy nhất**:
 
-| File | Mục tiêu | Khác v7-p2 |
+| File | Mục tiêu | Thời gian |
 |---|---|---|
-| `configs/hgt_smoke_v7_p3.yaml` | Smoke 5 epochs validate PE integration | `data.laplacian_pe_path` set |
-| `configs/hgt_t082_k5_l3_d01_server_v7_p3.yaml` | Full 100 epochs với PE | (same as smoke + EMA + DRW 0.7) |
+| `configs/hgt_smoke_v7_final.yaml` | Smoke 5 epochs validate Phase 1 + 2 | ~30 phút |
+| `configs/hgt_t082_k5_l3_d01_server_v7_final.yaml` | Full 100 epochs convergence | ~28-36h trên L40S |
 
-**HPE-HGT** (Hybrid Positional Encoding cho HGT) là adaptation của MTSU 2025 paper. Bổ sung kiến thức cấu trúc toàn cục (global topology) vào HGT — vốn chỉ có local relation-aware attention.
+Quyết định gộp các ablation v7-p1 / v7-p2 / v7-p3 → 1 unified run vì:
+- Tiết kiệm compute ($18 vs $54 trên AWS L40S @ $0.60/h)
+- Thesis ablation đơn giản hơn: 2 configs (v6 baseline vs v7-final) thay vì 5
+- Pipeline end-to-end integrity được verify qua smoke
 
-**Cơ chế**:
-1. Precompute top-16 Laplacian eigenvectors của **flow-flow graph** (2 flows nối nhau nếu chia sẻ ≥1 packet)
-2. Cache vào file `.npy` (one-time, ~5-15 min trên L40S)
-3. Training loop load 1 lần ở startup, install vào module-level slot
-4. `to_torch_batch` tự động concat PE rows vào flow features mỗi batch
-5. `node_input_dims["flow"]` auto-expand từ 64 → 80 (= 64 + k=16)
+Các config v7-p1/p2/p3 đã bị xóa khỏi repo (commit 2026-05-21).
 
-**Prereq trước khi run v7-p3**:
-```bash
-python -m graphslm_ids.offline.training.precompute_laplacian_pe \
-  --graph-store-root /home/ubuntu/dataset/graph_store_v1 \
-  --output-path /home/ubuntu/dataset/graph_store_v1/laplacian_pe_flow.npy \
-  --k 16
-```
+## v7 Phase 3 — HPE Laplacian PE: DEFERRED cho run này
 
-**Module**: [laplacian_pe.py](../../src/graphslm_ids/offline/training/laplacian_pe.py), [precompute_laplacian_pe.py](../../src/graphslm_ids/offline/training/precompute_laplacian_pe.py).
+**Status**: code đã implement đầy đủ ([laplacian_pe.py](../../src/graphslm_ids/offline/training/laplacian_pe.py), [precompute_laplacian_pe.py](../../src/graphslm_ids/offline/training/precompute_laplacian_pe.py), tests 9/9 pass) nhưng **không activate** trong v7-final.
 
-**Integration**: module-level singleton `_HPE_FLOW_PE` ở [train_hgt_flow_classifier.py](../../src/graphslm_ids/offline/training/train_hgt_flow_classifier.py) — không phải thread parameter qua `_multi_gpu_train_step` / `evaluate_neighbor_sampling`. Sampler hot path KHÔNG bị đụng.
+**Lý do defer**: NT114 graph schema có quan hệ packet→flow là 1:1 (mỗi packet thuộc đúng 1 flow). Hệ quả: định nghĩa "flow-flow connectivity qua shared packets" trong [precompute_laplacian_pe.py:33](../../src/graphslm_ids/offline/training/precompute_laplacian_pe.py#L33) tạo ra **zero edges** trên dataset thật (verified 2026-05-21 trên L40S: `[pe] flow-flow edges: shape=(2, 0)`). Laplacian degenerate → eigenvectors meaningless → PE file = noise.
 
-**Acceptance**:
-- val_macro_f1 epoch 5 (smoke) ≥ v7-p2 smoke baseline
-- Log line `[hpe] Loaded Laplacian PE: shape=(N, 16) k=16 path=...` ở startup
-- Inference latency tăng ≤ 2% (chỉ index_select + concat)
+**Cần research thêm cho v8**: định nghĩa flow-flow connectivity phù hợp với IDS schema. Các phương án tiềm năng:
+- Shared MITRE technique: `flow → matches_technique → technique ← matches_technique → flow`
+- Shared 5-tuple subset (src_ip, dst_ip, proto)
+- Temporal window co-occurrence
+- 2-hop walks qua packet→next_packet→packet chains
+
+**Cấu hình hiện tại**: `data.laplacian_pe_path: null` trong cả 2 v7-final configs. Code path tại [train_hgt_flow_classifier.py:1561](../../src/graphslm_ids/offline/training/train_hgt_flow_classifier.py#L1561) detect null → skip PE load → per-batch concat hook tại line 1032 trở thành no-op. Model input dim không thay đổi.
+
+**Module vẫn giữ trong repo** cho v8 tương lai — không cần xóa, chỉ disable qua config.
 
 ## v7 Phase 2 — HGAA Adaptive Augmentation (2026-05)
 
-Hai config mới cho lineage v7-p2:
-
-| File | Mục tiêu | Khác v7-p1 |
-|---|---|---|
-| `configs/hgt_smoke_v7_p2.yaml` | Smoke 5 epochs validate HGAA pipeline | Thêm `train.hgaa.*` block |
-| `configs/hgt_t082_k5_l3_d01_server_v7_p2.yaml` | Full 100 epochs với HGAA | (same as smoke + EMA + DRW 0.7) |
+HGAA được activate trong v7-final configs (`train.hgaa.enabled: true`):
 
 **HGAA** (Heterogeneous Graph Adaptive Augmentation) là adaptation của Zhao et al. *Symmetry* 2025, 17, 1623 từ binary anomaly detection sang multiclass IDS. 4 operators:
 
@@ -137,24 +129,18 @@ Hai config mới cho lineage v7-p2:
 
 **Module ở**: [hgaa_augmentation.py](../../src/graphslm_ids/offline/training/hgaa_augmentation.py), [hgaa_filter_network.py](../../src/graphslm_ids/offline/training/hgaa_filter_network.py).
 
-**Acceptance criteria (smoke)**:
-- val_macro_f1 epoch 5 ≥ v7-p1 smoke baseline (0.118).
+**Acceptance criteria (smoke v7-final)**:
+- val_macro_f1 epoch 5 ≥ v6 smoke baseline (0.114).
 - `[hgaa] enabled — ...` line log đầu training: confirm `bias_classes` auto-detected (kỳ vọng `{10, 7, 0}` cho NT114 13 classes).
 - `[hgaa] epoch=N considered=X augmented=Y aug_rate≈0.5` mỗi epoch log.
+- KHÔNG có log `[hpe] Loaded Laplacian PE` (Phase 3 đã defer).
 - Không có NaN.
 
 Reference: `docs/superpowers/specs/2026-05-21-hgaa-multiclass-hgt-v7-design.md` §3.2.
 
 ## v7 Phase 1 — Speed-up Configs (2026-05)
 
-Hai config mới được thêm cho lineage v7:
-
-| File | Mục tiêu | Khác v6 |
-|---|---|---|
-| `configs/hgt_smoke_v7_p1.yaml` | Smoke 5 epochs validate Phase 1 speed-ups | compile on; batch 512; workers 16; prefetch 16 |
-| `configs/hgt_t082_k5_l3_d01_server_v7.yaml` | Full 100 epochs với Phase 1 speed-ups | (same as smoke + ema_enabled, drw_start_pct=0.7) |
-
-Phase 1 KHÔNG thay model logic. Mục tiêu: giảm wall time 25-40h → 18-25h trên L40S.
+Phase 1 speed-ups (torch.compile, batch 512, workers 16, prefetch 16) được activate trong v7-final configs. KHÔNG thay model logic. Mục tiêu: giảm wall time 25-40h → 18-25h trên L40S.
 
 Speed-ups áp dụng:
 
