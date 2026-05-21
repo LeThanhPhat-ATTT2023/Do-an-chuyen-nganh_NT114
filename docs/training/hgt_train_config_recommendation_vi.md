@@ -76,6 +76,75 @@ Các metric cần ghi:
 | Sampler | avg subgraph nodes/edges theo relation |
 | Ổn định | OOM, fallback CPU, early stopping |
 
+## v7 Phase 3 — HPE Laplacian Positional Encoding (2026-05)
+
+Hai config mới cho lineage v7-p3:
+
+| File | Mục tiêu | Khác v7-p2 |
+|---|---|---|
+| `configs/hgt_smoke_v7_p3.yaml` | Smoke 5 epochs validate PE integration | `data.laplacian_pe_path` set |
+| `configs/hgt_t082_k5_l3_d01_server_v7_p3.yaml` | Full 100 epochs với PE | (same as smoke + EMA + DRW 0.7) |
+
+**HPE-HGT** (Hybrid Positional Encoding cho HGT) là adaptation của MTSU 2025 paper. Bổ sung kiến thức cấu trúc toàn cục (global topology) vào HGT — vốn chỉ có local relation-aware attention.
+
+**Cơ chế**:
+1. Precompute top-16 Laplacian eigenvectors của **flow-flow graph** (2 flows nối nhau nếu chia sẻ ≥1 packet)
+2. Cache vào file `.npy` (one-time, ~5-15 min trên L40S)
+3. Training loop load 1 lần ở startup, install vào module-level slot
+4. `to_torch_batch` tự động concat PE rows vào flow features mỗi batch
+5. `node_input_dims["flow"]` auto-expand từ 64 → 80 (= 64 + k=16)
+
+**Prereq trước khi run v7-p3**:
+```bash
+python -m graphslm_ids.offline.training.precompute_laplacian_pe \
+  --graph-store-root /home/ubuntu/dataset/graph_store_v1 \
+  --output-path /home/ubuntu/dataset/graph_store_v1/laplacian_pe_flow.npy \
+  --k 16
+```
+
+**Module**: [laplacian_pe.py](../../src/graphslm_ids/offline/training/laplacian_pe.py), [precompute_laplacian_pe.py](../../src/graphslm_ids/offline/training/precompute_laplacian_pe.py).
+
+**Integration**: module-level singleton `_HPE_FLOW_PE` ở [train_hgt_flow_classifier.py](../../src/graphslm_ids/offline/training/train_hgt_flow_classifier.py) — không phải thread parameter qua `_multi_gpu_train_step` / `evaluate_neighbor_sampling`. Sampler hot path KHÔNG bị đụng.
+
+**Acceptance**:
+- val_macro_f1 epoch 5 (smoke) ≥ v7-p2 smoke baseline
+- Log line `[hpe] Loaded Laplacian PE: shape=(N, 16) k=16 path=...` ở startup
+- Inference latency tăng ≤ 2% (chỉ index_select + concat)
+
+## v7 Phase 2 — HGAA Adaptive Augmentation (2026-05)
+
+Hai config mới cho lineage v7-p2:
+
+| File | Mục tiêu | Khác v7-p1 |
+|---|---|---|
+| `configs/hgt_smoke_v7_p2.yaml` | Smoke 5 epochs validate HGAA pipeline | Thêm `train.hgaa.*` block |
+| `configs/hgt_t082_k5_l3_d01_server_v7_p2.yaml` | Full 100 epochs với HGAA | (same as smoke + EMA + DRW 0.7) |
+
+**HGAA** (Heterogeneous Graph Adaptive Augmentation) là adaptation của Zhao et al. *Symmetry* 2025, 17, 1623 từ binary anomaly detection sang multiclass IDS. 4 operators:
+
+1. **edge_addition** trên `flow__contains__packet`
+2. **node_feature_swap** giữa flows cùng class (in-class oversampling)
+3. **edge_direction_swap** trên `packet__next_packet__packet`
+4. **edge_perturbation** trên `flow__matches_technique__technique`
+
+(Skip type-swap vì sẽ phá ngữ nghĩa flow ↔ packet ↔ technique ↔ tactic.)
+
+**Adaptive selection** (paper §3.3.1): track success rate per (class, op) → sample ops theo phân phối normalized. Laplace smoothing prevents zero-probability ops.
+
+**Bias-aware** (paper §3.3.2, multiclass adaptation): auto-detect 3 rarest classes từ class distribution lúc training startup (KHÔNG hardcode class IDs — dataset-portable per spec §1.5 DC-2). Với prob `bias_factor_T=0.5`, tail-class samples force-select `node_feature_swap`.
+
+**Filter network**: defer cho v7-p3 (cần v7-p1 checkpoint làm teacher). v7-p2 chạy không filter — adaptive op success-rate tự gating chất lượng qua feedback loop.
+
+**Module ở**: [hgaa_augmentation.py](../../src/graphslm_ids/offline/training/hgaa_augmentation.py), [hgaa_filter_network.py](../../src/graphslm_ids/offline/training/hgaa_filter_network.py).
+
+**Acceptance criteria (smoke)**:
+- val_macro_f1 epoch 5 ≥ v7-p1 smoke baseline (0.118).
+- `[hgaa] enabled — ...` line log đầu training: confirm `bias_classes` auto-detected (kỳ vọng `{10, 7, 0}` cho NT114 13 classes).
+- `[hgaa] epoch=N considered=X augmented=Y aug_rate≈0.5` mỗi epoch log.
+- Không có NaN.
+
+Reference: `docs/superpowers/specs/2026-05-21-hgaa-multiclass-hgt-v7-design.md` §3.2.
+
 ## v7 Phase 1 — Speed-up Configs (2026-05)
 
 Hai config mới được thêm cho lineage v7:

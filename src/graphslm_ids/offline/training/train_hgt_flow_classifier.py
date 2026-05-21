@@ -969,6 +969,24 @@ def _to_device(value: Any, device: torch.device, non_blocking: bool, dtype: Any 
     return t.to(device, non_blocking=non_blocking)
 
 
+# Phase 3 — HPE-HGT module-level slot for the Laplacian Positional Encoding
+# tensor. Populated once at the start of training (see
+# ``train_neighbor_sampling``) and read by ``to_torch_batch`` on every batch.
+# Module-level singleton keeps the wiring surgical — no need to thread an
+# extra kwarg through ``_multi_gpu_train_step``, ``_multi_gpu_eval_step``,
+# and ``evaluate_neighbor_sampling``.
+_HPE_FLOW_PE: torch.Tensor | None = None
+
+
+def _set_hpe_flow_pe(pe: torch.Tensor | None) -> None:
+    """Install the Laplacian PE tensor used by :func:`to_torch_batch`.
+
+    Pass ``None`` to disable PE concatenation (no-op path).
+    """
+    global _HPE_FLOW_PE
+    _HPE_FLOW_PE = pe
+
+
 def to_torch_batch(
     batch: MiniBatchSubgraph,
     edge_types: list[tuple[str, str, str]],
@@ -1005,6 +1023,27 @@ def to_torch_batch(
 
     seed_mask = _to_device(batch.seed_mask, device, non_blocking, dtype=bool)
     seed_labels = _to_device(batch.seed_labels, device, non_blocking, dtype=np.int64)
+
+    # Phase 3 — HPE-HGT: concatenate Laplacian PE rows onto flow features when
+    # the full-graph PE tensor has been installed via ``_set_hpe_flow_pe``.
+    # ``local_to_global["flow"]`` gives the global flow IDs for the local
+    # subgraph's flow nodes (built by the neighbor sampler), so we gather
+    # PE rows once per batch on-device. No-op when ``_HPE_FLOW_PE`` is None.
+    if _HPE_FLOW_PE is not None:
+        flow_global = batch.local_to_global.get("flow") if batch.local_to_global else None
+        if flow_global is not None and len(flow_global) > 0:
+            # Build the index tensor on CPU then transfer non-blocking so the H2D
+            # copy can overlap with GPU compute on the next step, matching the
+            # pin_memory/non_blocking pattern used for the rest of the batch.
+            idx_cpu = torch.from_numpy(np.ascontiguousarray(flow_global, dtype=np.int64))
+            if non_blocking and _HPE_FLOW_PE.device.type == "cuda" and not idx_cpu.is_pinned():
+                idx_cpu = idx_cpu.pin_memory()
+            idx = idx_cpu.to(_HPE_FLOW_PE.device, non_blocking=non_blocking)
+            pe_rows = _HPE_FLOW_PE.index_select(0, idx).to(node_tensors["flow"].device)
+            # Match dtype of the flow features (BF16 under AMP, FP32 otherwise).
+            pe_rows = pe_rows.to(dtype=node_tensors["flow"].dtype)
+            node_tensors["flow"] = torch.cat([node_tensors["flow"], pe_rows], dim=1)
+
     return node_tensors, edge_tensors, edge_weights or None, seed_mask, seed_labels
 
 
@@ -1517,8 +1556,31 @@ def train_neighbor_sampling(
     )
 
     edge_types = list(backend.edge_types)
+
+    # Phase 3 — HPE-HGT Laplacian Positional Encoding. Loaded once here so
+    # downstream node_input_dims["flow"] reflects the augmented width.
+    # When ``data.laplacian_pe_path`` is absent / blank the variable stays
+    # None and the per-batch concat hook becomes a no-op.
+    flow_pe: torch.Tensor | None = None
+    flow_pe_k: int = 0
+    _pe_path = (config.get("data") or {}).get("laplacian_pe_path")
+    if _pe_path:
+        from graphslm_ids.offline.training.laplacian_pe import load_laplacian_pe
+        _pe_np = load_laplacian_pe(_pe_path)
+        flow_pe = torch.from_numpy(_pe_np).to(device)
+        flow_pe_k = int(_pe_np.shape[1])
+        if rank == 0:
+            print(
+                f"[hpe] Loaded Laplacian PE: shape={tuple(_pe_np.shape)} "
+                f"k={flow_pe_k} path={_pe_path}",
+                flush=True,
+            )
+    # Install (or clear) the module-level singleton read by to_torch_batch.
+    _set_hpe_flow_pe(flow_pe)
+
+    flow_feat_dim = int(backend.feature_dims["flow"]) + flow_pe_k
     node_input_dims = {
-        "flow": int(backend.feature_dims["flow"]),
+        "flow": flow_feat_dim,
         "packet": int(backend.feature_dims["packet"]),
         "technique": int(backend.feature_dims["technique"]),
     }
@@ -1695,6 +1757,28 @@ def train_neighbor_sampling(
     if rank == 0 and drop_edge_prob > 0.0:
         print(f"[drop_edge] prob={drop_edge_prob}", flush=True)
 
+    # HGAA Phase 2 — Adaptive heterogeneous-graph augmentation. Gated entirely
+    # by ``train.hgaa.enabled`` in config; when off the factory returns None
+    # and the per-batch hook below is a no-op. Dataset-portable: tail classes
+    # are auto-detected from the train labels (no hardcoded class IDs per
+    # spec §1.5 DC-2).
+    from graphslm_ids.offline.training.hgaa_augmentation import (
+        build_hgaa_pipeline_from_config,
+    )
+    hgaa_train_labels_for_detect = backend.get_flow_labels(
+        np.asarray(train_idx_np, dtype=np.int64)
+    )
+    # Build on all ranks — each rank's dataloader produces its own batches, so
+    # each rank applies its own augmentation independently (seed offset by rank
+    # to avoid identical RNG sequences across ranks).
+    hgaa_pipeline = build_hgaa_pipeline_from_config(
+        config=config,
+        train_labels=hgaa_train_labels_for_detect,
+        num_classes=num_classes,
+        seed=int(config["train"].get("seed", 42)) + rank,
+    )
+    del hgaa_train_labels_for_detect  # free memory; not needed beyond detect
+
     skip_val_first_epoch = bool(config["train"].get("skip_val_first_epoch", False))
 
     # QUALITY v4: EMA setup. Shadow weights tracked on raw_model (unwrapped, no
@@ -1793,9 +1877,16 @@ def train_neighbor_sampling(
             batch_group: list[MiniBatchSubgraph] = []
             for _ in range(group_size):
                 try:
-                    batch_group.append(next(train_iter))
+                    raw_batch = next(train_iter)
                 except StopIteration:
                     break
+                # HGAA hook — may return raw_batch unchanged when disabled or
+                # when probabilistic gate didn't fire. Failure inside the
+                # pipeline is logged and falls back to raw_batch so a bug
+                # in augmentation cannot abort training.
+                if hgaa_pipeline is not None:
+                    raw_batch = hgaa_pipeline.maybe_augment(raw_batch)
+                batch_group.append(raw_batch)
             if not batch_group:
                 break
 
@@ -2094,6 +2185,15 @@ def train_neighbor_sampling(
             device=device,
             rank=rank,
         )
+        if hgaa_pipeline is not None and rank == 0:
+            _hgaa_snap = hgaa_pipeline.stats_snapshot()
+            print(
+                f"[hgaa] epoch={epoch} considered={_hgaa_snap['considered']} "
+                f"augmented={_hgaa_snap['augmented']} "
+                f"aug_rate={_hgaa_snap['aug_rate']:.3f} "
+                f"op_counts={_hgaa_snap['op_counts']}",
+                flush=True,
+            )
         _wandb_log(entry, use_wandb)
 
         _val_loss = val_metrics["loss"]
