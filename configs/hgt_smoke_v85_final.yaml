@@ -51,7 +51,7 @@ train:
   batch_seed_flows: 768
   grad_accum_steps: 1
 
-  lr: 0.0008                   # matches v85_final (raised from 0.0005 per smoke evidence)
+  lr: 0.0005                   # matches v85_final (0.0008 confirmation smoke was slower)
   weight_decay: 0.0003
   grad_clip_norm: 1.0
   adamw_eps: 1.0e-6
