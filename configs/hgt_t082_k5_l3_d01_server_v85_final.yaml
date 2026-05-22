@@ -1,14 +1,19 @@
 # NT114 HGT v8.5-FINAL — Focal-SAM + BufferGraph + TEW + Fixed Class Weights.
 #
 # This is the ONE-SHOT final config. It replaces the failed v7 DRW approach
-# (epoch 80: macro_f1=0.2091, val_acc=0.4106) with FIVE orthogonal fixes:
+# (epoch 80: macro_f1=0.2091, val_acc=0.4106) with FOUR orthogonal fixes:
 #   1. Focal Loss (γ=3) + inverse class weights (cap 20×) from epoch 1 — no DRW.
 #   2. SAM optimizer (ρ=0.05) for sharpness-aware flat-minima convergence.
 #   3. BufferGraph (topology-level): private technique buffers for minority flows
 #      that block majority→minority signal dilution at message-passing time.
 #   4. TEW (Temporal Edge Weights): wire next_packet Δt as 1/(Δt+ε) edge weight
 #      so HGT attention gets a temporal-locality bias (burst vs slow-scan).
-#   5. Logit adjustment τ=0.5 at inference to debias BENIGN-dominant argmax.
+#
+# Logit adjustment was TRIED (τ=0.5) and DROPPED: smoke isolation showed it tanks
+# val_acc below random on the undertrained model and corrupts the monitored metric.
+# Training-time fixes (1+3) already handle BENIGN dominance.
+#
+# lr raised 0.0005→0.0008 after smoke evidence (v8's "halve for SAM" was unfounded).
 #
 # Compute knobs to keep one-shot wall-clock ~38h (SAM doubles per-step cost):
 #   - batch 768 (was 512), epochs 80 (was 100), patience 20 (was 30)
@@ -70,7 +75,10 @@ train:
   grad_accum_steps: 1           # SAM requires accum=1
 
   # Optimizer — SAM wraps AdamW
-  lr: 0.0005                    # lower: SAM effective update is ~2× stronger than plain AdamW
+  lr: 0.0008                    # smoke evidence: lr=0.0005 trailed v6 baseline at ep5;
+                                # SAM changes gradient DIRECTION (flat minima), not step
+                                # MAGNITUDE — so the v8 "halve for SAM" rationale was wrong.
+                                # 0.0008 is bracketed by evidence: 0.0005 stable here, 0.001 stable in v6.
   weight_decay: 0.0003
   grad_clip_norm: 1.0
   adamw_eps: 1.0e-6
@@ -97,8 +105,14 @@ train:
   cb_beta: 0.9999
   drw_start_pct: 0.0            # NO deferred reweighting; weights active from epoch 1
 
-  # Inference-time debiasing (Menon et al. ICLR 2021)
-  logit_adjustment: 0.5         # subtract τ·log(prior) from logits at eval/test
+  # Inference-time debiasing (Menon et al. ICLR 2021) — DISABLED.
+  # Smoke isolation test proved tau=0.5 tanked val_acc below random (0.011 vs
+  # 0.077): logit adjustment is designed for a CONVERGED model; applied during
+  # training it pushes an undertrained model to predict rare classes, and it
+  # corrupts the val_macro_f1 we monitor (would trigger false aborts). The
+  # training-time imbalance fixes (inverse weights cap=20 + focal γ=3 +
+  # BufferGraph) already handle BENIGN dominance — no inference band-aid needed.
+  logit_adjustment: 0.0
 
   val_ratio: 0.1
   test_ratio: 0.1
