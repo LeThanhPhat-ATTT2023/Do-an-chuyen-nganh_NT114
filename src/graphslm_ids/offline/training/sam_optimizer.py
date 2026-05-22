@@ -45,6 +45,11 @@ class SAM(torch.optim.Optimizer):
         super().__init__(params, defaults)
         self.base_optimizer = base_optimizer(self.param_groups, **kwargs)
         self.param_groups = self.base_optimizer.param_groups
+        # Expose the base optimizer's defaults (lr, betas/momentum, eps, ...) so
+        # LR schedulers that introspect `optimizer.defaults` work transparently.
+        # In particular OneCycleLR(cycle_momentum=True) requires 'betas' (AdamW)
+        # or 'momentum' (SGD) to be present, else it raises at construction.
+        self.defaults.update(self.base_optimizer.defaults)
         for group in self.param_groups:
             group.setdefault("rho", rho)
             group.setdefault("adaptive", adaptive)
