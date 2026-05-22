@@ -50,6 +50,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "add_reverse_edges": True,
         "standardize_flow_features": True,
         "use_semantic_edge_weights": True,
+        # v8.5 TEW — wire delta_time_seconds (next_packet edge attr) as edge_weight
+        # so HGT layer's `scores += log(edge_weight)` becomes a temporal-locality
+        # bias: small Δt amplifies attention (burst detection), large Δt suppresses.
+        # Transform: edge_weight = 1.0 / (Δt + tew_epsilon).
+        "use_temporal_edge_weights": False,
+        "tew_epsilon": 1.0e-3,
     },
     "model": {
         "hidden_dim": 128,
@@ -97,6 +103,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # Optimizer numerics (BF16-stable defaults)
         "adamw_eps": 1.0e-6,
         "adamw_betas": (0.9, 0.95),
+        # SAM (Sharpness-Aware Minimization, Foret et al. ICLR 2021).
+        # Requires grad_accum_steps=1 and multi_gpu=false.
+        "sam_enabled": False,
+        "sam_rho": 0.05,
         # Skip val eval at epoch 1 (OneCycle warmup → near-random val anyway)
         "skip_val_first_epoch": False,
     },
@@ -976,6 +986,10 @@ def _to_device(value: Any, device: torch.device, non_blocking: bool, dtype: Any 
 # extra kwarg through ``_multi_gpu_train_step``, ``_multi_gpu_eval_step``,
 # and ``evaluate_neighbor_sampling``.
 _HPE_FLOW_PE: torch.Tensor | None = None
+# v8.5 TEW — module state (mirrors the _HPE_FLOW_PE pattern so we don't have to
+# thread two extra kwargs through 6 call sites of to_torch_batch).
+_TEW_ENABLED: bool = False
+_TEW_EPSILON: float = 1.0e-3
 
 
 def _set_hpe_flow_pe(pe: torch.Tensor | None) -> None:
@@ -985,6 +999,18 @@ def _set_hpe_flow_pe(pe: torch.Tensor | None) -> None:
     """
     global _HPE_FLOW_PE
     _HPE_FLOW_PE = pe
+
+
+def _set_tew_state(enabled: bool, epsilon: float = 1.0e-3) -> None:
+    """Configure temporal edge weights (TEW) used by :func:`to_torch_batch`.
+
+    When ``enabled`` is True, the function wires next_packet edges' delta_time
+    as edge_weight = 1/(Δt+epsilon); HGT will then add log(edge_weight) to
+    attention scores, creating a temporal-locality bias.
+    """
+    global _TEW_ENABLED, _TEW_EPSILON
+    _TEW_ENABLED = bool(enabled)
+    _TEW_EPSILON = float(epsilon)
 
 
 def to_torch_batch(
@@ -1020,6 +1046,21 @@ def to_torch_batch(
             value = batch.edge_attr.get(edge_type, np.empty((0,), dtype=np.float32))
             t = _to_device(value, device, non_blocking, dtype=np.float32)
             edge_weights[edge_type] = t.reshape(-1)
+
+    # v8.5 TEW — wire next_packet Δt as temporal-locality bias. HGT layer adds
+    # log(edge_weight) to attention scores; we pass 1/(Δt+ε) so:
+    #   small Δt  → log(1/small)  = large positive → amplify (burst pattern)
+    #   large Δt  → log(1/large)  = large negative → suppress (far in time)
+    if _TEW_ENABLED:
+        for edge_type in edge_types:
+            if edge_type[1] != "next_packet":
+                continue
+            value = batch.edge_attr.get(edge_type)
+            if value is None:
+                continue
+            t = _to_device(value, device, non_blocking, dtype=np.float32)
+            delta_t = t.reshape(-1) if t.ndim <= 1 else t[:, 0]
+            edge_weights[edge_type] = 1.0 / (delta_t.clamp_min(0.0) + _TEW_EPSILON)
 
     seed_mask = _to_device(batch.seed_mask, device, non_blocking, dtype=bool)
     seed_labels = _to_device(batch.seed_labels, device, non_blocking, dtype=np.int64)
@@ -1631,15 +1672,39 @@ def train_neighbor_sampling(
     else:
         model = core
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
+    grad_accum_steps = max(1, int(config["train"].get("grad_accum_steps", 1)))
+    _adamw_kwargs = dict(
         lr=float(config["train"]["lr"]),
         weight_decay=float(config["train"]["weight_decay"]),
         eps=float(config["train"].get("adamw_eps", 1e-6)),
         betas=tuple(config["train"].get("adamw_betas", (0.9, 0.95))),
         fused=(device.type == "cuda"),
     )
-    grad_accum_steps = max(1, int(config["train"].get("grad_accum_steps", 1)))
+    sam_enabled = bool(config["train"].get("sam_enabled", False))
+    sam_rho = float(config["train"].get("sam_rho", 0.05))
+    if sam_enabled and is_ddp:
+        if rank == 0:
+            print("[SAM] DDP + SAM unsupported — disabling SAM, using AdamW.", flush=True)
+        sam_enabled = False
+    if sam_enabled and grad_accum_steps > 1:
+        if rank == 0:
+            print(
+                f"[SAM] grad_accum_steps={grad_accum_steps} > 1 is incompatible — disabling SAM.",
+                flush=True,
+            )
+        sam_enabled = False
+    if sam_enabled:
+        from graphslm_ids.offline.training.sam_optimizer import SAM
+        optimizer = SAM(
+            model.parameters(),
+            base_optimizer=torch.optim.AdamW,
+            rho=sam_rho,
+            **_adamw_kwargs,
+        )
+        if rank == 0:
+            print(f"[optimizer] SAM(AdamW) rho={sam_rho}", flush=True)
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), **_adamw_kwargs)
     grad_clip_norm = float(config["train"].get("grad_clip_norm", 0.0))
 
     _scheduler_type = str(config["train"].get("scheduler", "onecycle")).lower()
@@ -1815,6 +1880,11 @@ def train_neighbor_sampling(
     scaler = torch.amp.GradScaler("cuda", enabled=False)
     use_wandb = _wandb_init(config, rank)
     use_semantic_edge_weights = bool(config["data"]["use_semantic_edge_weights"])
+    use_temporal_edge_weights = bool(config["data"].get("use_temporal_edge_weights", False))
+    tew_epsilon = float(config["data"].get("tew_epsilon", 1.0e-3))
+    _set_tew_state(enabled=use_temporal_edge_weights, epsilon=tew_epsilon)
+    if rank == 0 and use_temporal_edge_weights:
+        print(f"[TEW] temporal edge weights enabled — 1/(Δt+{tew_epsilon}) on next_packet edges", flush=True)
 
     best_score = -float("inf")
     best_epoch = 0
@@ -1973,74 +2043,136 @@ def train_neighbor_sampling(
 
             pending_step = True
             if (step + 1) % grad_accum_steps == 0:
-                scaler.unscale_(optimizer)
-                if grad_clip_norm > 0.0:
-                    # clip_grad_norm_ returns total_norm as a scalar tensor.
-                    # When any grad is inf: total_norm=inf → clip_coef=0 → inf*0=NaN.
-                    # Checking total_norm.isfinite() after the call is O(1) and catches
-                    # this before the NaN gradients can be applied to weights.
-                    total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
-                    _bad_grads = not total_norm.isfinite()
-                else:
-                    _bad_grads = False
-                if _bad_grads:
-                    # Discard NaN/inf gradients before step to avoid weight corruption.
-                    optimizer.zero_grad(set_to_none=True)
-                    scaler.update()
-                    skipped_steps += 1
-                    # Loud warning: a silently-skipped step is invisible, and if EVERY
-                    # step skips the model never learns (loss frozen at ln(num_classes)).
-                    if rank == 0 and skipped_steps <= 5:
-                        print(
-                            f"[warn] optimizer step skipped — non-finite grad norm "
-                            f"(total_norm={float(total_norm):.3e}) at epoch {epoch} batch {step+1}. "
-                            f"Persistent skips freeze training; run in FP32 (amp: false) if this repeats.",
-                            flush=True,
-                        )
-                else:
-                    _scale_before = scaler.get_scale()
-                    scaler.step(optimizer)
-                    scaler.update()
-                    optimizer.zero_grad(set_to_none=True)
-                    if scaler.get_scale() < _scale_before:
-                        # scaler halved → step was skipped due to inf/NaN gradients
+                if sam_enabled and _loss_ok:
+                    # --- SAM two-step update ---
+                    # Step 1: clip gradient, perturb weights toward sharpness direction.
+                    scaler.unscale_(optimizer)
+                    if grad_clip_norm > 0.0:
+                        total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                        _bad_grads = not total_norm.isfinite()
+                    else:
+                        _bad_grads = False
+                        total_norm = torch.tensor(0.0)
+                    if _bad_grads:
+                        optimizer.zero_grad(set_to_none=True)
                         skipped_steps += 1
                         if rank == 0 and skipped_steps <= 5:
                             print(
-                                f"[AMP] step skipped (inf/NaN grad) at batch {step+1}, "
-                                f"scale {_scale_before:.0f}→{scaler.get_scale():.0f}",
+                                f"[warn][SAM] first step skipped — non-finite grad norm "
+                                f"(total_norm={float(total_norm):.3e}) at epoch {epoch} batch {step+1}.",
                                 flush=True,
                             )
                     else:
-                        optimizer_steps += 1
-                        if scheduler is not None:
-                            scheduler.step()
-                        if ema is not None:
-                            ema.update(raw_model)
-                        # First-step learning-signal probe: a healthy run shows a
-                        # non-trivial gradient norm here. A norm of ~0 means the
-                        # backward graph is detached / weights will never move —
-                        # the fingerprint of a frozen-loss run.
-                        if epoch == 1 and optimizer_steps == 1 and rank == 0:
-                            _gn = (
-                                float(total_norm) if grad_clip_norm > 0.0
-                                else float(
-                                    torch.norm(
-                                        torch.stack([
-                                            p.grad.detach().norm()
-                                            for p in model.parameters()
-                                            if p.grad is not None
-                                        ])
-                                    )
-                                ) if any(p.grad is not None for p in model.parameters())
-                                else 0.0
+                        optimizer.first_step(zero_grad=True)
+                        # Step 2: second forward at perturbed weights (same batch).
+                        with _nullcontext(), torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
+                            _logits_sam = model(nf, ei, edge_weight_dict=ew)
+                            _seed_logits_sam = _logits_sam[sm].float()
+                            _loss_sam = _compute_train_loss(
+                                _seed_logits_sam, sl, weight,
+                                loss_type=loss_type,
+                                label_smoothing=label_smoothing,
+                                focal_gamma=focal_gamma,
+                                ldam_margins=ldam_margins,
+                                ldam_scale=ldam_scale,
                             )
-                            _cur_lr = optimizer.param_groups[0]["lr"]
+                        if torch.isfinite(_loss_sam):
+                            _loss_sam.backward()
+                            if grad_clip_norm > 0.0:
+                                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                            optimizer.second_step(zero_grad=True)
+                            optimizer_steps += 1
+                            if scheduler is not None:
+                                scheduler.step()
+                            if ema is not None:
+                                ema.update(raw_model)
+                            if epoch == 1 and optimizer_steps == 1 and rank == 0:
+                                _cur_lr = optimizer.param_groups[0]["lr"]
+                                print(
+                                    f"[diag] first optimizer step (SAM) | grad_norm={float(total_norm):.4e} "
+                                    f"lr={_cur_lr:.3e}",
+                                    flush=True,
+                                )
+                        else:
+                            # Perturbed loss non-finite: restore weights, skip update.
+                            optimizer.restore_weights()
+                            skipped_steps += 1
+                            if rank == 0 and skipped_steps <= 5:
+                                print(
+                                    f"[warn][SAM] second step skipped — non-finite perturbed loss "
+                                    f"at epoch {epoch} batch {step+1}.",
+                                    flush=True,
+                                )
+                else:
+                    # Standard AdamW path (also used when sam_enabled but _loss_ok=False).
+                    scaler.unscale_(optimizer)
+                    if grad_clip_norm > 0.0:
+                        # clip_grad_norm_ returns total_norm as a scalar tensor.
+                        # When any grad is inf: total_norm=inf → clip_coef=0 → inf*0=NaN.
+                        # Checking total_norm.isfinite() after the call is O(1) and catches
+                        # this before the NaN gradients can be applied to weights.
+                        total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                        _bad_grads = not total_norm.isfinite()
+                    else:
+                        _bad_grads = False
+                    if _bad_grads:
+                        # Discard NaN/inf gradients before step to avoid weight corruption.
+                        optimizer.zero_grad(set_to_none=True)
+                        scaler.update()
+                        skipped_steps += 1
+                        # Loud warning: a silently-skipped step is invisible, and if EVERY
+                        # step skips the model never learns (loss frozen at ln(num_classes)).
+                        if rank == 0 and skipped_steps <= 5:
                             print(
-                                f"[diag] first optimizer step | grad_norm={_gn:.4e} "
-                                f"lr={_cur_lr:.3e}",
+                                f"[warn] optimizer step skipped — non-finite grad norm "
+                                f"(total_norm={float(total_norm):.3e}) at epoch {epoch} batch {step+1}. "
+                                f"Persistent skips freeze training; run in FP32 (amp: false) if this repeats.",
                                 flush=True,
                             )
+                    else:
+                        _scale_before = scaler.get_scale()
+                        scaler.step(optimizer)
+                        scaler.update()
+                        optimizer.zero_grad(set_to_none=True)
+                        if scaler.get_scale() < _scale_before:
+                            # scaler halved → step was skipped due to inf/NaN gradients
+                            skipped_steps += 1
+                            if rank == 0 and skipped_steps <= 5:
+                                print(
+                                    f"[AMP] step skipped (inf/NaN grad) at batch {step+1}, "
+                                    f"scale {_scale_before:.0f}→{scaler.get_scale():.0f}",
+                                    flush=True,
+                                )
+                        else:
+                            optimizer_steps += 1
+                            if scheduler is not None:
+                                scheduler.step()
+                            if ema is not None:
+                                ema.update(raw_model)
+                            # First-step learning-signal probe: a healthy run shows a
+                            # non-trivial gradient norm here. A norm of ~0 means the
+                            # backward graph is detached / weights will never move —
+                            # the fingerprint of a frozen-loss run.
+                            if epoch == 1 and optimizer_steps == 1 and rank == 0:
+                                _gn = (
+                                    float(total_norm) if grad_clip_norm > 0.0
+                                    else float(
+                                        torch.norm(
+                                            torch.stack([
+                                                p.grad.detach().norm()
+                                                for p in model.parameters()
+                                                if p.grad is not None
+                                            ])
+                                        )
+                                    ) if any(p.grad is not None for p in model.parameters())
+                                    else 0.0
+                                )
+                                _cur_lr = optimizer.param_groups[0]["lr"]
+                                print(
+                                    f"[diag] first optimizer step | grad_norm={_gn:.4e} "
+                                    f"lr={_cur_lr:.3e}",
+                                    flush=True,
+                                )
                 pending_step = False
             step += 1
             batches_seen += len(batch_group)

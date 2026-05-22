@@ -275,6 +275,140 @@ class GraphAugmentor:
             target_edge_type=target_edge_type,
         )
 
+    # ----- Operator 5: buffer node insertion (BufferGraph 2025, v8.5) -----
+    def buffer_node_insertion(
+        self,
+        subgraph: Any,
+        seed_labels: np.ndarray,
+        minority_classes: np.ndarray,
+        pressure_threshold: int = 3,
+        max_buffers: int = 100,
+        technique_edge_type: EdgeKey = ("flow", "matches_technique", "technique"),
+        reverse_edge_type: EdgeKey | None = ("technique", "rev_matches_technique", "flow"),
+    ) -> AugmentedSubgraph:
+        """Insert buffer technique nodes for minority flows under majority pressure.
+
+        Blocks majority→minority signal dilution through shared technique nodes.
+        For each (minority_flow F_m, tech T) pair where T is also connected to
+        >= ``pressure_threshold`` other flows in the batch, create a private
+        buffer technique node B (features = copy of T) and reroute F_m's edge
+        from T to B. F_m then aggregates clean technique signal from B (only
+        F_m as neighbor) instead of majority-dominated T.
+
+        Majority flow connections to T are NOT modified.
+        """
+        node_features, edge_index, edge_attr = self._copy_dicts(subgraph)
+
+        if technique_edge_type not in edge_index:
+            return AugmentedSubgraph(
+                node_features=node_features, edge_index=edge_index, edge_attr=edge_attr,
+                augmentation_op="buffer_node_insertion",
+                extra={"n_buffers_created": 0, "reason": "no_technique_edges"},
+            )
+        fei = np.asarray(edge_index[technique_edge_type])
+        if fei.shape[1] == 0:
+            return AugmentedSubgraph(
+                node_features=node_features, edge_index=edge_index, edge_attr=edge_attr,
+                augmentation_op="buffer_node_insertion",
+                extra={"n_buffers_created": 0, "reason": "empty_technique_edges"},
+            )
+
+        seed_labels_arr = np.asarray(seed_labels)
+        minority_arr = np.asarray(minority_classes)
+        if minority_arr.size == 0 or seed_labels_arr.size == 0:
+            return AugmentedSubgraph(
+                node_features=node_features, edge_index=edge_index, edge_attr=edge_attr,
+                augmentation_op="buffer_node_insertion",
+                extra={"n_buffers_created": 0, "reason": "no_minority_input"},
+            )
+
+        is_minority = np.isin(seed_labels_arr, minority_arr)
+        minority_flow_indices = np.flatnonzero(is_minority)
+        if minority_flow_indices.size == 0:
+            return AugmentedSubgraph(
+                node_features=node_features, edge_index=edge_index, edge_attr=edge_attr,
+                augmentation_op="buffer_node_insertion",
+                extra={"n_buffers_created": 0, "reason": "no_minority_in_batch"},
+            )
+
+        # Build tech → set(flow_indices) from valid seed flows only.
+        valid_seeds = set(np.flatnonzero(seed_labels_arr >= 0).tolist())
+        tech_to_flows: dict[int, set[int]] = {}
+        for i in range(fei.shape[1]):
+            f_idx, t_idx = int(fei[0, i]), int(fei[1, i])
+            if f_idx in valid_seeds:
+                tech_to_flows.setdefault(t_idx, set()).add(f_idx)
+
+        # Collect unique (F_m, T) pairs exceeding pressure threshold (FIFO cap).
+        minority_set = set(minority_flow_indices.tolist())
+        seen: set[tuple[int, int]] = set()
+        buffer_candidates: list[tuple[int, int]] = []
+        for i in range(fei.shape[1]):
+            f_idx, t_idx = int(fei[0, i]), int(fei[1, i])
+            if f_idx not in minority_set:
+                continue
+            key = (f_idx, t_idx)
+            if key in seen:
+                continue
+            if t_idx not in tech_to_flows:
+                continue
+            if len(tech_to_flows[t_idx]) < pressure_threshold:
+                continue
+            seen.add(key)
+            buffer_candidates.append(key)
+            if len(buffer_candidates) >= max_buffers:
+                break
+
+        if not buffer_candidates:
+            return AugmentedSubgraph(
+                node_features=node_features, edge_index=edge_index, edge_attr=edge_attr,
+                augmentation_op="buffer_node_insertion",
+                extra={"n_buffers_created": 0, "reason": "no_pressure_exceeded"},
+            )
+
+        # Extend technique features with buffer rows.
+        tech_feats = node_features["technique"]
+        n_existing = int(tech_feats.shape[0])
+        n_buffers = len(buffer_candidates)
+        buffer_indices = np.arange(n_existing, n_existing + n_buffers, dtype=fei.dtype)
+        buffer_feats = np.stack(
+            [tech_feats[t] for _, t in buffer_candidates], axis=0,
+        ).astype(tech_feats.dtype)
+        node_features["technique"] = np.concatenate([tech_feats, buffer_feats], axis=0)
+
+        pair_to_buffer: dict[tuple[int, int], int] = {
+            pair: int(buf) for pair, buf in zip(buffer_candidates, buffer_indices)
+        }
+
+        # Reroute forward edges F_m → T  ⟶  F_m → buffer.
+        new_fei = fei.copy()
+        for i in range(new_fei.shape[1]):
+            key = (int(new_fei[0, i]), int(new_fei[1, i]))
+            if key in pair_to_buffer:
+                new_fei[1, i] = pair_to_buffer[key]
+        edge_index[technique_edge_type] = new_fei
+
+        # Reroute reverse edges T → F_m  ⟶  buffer → F_m, if present.
+        if reverse_edge_type is not None and reverse_edge_type in edge_index:
+            rev = np.asarray(edge_index[reverse_edge_type])
+            if rev.shape[1] > 0:
+                new_rev = rev.copy()
+                for i in range(new_rev.shape[1]):
+                    key = (int(new_rev[1, i]), int(new_rev[0, i]))  # (flow, tech)
+                    if key in pair_to_buffer:
+                        new_rev[0, i] = pair_to_buffer[key]
+                edge_index[reverse_edge_type] = new_rev
+
+        return AugmentedSubgraph(
+            node_features=node_features, edge_index=edge_index, edge_attr=edge_attr,
+            augmentation_op="buffer_node_insertion",
+            extra={
+                "n_buffers_created": n_buffers,
+                "n_minority_in_batch": int(minority_flow_indices.size),
+                "pressure_threshold": int(pressure_threshold),
+            },
+        )
+
 
 # =========================================================================
 # Adaptive op selector — paper §3.3.1, multiclass extension
@@ -494,6 +628,11 @@ class HGAAPipeline:
         op_edge_map: dict[str, EdgeKey] | None = None,
         feature_swap_node_type: str = "flow",
         seed: int | None = None,
+        # BufferGraph pre-step (v8.5 — deterministic, applied before stochastic op).
+        buffer_enabled: bool = False,
+        buffer_minority_classes: np.ndarray | None = None,
+        buffer_pressure_threshold: int = 3,
+        buffer_max_per_batch: int = 100,
     ) -> None:
         if not 0.0 <= p_aug <= 1.0:
             raise ValueError(f"p_aug must be in [0, 1], got {p_aug}")
@@ -503,7 +642,18 @@ class HGAAPipeline:
         self.op_edge_map = dict(op_edge_map) if op_edge_map is not None else dict(DEFAULT_OP_EDGE_MAP)
         self.feature_swap_node_type = str(feature_swap_node_type)
         self._rng = np.random.default_rng(seed) if seed is not None else np.random.default_rng()
-        self._stats = {"considered": 0, "augmented": 0, "op_counts": {}}
+        self.buffer_enabled = bool(buffer_enabled)
+        self.buffer_minority_classes = (
+            np.asarray(buffer_minority_classes, dtype=np.int64)
+            if buffer_minority_classes is not None
+            else np.array([], dtype=np.int64)
+        )
+        self.buffer_pressure_threshold = int(buffer_pressure_threshold)
+        self.buffer_max_per_batch = int(buffer_max_per_batch)
+        self._stats = {
+            "considered": 0, "augmented": 0, "op_counts": {},
+            "buffer_created_total": 0, "buffer_applied_batches": 0,
+        }
 
     def _pick_target_class(self, seed_labels: np.ndarray) -> int | None:
         """Pick the rarest class present in this batch (excluding pad -1).
@@ -533,8 +683,6 @@ class HGAAPipeline:
                 ``seed_labels``).
         """
         self._stats["considered"] += 1
-        if self._rng.random() >= self.p_aug:
-            return subgraph
         # The seed_labels may be a numpy array or a torch tensor depending
         # on whether ``pin_memory`` was already called.
         labels = subgraph.seed_labels
@@ -542,6 +690,26 @@ class HGAAPipeline:
             labels_np = labels.cpu().numpy()
         else:
             labels_np = np.asarray(labels)
+
+        # --- BufferGraph pre-step (v8.5 — deterministic, runs before stochastic gate) ---
+        if self.buffer_enabled and self.buffer_minority_classes.size > 0:
+            subgraph_np = _ensure_numpy_subgraph(subgraph)
+            buffered = self.augmentor.buffer_node_insertion(
+                subgraph_np,
+                seed_labels=labels_np,
+                minority_classes=self.buffer_minority_classes,
+                pressure_threshold=self.buffer_pressure_threshold,
+                max_buffers=self.buffer_max_per_batch,
+            )
+            n_created = int(buffered.extra.get("n_buffers_created", 0))
+            if n_created > 0:
+                subgraph = self._merge_back(subgraph, buffered)
+                self._stats["buffer_created_total"] += n_created
+                self._stats["buffer_applied_batches"] += 1
+
+        # --- Stochastic gate for the remaining HGAA ops ---
+        if self._rng.random() >= self.p_aug:
+            return subgraph
         target_class = self._pick_target_class(labels_np)
         if target_class is None:
             return subgraph
@@ -696,9 +864,27 @@ def build_hgaa_pipeline_from_config(
         flush=True,
     )
 
+    # BufferGraph (v8.5) — re-use the same bias_classes already detected above
+    # as the minority pool. Off by default; turned on via `buffer_enabled` flag.
+    buffer_enabled = bool(hgaa_cfg.get("buffer_enabled", False))
+    buffer_minority_arr = (
+        np.asarray(bias_classes, dtype=np.int64) if buffer_enabled else None
+    )
+    if buffer_enabled:
+        print(
+            f"[hgaa] BufferGraph enabled — minority={bias_classes} "
+            f"pressure={int(hgaa_cfg.get('buffer_pressure_threshold', 3))} "
+            f"max_per_batch={int(hgaa_cfg.get('buffer_max_per_batch', 100))}",
+            flush=True,
+        )
+
     return HGAAPipeline(
         augmentor=augmentor,
         selector=selector,
         p_aug=p_aug,
         seed=seed,
+        buffer_enabled=buffer_enabled,
+        buffer_minority_classes=buffer_minority_arr,
+        buffer_pressure_threshold=int(hgaa_cfg.get("buffer_pressure_threshold", 3)),
+        buffer_max_per_batch=int(hgaa_cfg.get("buffer_max_per_batch", 100)),
     )
