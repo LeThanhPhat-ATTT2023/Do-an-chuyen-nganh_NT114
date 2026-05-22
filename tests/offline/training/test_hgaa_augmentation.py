@@ -550,3 +550,197 @@ def test_build_pipeline_from_config_enabled_builds_pipeline():
     assert pipeline is not None
     assert isinstance(pipeline.selector, BiasAwareSelector)
     assert set(pipeline.selector.bias_classes) == {1, 2}
+
+
+# ============================================================================
+# BufferGraph operator tests (v8.5 — signal-dilution prevention)
+# ============================================================================
+from types import SimpleNamespace
+
+
+def _make_buffer_sg(n_majority, n_minority, shared_tech_idx=0, with_reverse=False):
+    """Subgraph where all flows connect to a single shared technique.
+
+    All majority flows AND minority flows attach to technique[shared_tech_idx].
+    This is the canonical "signal dilution" scenario.
+    """
+    n_flows = n_majority + n_minority
+    flow_feats = np.random.rand(n_flows, 8).astype(np.float32)
+    n_techs = max(2, shared_tech_idx + 1)
+    tech_feats = np.random.rand(n_techs, 4).astype(np.float32)
+
+    src = list(range(n_flows))
+    dst = [shared_tech_idx] * n_flows
+    fei = np.array([src, dst], dtype=np.int64)
+    f_attr = np.random.rand(fei.shape[1]).astype(np.float32)
+
+    sg = SimpleNamespace(
+        node_features={"flow": flow_feats, "technique": tech_feats},
+        edge_index={("flow", "matches_technique", "technique"): fei},
+        edge_attr={("flow", "matches_technique", "technique"): f_attr},
+    )
+    if with_reverse:
+        rev = np.array([fei[1], fei[0]], dtype=np.int64)
+        sg.edge_index[("technique", "rev_matches_technique", "flow")] = rev
+        sg.edge_attr[("technique", "rev_matches_technique", "flow")] = f_attr.copy()
+    return sg
+
+
+def _make_many_shared_sg(n_majority, n_minority, n_shared_techs):
+    """Each flow connects to ALL n_shared_techs (high pressure on every tech)."""
+    n_flows = n_majority + n_minority
+    flow_feats = np.random.rand(n_flows, 8).astype(np.float32)
+    tech_feats = np.random.rand(n_shared_techs, 4).astype(np.float32)
+    src, dst = [], []
+    for f in range(n_flows):
+        for t in range(n_shared_techs):
+            src.append(f); dst.append(t)
+    fei = np.array([src, dst], dtype=np.int64)
+    return SimpleNamespace(
+        node_features={"flow": flow_feats, "technique": tech_feats},
+        edge_index={("flow", "matches_technique", "technique"): fei},
+        edge_attr={("flow", "matches_technique", "technique"): np.random.rand(fei.shape[1]).astype(np.float32)},
+    )
+
+
+def test_buffer_op_noop_when_no_minority():
+    from graphslm_ids.offline.training.hgaa_augmentation import GraphAugmentor
+    aug = GraphAugmentor(eta=0.1, rng=np.random.default_rng(0))
+    sg = _make_buffer_sg(n_majority=4, n_minority=0)
+    out = aug.buffer_node_insertion(
+        sg, seed_labels=np.array([0, 0, 0, 0]),
+        minority_classes=np.array([1]), pressure_threshold=2,
+    )
+    assert out.extra["n_buffers_created"] == 0
+    assert out.node_features["technique"].shape == sg.node_features["technique"].shape
+
+
+def test_buffer_op_creates_buffer_for_minority_under_pressure():
+    from graphslm_ids.offline.training.hgaa_augmentation import GraphAugmentor
+    aug = GraphAugmentor(eta=0.1, rng=np.random.default_rng(0))
+    sg = _make_buffer_sg(n_majority=5, n_minority=1, shared_tech_idx=0)
+
+    out = aug.buffer_node_insertion(
+        sg, seed_labels=np.array([0, 0, 0, 0, 0, 1]),
+        minority_classes=np.array([1]), pressure_threshold=3,
+    )
+    assert out.extra["n_buffers_created"] == 1
+    assert out.node_features["technique"].shape[0] == sg.node_features["technique"].shape[0] + 1
+
+    new_ei = out.edge_index[("flow", "matches_technique", "technique")]
+    minority_dst = new_ei[1][new_ei[0] == 5].tolist()
+    buffer_idx = sg.node_features["technique"].shape[0]
+    assert buffer_idx in minority_dst, "minority flow not rerouted to buffer"
+    assert 0 not in minority_dst, "minority flow still connects to diluted tech 0"
+
+
+def test_buffer_op_leaves_majority_connections_intact():
+    from graphslm_ids.offline.training.hgaa_augmentation import GraphAugmentor
+    aug = GraphAugmentor(eta=0.1, rng=np.random.default_rng(0))
+    sg = _make_buffer_sg(n_majority=5, n_minority=1, shared_tech_idx=0)
+    out = aug.buffer_node_insertion(
+        sg, seed_labels=np.array([0, 0, 0, 0, 0, 1]),
+        minority_classes=np.array([1]), pressure_threshold=3,
+    )
+    new_ei = out.edge_index[("flow", "matches_technique", "technique")]
+    for f in range(5):
+        assert 0 in new_ei[1][new_ei[0] == f].tolist(), f"majority flow {f} lost tech 0"
+
+
+def test_buffer_op_respects_max_buffers_cap():
+    from graphslm_ids.offline.training.hgaa_augmentation import GraphAugmentor
+    aug = GraphAugmentor(eta=0.1, rng=np.random.default_rng(0))
+    sg = _make_many_shared_sg(n_majority=10, n_minority=5, n_shared_techs=4)
+    out = aug.buffer_node_insertion(
+        sg, seed_labels=np.array([0] * 10 + [1] * 5),
+        minority_classes=np.array([1]), pressure_threshold=3, max_buffers=10,
+    )
+    assert out.extra["n_buffers_created"] == 10
+
+
+def test_buffer_op_below_threshold_no_buffer():
+    from graphslm_ids.offline.training.hgaa_augmentation import GraphAugmentor
+    aug = GraphAugmentor(eta=0.1, rng=np.random.default_rng(0))
+    sg = _make_buffer_sg(n_majority=2, n_minority=1, shared_tech_idx=0)
+    out = aug.buffer_node_insertion(
+        sg, seed_labels=np.array([0, 0, 1]),
+        minority_classes=np.array([1]), pressure_threshold=5,
+    )
+    assert out.extra["n_buffers_created"] == 0
+    assert out.node_features["technique"].shape == sg.node_features["technique"].shape
+
+
+def test_buffer_op_reroutes_reverse_edges():
+    from graphslm_ids.offline.training.hgaa_augmentation import GraphAugmentor
+    aug = GraphAugmentor(eta=0.1, rng=np.random.default_rng(0))
+    sg = _make_buffer_sg(n_majority=4, n_minority=1, shared_tech_idx=0, with_reverse=True)
+    out = aug.buffer_node_insertion(
+        sg, seed_labels=np.array([0, 0, 0, 0, 1]),
+        minority_classes=np.array([1]), pressure_threshold=3,
+    )
+    assert out.extra["n_buffers_created"] == 1
+    buffer_idx = sg.node_features["technique"].shape[0]
+    rev_ei = out.edge_index[("technique", "rev_matches_technique", "flow")]
+    src_into_minority = rev_ei[0][rev_ei[1] == 4].tolist()
+    assert buffer_idx in src_into_minority
+    assert 0 not in src_into_minority
+
+
+def test_buffer_op_preserves_edge_attr():
+    from graphslm_ids.offline.training.hgaa_augmentation import GraphAugmentor
+    aug = GraphAugmentor(eta=0.1, rng=np.random.default_rng(0))
+    sg = _make_buffer_sg(n_majority=4, n_minority=1, shared_tech_idx=0)
+    pre_attr = sg.edge_attr[("flow", "matches_technique", "technique")].copy()
+    out = aug.buffer_node_insertion(
+        sg, seed_labels=np.array([0, 0, 0, 0, 1]),
+        minority_classes=np.array([1]), pressure_threshold=3,
+    )
+    np.testing.assert_allclose(
+        out.edge_attr[("flow", "matches_technique", "technique")], pre_attr,
+    )
+
+
+def test_buffer_op_handles_missing_technique_edge_type():
+    from graphslm_ids.offline.training.hgaa_augmentation import GraphAugmentor
+    aug = GraphAugmentor(eta=0.1, rng=np.random.default_rng(0))
+    sg = SimpleNamespace(
+        node_features={"flow": np.zeros((2, 4)), "technique": np.zeros((2, 4))},
+        edge_index={},
+        edge_attr={},
+    )
+    out = aug.buffer_node_insertion(
+        sg, seed_labels=np.array([0, 1]),
+        minority_classes=np.array([1]), pressure_threshold=2,
+    )
+    assert out.extra["n_buffers_created"] == 0
+    assert out.extra["reason"] == "no_technique_edges"
+
+
+def test_pipeline_applies_buffer_before_random_op():
+    """When buffer_enabled and minority is in batch, buffer is applied even when p_aug=0."""
+    from graphslm_ids.offline.training.hgaa_augmentation import (
+        GraphAugmentor, BiasAwareSelector, AdaptiveOpSelector, HGAAPipeline,
+    )
+    aug = GraphAugmentor(eta=0.1, rng=np.random.default_rng(0))
+    base_sel = AdaptiveOpSelector(
+        num_classes=2,
+        op_names=["edge_addition", "node_feature_swap", "edge_direction_swap", "edge_perturbation"],
+    )
+    selector = BiasAwareSelector(
+        base_selector=base_sel, bias_classes=[1], preferred_op="node_feature_swap",
+    )
+    pipe = HGAAPipeline(
+        augmentor=aug, selector=selector,
+        p_aug=0.0,  # disable random op
+        seed=0,
+        buffer_enabled=True,
+        buffer_minority_classes=np.array([1]),
+        buffer_pressure_threshold=3,
+        buffer_max_per_batch=100,
+    )
+    sg = _make_buffer_sg(n_majority=5, n_minority=1, shared_tech_idx=0)
+    sg.seed_labels = np.array([0, 0, 0, 0, 0, 1])
+
+    out = pipe.maybe_augment(sg)
+    assert out.node_features["technique"].shape[0] == sg.node_features["technique"].shape[0] + 1
+    assert pipe._stats["buffer_created_total"] == 1

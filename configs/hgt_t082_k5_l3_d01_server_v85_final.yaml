@@ -1,0 +1,162 @@
+# NT114 HGT v8.5-FINAL — Focal-SAM + BufferGraph + TEW + Fixed Class Weights.
+#
+# This is the ONE-SHOT final config. It replaces the failed v7 DRW approach
+# (epoch 80: macro_f1=0.2091, val_acc=0.4106) with FIVE orthogonal fixes:
+#   1. Focal Loss (γ=3) + inverse class weights (cap 20×) from epoch 1 — no DRW.
+#   2. SAM optimizer (ρ=0.05) for sharpness-aware flat-minima convergence.
+#   3. BufferGraph (topology-level): private technique buffers for minority flows
+#      that block majority→minority signal dilution at message-passing time.
+#   4. TEW (Temporal Edge Weights): wire next_packet Δt as 1/(Δt+ε) edge weight
+#      so HGT attention gets a temporal-locality bias (burst vs slow-scan).
+#   5. Logit adjustment τ=0.5 at inference to debias BENIGN-dominant argmax.
+#
+# Compute knobs to keep one-shot wall-clock ~38h (SAM doubles per-step cost):
+#   - batch 768 (was 512), epochs 80 (was 100), patience 20 (was 30)
+#   - fanout flow→packet 6 (was 8), packet→next_packet 3 (was 4)
+#
+# Target macro_f1 at convergence: 0.60-0.78
+# Estimated runtime: ~38h on L40S
+#
+# Abort criteria (kill the run if breached):
+#   - Epoch 10: macro_f1 < 0.25 → frozen model, abort
+#   - skipped_steps > 50 in first 10 epochs → SAM unstable, abort
+#   - buffer_created_total == 0 after epoch 5 → BufferGraph not firing, abort
+
+experiment:
+  source_name: "NT114 IDS-HGT v8.5-FINAL — Focal-SAM + BufferGraph + TEW + fixed weights"
+  rationale: >
+    One-shot final run. v7 failure root cause: class_weight_cap=3.0 and
+    drw_start_pct=0.7 neutralized all minority weighting for 70 epochs, then
+    abrupt weight activation caused gradient collapse. v8.5 fixes: (1) weights
+    active from epoch 1 with cap=20, (2) SAM optimizer for flat-minima
+    convergence on long-tail loss landscape, (3) BufferGraph operator inserts
+    private technique buffers for minority flows, blocking the
+    majority→minority signal-dilution path at HGT message-passing time,
+    (4) TEW reuses the already-present next_packet delta_time as a temporal
+    attention bias (no graph rebuild, no model change), (5) logit adjustment
+    debiases inference-time BENIGN dominance. RTE was investigated and dropped:
+    the graph artifact has no absolute timestamps, only next_packet Δt, which
+    TEW exploits directly at near-zero integration risk.
+
+data:
+  source: graph_store
+  graph_npz: /home/ubuntu/dataset/graph3/graph_artifact_3tier_14gb.npz
+  graph_meta_json: /home/ubuntu/dataset/graph3/graph_artifact_3tier_14gb.meta.json
+  graph_store_root: /home/ubuntu/dataset/graph_store_v1
+  read_sealed_only: true
+  packet_feature: semantic
+  add_reverse_edges: true
+  standardize_flow_features: true
+  use_semantic_edge_weights: true
+  # v8.5 TEW — temporal edge weights on next_packet (Δt already in link_edge_attr)
+  use_temporal_edge_weights: true
+  tew_epsilon: 1.0e-3
+  laplacian_pe_path: null  # deferred (degenerate Laplacian for 1:1 packet-flow)
+
+model:
+  hidden_dim: 384
+  num_layers: 4
+  num_heads: 12
+  dropout: 0.20
+  ffn_multiplier: 4
+
+train:
+  output_dir: /home/ubuntu/outputs/train_v85_final
+  epochs: 80                    # 100 → 80 (v7 collapsed at 80; proper convergence needs less)
+  max_train_flows: 0
+  patience: 20                  # 30 → 20 (earlier early-stop)
+  batch_mode: neighbor_sampling
+  batch_seed_flows: 768         # 512 → 768 (≈ +30% throughput on L40S 48GB)
+  grad_accum_steps: 1           # SAM requires accum=1
+
+  # Optimizer — SAM wraps AdamW
+  lr: 0.0005                    # lower: SAM effective update is ~2× stronger than plain AdamW
+  weight_decay: 0.0003
+  grad_clip_norm: 1.0
+  adamw_eps: 1.0e-6
+  adamw_betas: [0.9, 0.95]
+  sam_enabled: true
+  sam_rho: 0.05                 # Foret et al. paper default
+
+  # Scheduler
+  scheduler: onecycle
+  scheduler_pct_start: 0.10     # longer warmup (v7 used 0.05)
+  scheduler_eta_min: 1.0e-5
+
+  # Loss — Focal with inverse class weights, active from epoch 1
+  loss_type: focal              # plain focal; CB weights come from class_weight below
+  focal_gamma: 3.0              # harder minority focus (v7 used 2.0)
+  label_smoothing: 0.0          # smoothing fights focal's gradient focusing — disable
+  ldam_max_m: 0.5
+  ldam_scale: 30.0
+
+  # Class weights — no cap collapse, no deferral
+  class_weight: balanced
+  class_weight_method: inverse  # inverse-frequency; more aggressive than CB for 1000:1 ratios
+  class_weight_cap: 20.0        # v7 used 3.0 — that cap nullified all minority weighting
+  cb_beta: 0.9999
+  drw_start_pct: 0.0            # NO deferred reweighting; weights active from epoch 1
+
+  # Inference-time debiasing (Menon et al. ICLR 2021)
+  logit_adjustment: 0.5         # subtract τ·log(prior) from logits at eval/test
+
+  val_ratio: 0.1
+  test_ratio: 0.1
+  stratified_batch_sampling: false
+  drop_edge_prob: 0.05
+  ema_enabled: true
+  ema_decay: 0.999
+  seed: 42
+  device: cuda
+  monitor: val_macro_f1
+  log_every: 1
+  amp: true
+  amp_dtype: auto
+  activation_checkpointing: false
+  compile: true
+  multi_gpu: false              # SAM unsupported with DDP
+  skip_val_first_epoch: true
+
+  hgaa:
+    enabled: true
+    ops: [edge_addition, node_feature_swap, edge_direction_swap, edge_perturbation]
+    eta_per_op: 0.1
+    aug_ratio_in_batch: 0.5
+    smoothing: 1.0
+    bias_selection_method: top_k
+    bias_top_k_rarest: 3
+    bias_min_class_freq: 0.01
+    bias_factor_T: 0.5
+    bias_preferred_op: node_feature_swap
+    # BufferGraph (topology-level signal-dilution fix, Less is More 2025)
+    # Applied DETERMINISTICALLY for batches containing detected minority classes,
+    # BEFORE the stochastic op selection above.
+    buffer_enabled: true
+    buffer_pressure_threshold: 3   # minimum 'sharing count' for a tech to be 'diluted'
+    buffer_max_per_batch: 100      # cap to bound memory (≈ <50KB extra technique features)
+
+sampler:
+  hops: 4
+  fanouts:
+    flow__contains__packet: 6        # 8 → 6 (compute knob, -25% packet expansion)
+    packet__next_packet__packet: 3   # 4 → 3 (compute knob; TEW still has temporal edges)
+    packet__matches_technique__technique: 5
+    flow__matches_technique__technique: 5
+    technique__belongs_to_tactic__tactic: 1
+  reverse_fanouts:
+    rev_contains: 3
+    rev_next_packet: 2
+    rev_matches_technique: 2
+    rev_belongs_to_tactic: 0
+  always_include_all_tactics: true
+  always_include_all_techniques: true
+
+dataloader:
+  num_workers: 8
+  prefetch_factor: 16
+  pin_memory: true
+  persistent_workers: true
+
+wandb:
+  project: nt114-hgt-paper-variants
+  run_name: train_v85_final

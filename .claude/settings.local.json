@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "PowerShell($file = \"D:\\\\Tai_lieu_nam_ba\\\\Hoc_ky_2\\\\Do_an_chuyen_nganh\\\\Do-an-chuyen-nganh_NT114\\\\outputs\\\\Train_kaggle\\\\log\\\\mahgt_dfd_funnel_l3_h128_h4_gpu0_retry0.md\"; $lines = Get-Content $file; Write-Output \"Total lines: $\\($lines.Count\\)\"; $lines | Select-Object -First 5; Write-Output \"---LAST---\"; $lines | Select-Object -Last 30)",
-      "Bash(python -c ' *)"
+      "Bash(python -c ' *)",
+      "Bash(python -m pytest tests/offline/training/test_hgaa_filter_network.py -v)"
     ]
   }
 }

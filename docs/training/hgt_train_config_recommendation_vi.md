@@ -136,8 +136,6 @@ HGAA được activate trong v7-final configs (`train.hgaa.enabled: true`):
 - KHÔNG có log `[hpe] Loaded Laplacian PE` (Phase 3 đã defer).
 - Không có NaN.
 
-Reference: `docs/superpowers/specs/2026-05-21-hgaa-multiclass-hgt-v7-design.md` §3.2.
-
 ## v7 Phase 1 — Speed-up Configs (2026-05)
 
 Phase 1 speed-ups (torch.compile, batch 512, workers 16, prefetch 16) được activate trong v7-final configs. KHÔNG thay model logic. Mục tiêu: giảm wall time 25-40h → 18-25h trên L40S.
@@ -157,8 +155,6 @@ Acceptance criteria (smoke pass trước khi full run):
 - Wall time per epoch giảm ≥ 25%.
 - Peak VRAM ≤ 42GB.
 - Không có NaN losses.
-
-Reference: `docs/superpowers/specs/2026-05-21-hgaa-multiclass-hgt-v7-design.md` §3.1.
 
 ## Lưu Ý Về Phạm Vi
 
