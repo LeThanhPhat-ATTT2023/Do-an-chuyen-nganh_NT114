@@ -127,3 +127,38 @@ def test_rho_zero_is_plain_optimizer():
     opt_base.step(); opt_base.zero_grad()
 
     torch.testing.assert_close(model_sam.weight.data, model_base.weight.data, atol=1e-5, rtol=1e-5)
+
+
+def test_defaults_expose_base_optimizer_keys():
+    """SAM.defaults must include the base optimizer's keys (betas for AdamW).
+
+    OneCycleLR(cycle_momentum=True) inspects optimizer.defaults for 'betas' or
+    'momentum'; without merging base defaults it raises ValueError at __init__.
+    """
+    _, opt = _make_model_and_sam(base=torch.optim.AdamW, lr=0.001)
+    assert "betas" in opt.defaults, "SAM.defaults missing 'betas' from AdamW base"
+    assert "rho" in opt.defaults, "SAM.defaults lost its own 'rho'"
+
+
+def test_onecycle_lr_constructs_over_sam_with_cycle_momentum():
+    """OneCycleLR with default cycle_momentum=True must construct over SAM(AdamW).
+
+    Regression for the smoke-test crash:
+      ValueError: optimizer must support momentum or beta1 with
+      `cycle_momentum` option enabled
+    """
+    model = torch.nn.Linear(8, 3, bias=False)
+    from graphslm_ids.offline.training.sam_optimizer import SAM
+    opt = SAM(model.parameters(), torch.optim.AdamW, rho=0.05, lr=0.001)
+    # Must NOT raise — cycle_momentum defaults to True.
+    sched = torch.optim.lr_scheduler.OneCycleLR(
+        opt, max_lr=0.001, steps_per_epoch=4, epochs=2,
+    )
+    # One full SAM cycle + scheduler step keeps lr finite and positive.
+    x, y = torch.randn(8, 8), torch.randint(0, 3, (8,))
+    F.cross_entropy(model(x), y).backward()
+    opt.first_step(zero_grad=True)
+    F.cross_entropy(model(x), y).backward()
+    opt.second_step(zero_grad=True)
+    sched.step()
+    assert opt.param_groups[0]["lr"] > 0.0
