@@ -1332,14 +1332,40 @@ def train_neighbor_sampling(
     num_classes = int(labels_np.max()) + 1
     train_idx_np, val_idx_np, test_idx_np = backend_splits(backend, labels_np, config, seed)
 
-    max_train_flows = int(config["train"].get("max_train_flows", 0))
-    if max_train_flows > 0 and int(train_idx_np.shape[0]) > max_train_flows:
+    # Balanced overfit subset (diagnostic): keep min(N, available) flows PER CLASS.
+    # Used to answer "are the features even separable?" — with regularization off
+    # and many epochs, a healthy representation overfits this tiny balanced set to
+    # ~100% train_acc. A low plateau means the bottleneck is representation, not
+    # imbalance/recipe. Takes precedence over max_train_flows when > 0.
+    balanced_subset = int(config["train"].get("balanced_subset_per_class", 0))
+    if balanced_subset > 0:
         rng_sub = np.random.default_rng(seed + rank)
-        perm = rng_sub.permutation(train_idx_np.shape[0])
+        train_labels_full = labels_np[train_idx_np]
+        keep: list[np.ndarray] = []
+        for c in range(num_classes):
+            cls_pos = np.where(train_labels_full == c)[0]
+            if cls_pos.size == 0:
+                continue
+            rng_sub.shuffle(cls_pos)
+            keep.append(train_idx_np[cls_pos[:balanced_subset]])
         full_n = int(train_idx_np.shape[0])
-        train_idx_np = train_idx_np[perm[:max_train_flows]]
+        train_idx_np = np.concatenate(keep) if keep else train_idx_np
         if rank == 0:
-            print(f"[subsample] Train: {max_train_flows:,} / {full_n:,} flows.", flush=True)
+            _kept_counts = np.bincount(labels_np[train_idx_np], minlength=num_classes)
+            print(
+                f"[balanced_subset] Train: {train_idx_np.shape[0]:,} / {full_n:,} flows "
+                f"(<= {balanced_subset}/class). per-class={_kept_counts.tolist()}",
+                flush=True,
+            )
+    else:
+        max_train_flows = int(config["train"].get("max_train_flows", 0))
+        if max_train_flows > 0 and int(train_idx_np.shape[0]) > max_train_flows:
+            rng_sub = np.random.default_rng(seed + rank)
+            perm = rng_sub.permutation(train_idx_np.shape[0])
+            full_n = int(train_idx_np.shape[0])
+            train_idx_np = train_idx_np[perm[:max_train_flows]]
+            if rank == 0:
+                print(f"[subsample] Train: {max_train_flows:,} / {full_n:,} flows.", flush=True)
 
     flow_feature_stats: dict[str, list[float]] | None = None
     if bool(config["data"]["standardize_flow_features"]):
@@ -1617,6 +1643,13 @@ def train_neighbor_sampling(
     del hgaa_train_labels_for_detect  # free memory; not needed beyond detect
 
     skip_val_first_epoch = bool(config["train"].get("skip_val_first_epoch", False))
+    # Run full-split validation only every K epochs (always on the final epoch).
+    # Cuts wasted eval on long runs and on tiny-train diagnostics where the full
+    # val set dwarfs the training set. Best-checkpoint/patience logic is gated on
+    # do_val, so skipped epochs never falsely advance early-stopping.
+    eval_every = max(1, int(config["train"].get("eval_every", 1)))
+    if rank == 0 and eval_every > 1:
+        print(f"[eval_every] validating every {eval_every} epochs (+ final epoch)", flush=True)
 
     # QUALITY v4: EMA setup. Shadow weights tracked on raw_model (unwrapped, no
     # DDP/compile). update() called after each successful optimizer step. eval
@@ -1996,7 +2029,11 @@ def train_neighbor_sampling(
         # so checkpoint save (if best) snapshots EMA weights from raw_model.state_dict().
         # During OneCycle warmup epoch 1, lr is near-zero → val is near-random → optionally
         # skip to save ~30 min on long runs.
-        do_val = not (epoch == 1 and skip_val_first_epoch)
+        _total_epochs = int(config["train"]["epochs"])
+        do_val = (
+            not (epoch == 1 and skip_val_first_epoch)
+            and (epoch % eval_every == 0 or epoch == _total_epochs)
+        )
         if do_val and ema is not None:
             ema.apply_shadow(raw_model)
         if do_val:
@@ -2028,7 +2065,9 @@ def train_neighbor_sampling(
                 "count": 0,
             }
             if rank == 0:
-                print(f"Epoch {epoch:03d} | val SKIPPED (skip_val_first_epoch=true, warmup)", flush=True)
+                _why = "warmup" if (epoch == 1 and skip_val_first_epoch) else f"eval_every={eval_every}"
+                print(f"Epoch {epoch:03d} | loss={float(train_metrics['loss']) if train_metrics['loss'] is not None else float('nan'):.4f} "
+                      f"train_acc={train_metrics.get('accuracy', float('nan')):.4f} val SKIPPED ({_why})", flush=True)
         avg_nodes = {
             nt: sampled_node_sum[nt] / sampled_node_cnt[nt]
             for nt in sampled_node_sum
