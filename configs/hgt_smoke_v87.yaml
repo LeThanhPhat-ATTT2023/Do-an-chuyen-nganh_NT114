@@ -110,6 +110,11 @@ train:
 
   # ★ NEW: post-hoc logit adjustment (Menon ICLR 2021)
   logit_adjustment: 1.0        # subtract τ·log(prior) at eval to debias
+  # ★ NEW: tau-normalized inference (Kang et al. ICLR 2020). Reported as a 3rd
+  # eval view (TauNorm) alongside raw + LA. Shrinks majority classifier weight
+  # norms post-hoc → rebalance toward rare classes WITHOUT retraining. Diagnostic
+  # for whether the backbone already encodes rare-class signal.
+  tau_norm: 1.0
 
   val_ratio: 0.1
   test_ratio: 0.1
