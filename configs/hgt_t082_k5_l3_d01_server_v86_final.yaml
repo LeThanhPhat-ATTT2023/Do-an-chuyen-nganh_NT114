@@ -1,0 +1,161 @@
+# NT114 HGT v8.6 — Balanced (cb-focal) + SAM + BufferGraph + TEW, fully auto-adaptive.
+#
+# WHY v8.6 (what the v8.5 run taught us):
+#   v8.5 used AGGRESSIVE imbalance handling (inverse weights, cap=20, focal γ=3,
+#   no smoothing). The 34-epoch run proved this destroys majority classes:
+#     - train acc 0.155  << majority-class baseline 0.465 (always-predict-VulnScan)
+#     - per-class: majority high-precision/LOW-recall, rare low-precision/HIGH-recall
+#       = textbook over-reweighting (model abandons majority, can't learn rare either)
+#   Empirically GENTLE beats AGGRESSIVE:
+#     - v7  (cb, cap=3):    acc 0.41 / macro_f1 0.21
+#     - v8.5 (inv, cap=20): acc 0.17 / macro_f1 0.12   ← worse on BOTH
+#
+# v8.6 therefore returns to a GENTLE, class-balanced loss (cb-focal, moderate cap=5)
+# and KEEPS the sound architectural additions (SAM, BufferGraph, TEW) to lift the
+# minority classes without crushing the majority.
+#
+# OPTIMIZES BOTH metrics: monitor = val_balanced = 0.5·(accuracy + macro_f1), so the
+# saved checkpoint is the one strongest at majority AND minority jointly.
+#
+# FULLY AUTO-ADAPTIVE (verified): num_classes, class weights (cb), LDAM margins,
+# logit prior, and BufferGraph/HGAA minority detection are ALL recomputed from the
+# current split's label counts at runtime. Swapping or growing the dataset needs NO
+# config edits. use_manifest_class_weights:false guarantees weights are never reused
+# from a stale manifest. The only fixed numbers (cap, γ, β, lr, ρ, ε) are
+# dataset-agnostic ratios/scales, correct to hold constant.
+#
+# HONEST EXPECTATION on THIS small trial data: rare classes have only 260–660 samples,
+# which caps macro_f1 regardless of tuning. The 0.8 target is a SCALED-DATA goal; this
+# run validates the pipeline. Success here = acc clearly above the majority baseline
+# AND macro_f1 > v7's 0.21, with both rising together. Macro_f1 climbs as data grows.
+
+experiment:
+  source_name: "NT114 IDS-HGT v8.6 — balanced cb-focal + SAM + BufferGraph + TEW (auto-adaptive)"
+  rationale: >
+    v8.5 over-reweighted (inverse cap=20, γ=3) and destroyed majority classes
+    (train acc 0.155 < majority baseline 0.465). Empirically gentle beats
+    aggressive (v7 cap=3 acc 0.41/f1 0.21 > v8.5 acc 0.17/f1 0.12). v8.6 returns
+    to a gentle class-balanced focal loss (cb, cap=5, γ=2, smoothing=0.1) and
+    keeps SAM + BufferGraph + TEW to lift minority without crushing majority.
+    monitor=val_balanced optimizes accuracy and macro_f1 jointly. All
+    data-dependent parameters auto-recompute at runtime so the pipeline adapts
+    when the dataset is grown or swapped.
+
+data:
+  source: graph_store
+  graph_npz: /home/ubuntu/dataset/graph3/graph_artifact_3tier_14gb.npz
+  graph_meta_json: /home/ubuntu/dataset/graph3/graph_artifact_3tier_14gb.meta.json
+  graph_store_root: /home/ubuntu/dataset/graph_store_v1
+  read_sealed_only: true
+  packet_feature: semantic
+  add_reverse_edges: true
+  standardize_flow_features: true
+  use_semantic_edge_weights: true
+  use_temporal_edge_weights: true     # TEW — next_packet Δt as temporal-locality bias
+  tew_epsilon: 1.0e-3
+  laplacian_pe_path: null
+
+model:
+  hidden_dim: 384
+  num_layers: 4
+  num_heads: 12
+  dropout: 0.20
+  ffn_multiplier: 4
+
+train:
+  output_dir: /home/ubuntu/outputs/train_v86_final
+  epochs: 100
+  max_train_flows: 0
+  patience: 20
+  batch_mode: neighbor_sampling
+  batch_seed_flows: 768
+  grad_accum_steps: 1           # SAM requires accum=1
+
+  # Optimizer — SAM wraps AdamW
+  lr: 0.001                     # v6/v7 proven peak; v8.5's 0.0005 was undertrained
+  weight_decay: 0.0003
+  grad_clip_norm: 1.0
+  adamw_eps: 1.0e-6
+  adamw_betas: [0.9, 0.95]
+  sam_enabled: true
+  sam_rho: 0.05
+
+  # Scheduler
+  scheduler: onecycle
+  scheduler_pct_start: 0.10
+  scheduler_eta_min: 1.0e-5
+
+  # Loss — GENTLE class-balanced focal (the v8.5 lesson: aggressive weighting fails)
+  loss_type: cb_focal           # CB weights × focal, the v6/v7 proven family
+  focal_gamma: 2.0              # standard (v8.5's γ=3 over-focused)
+  label_smoothing: 0.1          # regularization restored (v8.5 removed it)
+  ldam_max_m: 0.5
+  ldam_scale: 30.0
+
+  # Class weights — class-balanced, MODERATE cap (auto-recomputed from counts)
+  class_weight: balanced
+  class_weight_method: cb       # effective-number weighting; bounded, stable
+  class_weight_cap: 5.0         # moderate: v7=3 (too gentle for macro_f1), v8.5=20 (destroyed acc)
+  cb_beta: 0.9999
+  drw_start_pct: 0.0            # weights active from epoch 1 (no deferral)
+  use_manifest_class_weights: false  # AUTO-ADAPT: always recompute from current split
+
+  logit_adjustment: 0.0         # off — corrupts val monitoring on undertrained model
+
+  val_ratio: 0.1
+  test_ratio: 0.1
+  stratified_batch_sampling: false
+  drop_edge_prob: 0.05
+  ema_enabled: true
+  ema_decay: 0.999
+  seed: 42
+  device: cuda
+  monitor: val_balanced         # optimize accuracy AND macro_f1 jointly
+  log_every: 1
+  amp: true
+  amp_dtype: auto
+  activation_checkpointing: false
+  compile: true
+  multi_gpu: false              # SAM unsupported with DDP
+  skip_val_first_epoch: true
+
+  hgaa:
+    enabled: true
+    ops: [edge_addition, node_feature_swap, edge_direction_swap, edge_perturbation]
+    eta_per_op: 0.1
+    aug_ratio_in_batch: 0.5
+    smoothing: 1.0
+    bias_selection_method: top_k
+    bias_top_k_rarest: 3
+    bias_min_class_freq: 0.01
+    bias_factor_T: 0.5
+    bias_preferred_op: node_feature_swap
+    buffer_enabled: true
+    buffer_pressure_threshold: 3
+    buffer_max_per_batch: 100
+
+sampler:
+  hops: 4
+  fanouts:
+    flow__contains__packet: 6
+    packet__next_packet__packet: 3
+    packet__matches_technique__technique: 5
+    flow__matches_technique__technique: 5
+    technique__belongs_to_tactic__tactic: 1
+  reverse_fanouts:
+    rev_contains: 3
+    rev_next_packet: 2
+    rev_matches_technique: 2
+    rev_belongs_to_tactic: 0
+  always_include_all_tactics: true
+  always_include_all_techniques: true
+
+dataloader:
+  num_workers: 8
+  prefetch_factor: 16
+  pin_memory: true
+  persistent_workers: true
+
+wandb:
+  project: nt114-hgt-paper-variants
+  run_name: train_v86_final
