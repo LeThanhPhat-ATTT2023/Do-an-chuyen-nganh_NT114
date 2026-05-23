@@ -1138,12 +1138,23 @@ def evaluate_neighbor_sampling(
       1. DDP (``is_ddp=True``): each rank evaluates its DistributedSampler shard,
          accumulates per-class counts on-device, ``all_reduce`` at the end.
       2. Single-device: straight loop.
+
+    Metrics are ALWAYS computed on RAW logits (the true learning signal). When
+    ``logit_adjustment`` is given, the post-hoc Menon-adjusted metrics are ALSO
+    computed and attached under ``metrics["logit_adjusted"]``. We deliberately
+    do NOT make the adjusted metrics primary: on an undertrained model the raw
+    logits are near-flat, so subtracting τ·log(prior) forces argmax onto the
+    rarest class for every sample (val_acc collapses to the rarest-class
+    frequency). LA is only meaningful once raw logits actually discriminate,
+    so it belongs as a post-hoc view, not the monitored/primary number.
     """
     model.eval()
     counts_acc = torch.zeros((num_classes, 4), dtype=torch.int64, device=device)
+    counts_acc_adj = torch.zeros((num_classes, 4), dtype=torch.int64, device=device)
     loss_sum_t = torch.zeros(1, dtype=torch.float64, device=device)
     examples_t = torch.zeros(1, dtype=torch.int64, device=device)
     preds: list[np.ndarray] = []
+    preds_adj: list[np.ndarray] = []
     labels: list[np.ndarray] = []
     loss_sum = 0.0
     total_batches = len(loader)
@@ -1165,11 +1176,11 @@ def evaluate_neighbor_sampling(
                     loss = F.cross_entropy(seed_logits.float(), seed_labels, reduction="sum")
                 loss_sum_t += loss.detach().to(torch.float64)
                 examples_t += seed_labels.numel()
-                _logits_for_pred = seed_logits.detach().float()
+                _logits_raw = seed_logits.detach().float()
+                counts_acc += _per_class_counts_tensor(_logits_raw.argmax(dim=1), seed_labels, num_classes)
                 if logit_adjustment is not None:
-                    _logits_for_pred = _logits_for_pred - logit_adjustment.to(_logits_for_pred.device)
-                pred = _logits_for_pred.argmax(dim=1)
-                counts_acc += _per_class_counts_tensor(pred, seed_labels, num_classes)
+                    _logits_adj = _logits_raw - logit_adjustment.to(_logits_raw.device)
+                    counts_acc_adj += _per_class_counts_tensor(_logits_adj.argmax(dim=1), seed_labels, num_classes)
                 if progress_every and (i - last_logged >= progress_every or i == total_batches):
                     if not dist.is_initialized() or dist.get_rank() == 0:
                         pct = 100.0 * i / total_batches
@@ -1184,12 +1195,21 @@ def evaluate_neighbor_sampling(
             dist.all_reduce(counts_acc, op=dist.ReduceOp.SUM)
             dist.all_reduce(loss_sum_t, op=dist.ReduceOp.SUM)
             dist.all_reduce(examples_t, op=dist.ReduceOp.SUM)
-            return _metrics_from_counts(
+            metrics = _metrics_from_counts(
                 counts_acc.cpu().numpy(),
                 label_names,
                 float(loss_sum_t.item()),
                 int(examples_t.item()),
             )
+            if logit_adjustment is not None:
+                dist.all_reduce(counts_acc_adj, op=dist.ReduceOp.SUM)
+                metrics["logit_adjusted"] = _metrics_from_counts(
+                    counts_acc_adj.cpu().numpy(),
+                    label_names,
+                    float(loss_sum_t.item()),
+                    int(examples_t.item()),
+                )
+            return metrics
         else:
             for i, batch in enumerate(loader, start=1):
                 node_features, edge_index, edge_weight, seed_mask, seed_labels = to_torch_batch(
@@ -1203,10 +1223,11 @@ def evaluate_neighbor_sampling(
                     seed_logits = logits[seed_mask]
                     loss = F.cross_entropy(seed_logits.float(), seed_labels, reduction="sum")
                 loss_sum += float(loss.item())
-                _logits_for_pred = seed_logits.detach().float()
+                _logits_raw = seed_logits.detach().float()
+                preds.append(_logits_raw.argmax(dim=1).cpu().numpy())
                 if logit_adjustment is not None:
-                    _logits_for_pred = _logits_for_pred - logit_adjustment.to(_logits_for_pred.device)
-                preds.append(_logits_for_pred.argmax(dim=1).cpu().numpy())
+                    _logits_adj = _logits_raw - logit_adjustment.to(_logits_raw.device)
+                    preds_adj.append(_logits_adj.argmax(dim=1).cpu().numpy())
                 labels.append(seed_labels.detach().cpu().numpy())
                 if progress_every and (i - last_logged >= progress_every or i == total_batches):
                     pct = 100.0 * i / total_batches
@@ -1219,7 +1240,13 @@ def evaluate_neighbor_sampling(
                     last_logged = i
     pred_np = np.concatenate(preds) if preds else np.empty((0,), dtype=np.int64)
     label_np = np.concatenate(labels) if labels else np.empty((0,), dtype=np.int64)
-    return metrics_from_predictions(pred_np, label_np, num_classes, label_names, loss_sum)
+    metrics = metrics_from_predictions(pred_np, label_np, num_classes, label_names, loss_sum)
+    if logit_adjustment is not None:
+        adj_np = np.concatenate(preds_adj) if preds_adj else np.empty((0,), dtype=np.int64)
+        metrics["logit_adjusted"] = metrics_from_predictions(
+            adj_np, label_np, num_classes, label_names, loss_sum
+        )
+    return metrics
 
 
 def train_neighbor_sampling(
@@ -2037,11 +2064,18 @@ def train_neighbor_sampling(
                 flush=True,
             )
         if rank == 0 and (epoch == 1 or epoch % log_every == 0):
+            _loss = float(train_metrics['loss']) if train_metrics['loss'] is not None else float('nan')
+            _train_acc = train_metrics.get("accuracy")
+            _train_acc_str = f"train_acc={_train_acc:.4f} " if _train_acc is not None else ""
+            _la = val_metrics.get("logit_adjusted") if isinstance(val_metrics, dict) else None
+            _la_str = (
+                f" | LA: val_acc={_la['accuracy']:.4f} val_macro_f1={_la['macro_f1']:.4f}"
+                if isinstance(_la, dict) else ""
+            )
             print(
-                f"Epoch {epoch:03d} | "
-                f"loss={float(train_metrics['loss']) if train_metrics['loss'] is not None else float('nan'):.4f} "
+                f"Epoch {epoch:03d} | loss={_loss:.4f} {_train_acc_str}"
                 f"val_acc={val_metrics['accuracy']:.4f} "
-                f"val_macro_f1={val_metrics['macro_f1']:.4f} "
+                f"val_macro_f1={val_metrics['macro_f1']:.4f}{_la_str} "
                 f"avg_flow_nodes={avg_nodes.get('flow', 0.0):.1f} "
                 f"avg_packet_nodes={avg_nodes.get('packet', 0.0):.1f}"
             )
