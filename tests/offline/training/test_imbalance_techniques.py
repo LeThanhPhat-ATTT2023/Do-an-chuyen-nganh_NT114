@@ -115,6 +115,42 @@ def test_cb_focal_without_weight_is_plain_focal():
     torch.testing.assert_close(cb, focal, rtol=1e-6, atol=1e-7)
 
 
+def test_cb_focal_applies_label_smoothing():
+    """Regression for BUG #1: focal/cb_focal must honor label_smoothing.
+
+    Before the fix, the focal branch ignored label_smoothing entirely, so
+    configs that set it (v7/v8.5/v8.6) silently trained without regularization.
+    The smoothed loss must differ from the unsmoothed one and match the
+    closed-form (1-eps)·NLL_true + eps·mean(-log_probs), modulated by focal.
+    """
+    from graphslm_ids.offline.training.train_hgt_flow_classifier import (
+        _compute_train_loss,
+    )
+
+    torch.manual_seed(2)
+    logits = torch.randn(8, 3)
+    labels = torch.tensor([0, 0, 1, 1, 1, 2, 2, 2], dtype=torch.long)
+    eps = 0.1
+
+    smoothed = _compute_train_loss(
+        logits, labels, weight=None,
+        loss_type="cb_focal", focal_gamma=2.0, label_smoothing=eps,
+    )
+    plain = _compute_train_loss(
+        logits, labels, weight=None,
+        loss_type="cb_focal", focal_gamma=2.0, label_smoothing=0.0,
+    )
+    assert not torch.allclose(smoothed, plain), "label_smoothing had no effect (BUG #1)"
+
+    log_probs = F.log_softmax(logits, dim=-1)
+    log_p_t = log_probs.gather(-1, labels.unsqueeze(-1)).squeeze(-1)
+    p_t = log_p_t.exp()
+    focal_factor = (1.0 - p_t).pow(2.0)
+    base = (1.0 - eps) * (-log_p_t) + eps * (-log_probs.mean(dim=-1))
+    expected = (focal_factor * base).mean()
+    torch.testing.assert_close(smoothed, expected, rtol=1e-5, atol=1e-6)
+
+
 def test_unknown_loss_type_raises():
     """Validation rejects unknown loss types with informative message."""
     from graphslm_ids.offline.training.train_hgt_flow_classifier import (
