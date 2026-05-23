@@ -62,7 +62,6 @@ data:
   use_semantic_edge_weights: true
   use_temporal_edge_weights: true
   tew_epsilon: 1.0e-3
-  laplacian_pe_path: null
 
 model:
   hidden_dim: 384
