@@ -75,7 +75,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "class_weight": "balanced",
         "seed": 42,
         "device": "auto",
-        "multi_gpu": True,
         "monitor": "val_macro_f1",
         "log_every": 1,
         "amp": True,
@@ -90,11 +89,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "grad_clip_norm": 1.0,
         "amp_dtype": "auto",
         # Loss function configurability
-        "loss_type": "ce",           # 'ce' | 'focal' | 'ldam'
-        "label_smoothing": 0.0,      # 0.0-0.2 (CE/LDAM only). 0.1 recommended.
+        "loss_type": "ce",           # 'ce' | 'focal' | 'cb_focal'
+        "label_smoothing": 0.0,      # 0.0-0.2. 0.1 recommended.
         "focal_gamma": 2.0,          # focal loss focusing parameter
-        "ldam_max_m": 0.5,           # LDAM max margin (paper default)
-        "ldam_scale": 30.0,          # LDAM logit scale (paper default)
         # QUALITY v4: EMA model weights for smoother validation
         "ema_enabled": False,        # set true for +1-3% F1 on imbalanced data
         "ema_decay": 0.999,          # 0.999 = effective window ~1000 steps
@@ -104,7 +101,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "adamw_eps": 1.0e-6,
         "adamw_betas": (0.9, 0.95),
         # SAM (Sharpness-Aware Minimization, Foret et al. ICLR 2021).
-        # Requires grad_accum_steps=1 and multi_gpu=false.
+        # Requires grad_accum_steps=1.
         "sam_enabled": False,
         "sam_rho": 0.05,
         # Skip val eval at epoch 1 (OneCycle warmup → near-random val anyway)
@@ -286,10 +283,6 @@ def parse_args() -> argparse.Namespace:
         help="Trade extra compute for lower activation memory during HGT training.",
     )
     parser.add_argument("--seed", type=int, default=None)
-    parser.add_argument("--multi-gpu", dest="multi_gpu", action="store_true", default=None,
-                        help="Use all available CUDA GPUs (neighbor_sampling mode only).")
-    parser.add_argument("--no-multi-gpu", dest="multi_gpu", action="store_false",
-                        help="Disable multi-GPU and force single GPU/CPU.")
     parser.add_argument(
         "--compile", action="store_true",
         help="Wrap HGT in torch.compile(mode='reduce-overhead'). Requires PyTorch >= 2.0.",
@@ -358,8 +351,6 @@ def apply_cli_overrides(config: dict[str, Any], args: argparse.Namespace) -> dic
         config["train"]["activation_checkpointing"] = True
     if args.seed is not None:
         config["train"]["seed"] = args.seed
-    if args.multi_gpu is not None:
-        config["train"]["multi_gpu"] = args.multi_gpu
     if args.compile:
         config["train"]["compile"] = True
     if args.no_tf32:
@@ -486,147 +477,6 @@ def _maybe_compile(model: torch.nn.Module, enabled: bool, rank: int = 0) -> torc
         if rank == 0:
             print(f"[torch.compile] skipped — {exc}", flush=True)
         return model
-
-
-def get_training_devices(primary: torch.device, multi_gpu: bool) -> list[torch.device]:
-    """Return all available CUDA devices when multi_gpu=True, else just the primary device."""
-    if primary.type != "cuda" or not multi_gpu:
-        return [primary]
-    n = torch.cuda.device_count()
-    if n <= 1:
-        return [primary]
-    return [torch.device("cuda", i) for i in range(n)]
-
-
-def _multi_gpu_train_step(
-    model: HeteroGraphTransformer,
-    batch_group: list[MiniBatchSubgraph],
-    devices: list[torch.device],
-    edge_types: list[tuple[str, str, str]],
-    weight: torch.Tensor | None,
-    scaler: torch.amp.GradScaler,
-    use_semantic_edge_weights: bool,
-    grad_accum_steps: int,
-    loss_type: str = "ce",
-    label_smoothing: float = 0.0,
-    focal_gamma: float = 2.0,
-    drop_edge_prob: float = 0.0,
-    ldam_margins: torch.Tensor | None = None,
-    ldam_scale: float = 30.0,
-) -> tuple[float, int, list[np.ndarray], list[np.ndarray], dict[str, list[int]], dict[str, list[int]]]:
-    """Forward-backward across multiple GPUs using parallel_apply, then sync gradients to primary model."""
-    import torch.nn.parallel as P
-
-    n = min(len(batch_group), len(devices))
-    primary = devices[0]
-    device_ids = [d.index for d in devices[:n]]
-
-    replicas = P.replicate(model, device_ids, detach=False)
-
-    inputs_args: list[tuple] = []
-    inputs_kwargs: list[dict[str, Any]] = []
-    masks: list[torch.Tensor] = []
-    all_labels: list[torch.Tensor] = []
-
-    for batch, device in zip(batch_group[:n], devices[:n]):
-        nf, ei, ew, sm, sl = to_torch_batch(batch, edge_types, device, use_semantic_edge_weights)
-        if drop_edge_prob > 0.0:
-            ei, ew = _drop_edges(ei, ew, drop_edge_prob)
-        inputs_args.append((nf, ei))
-        inputs_kwargs.append({"edge_weight_dict": ew})
-        masks.append(sm)
-        all_labels.append(sl)
-
-    all_logits = P.parallel_apply(replicas, inputs_args, inputs_kwargs)
-
-    preds: list[np.ndarray] = []
-    labels_out: list[np.ndarray] = []
-    gpu_losses: list[torch.Tensor] = []
-    loss_sum_f = 0.0
-    examples = 0
-
-    for logits, sm, sl, device in zip(all_logits, masks, all_labels, devices[:n]):
-        seed_logits = logits[sm].float()
-        w = weight.to(device) if weight is not None else None
-        m = ldam_margins.to(device) if ldam_margins is not None else None
-        loss = _compute_train_loss(
-            seed_logits, sl, w,
-            loss_type=loss_type,
-            label_smoothing=label_smoothing,
-            focal_gamma=focal_gamma,
-            ldam_margins=m,
-            ldam_scale=ldam_scale,
-        )
-        if not torch.isfinite(loss):
-            continue
-        gpu_losses.append(loss)
-        preds.append(seed_logits.detach().argmax(dim=1).cpu().numpy())
-        labels_out.append(sl.detach().cpu().numpy())
-        batch_n = int(sl.numel())
-        loss_sum_f += float(loss.item()) * batch_n
-        examples += batch_n
-
-    # Gather losses to primary device, scale by 1/(n_gpus * grad_accum), backward
-    if gpu_losses:
-        avg_loss = sum(lv.to(primary) for lv in gpu_losses) / (n * grad_accum_steps)
-        scaler.scale(avg_loss).backward()
-
-    # Aggregate replica gradients to the original model's parameters.
-    # Use torch._foreach_add_ to fuse the per-parameter loops into a single
-    # multi-tensor kernel (CUDA: 1 launch instead of N), and group the inbound
-    # .to(primary) copies into one stream-overlapped pass per replica.
-    replica_params = [list(r.parameters()) for r in replicas]
-    model_params = list(model.parameters())
-    n_params = len(model_params)
-
-    foreach_available = hasattr(torch, "_foreach_add_")
-    primary_grads_per_replica: list[list[torch.Tensor | None]] = []
-    for rp_list in replica_params:
-        replica_grads: list[torch.Tensor | None] = []
-        for p_r in rp_list:
-            if p_r.grad is None:
-                replica_grads.append(None)
-            elif p_r.device == primary:
-                replica_grads.append(p_r.grad)
-            else:
-                replica_grads.append(p_r.grad.to(primary, non_blocking=True))
-        primary_grads_per_replica.append(replica_grads)
-
-    # Stage 1: ensure each model parameter has a grad tensor to accumulate into.
-    for idx in range(n_params):
-        if model_params[idx].grad is None:
-            for replica_grads in primary_grads_per_replica:
-                if replica_grads[idx] is not None:
-                    model_params[idx].grad = torch.zeros_like(replica_grads[idx])
-                    break
-
-    # Stage 2: bulk add each replica's grads into the model's grads.
-    for replica_grads in primary_grads_per_replica:
-        tgt: list[torch.Tensor] = []
-        src: list[torch.Tensor] = []
-        for idx in range(n_params):
-            g = replica_grads[idx]
-            if g is None or model_params[idx].grad is None:
-                continue
-            tgt.append(model_params[idx].grad)
-            src.append(g)
-        if not tgt:
-            continue
-        if foreach_available:
-            torch._foreach_add_(tgt, src)
-        else:  # pragma: no cover - PyTorch < 1.10 fallback
-            for t, s in zip(tgt, src):
-                t.add_(s)
-
-    node_stats: dict[str, list[int]] = {}
-    edge_stats: dict[str, list[int]] = {}
-    for batch in batch_group[:n]:
-        for nt, cnt in batch.stats.get("nodes", {}).items():
-            node_stats.setdefault(nt, []).append(int(cnt))
-        for et, cnt in batch.stats.get("edges", {}).items():
-            edge_stats.setdefault(et, []).append(int(cnt))
-
-    return loss_sum_f, examples, preds, labels_out, node_stats, edge_stats
 
 
 def stratified_split(
@@ -807,21 +657,6 @@ def class_weights_from_backend(
     return torch.from_numpy(weights)
 
 
-def _compute_ldam_margins(
-    class_counts: np.ndarray, max_m: float = 0.5
-) -> torch.Tensor:
-    """Per-class margins for LDAM loss (Cao et al. NeurIPS 2019).
-
-    Δ_y = max_m / n_y^(1/4) (normalized so max margin = max_m).
-    Minority classes get larger margins → push their decision boundaries
-    further → better generalization on long-tail.
-    """
-    counts = np.maximum(class_counts.astype(np.float64), 1.0)
-    margins = 1.0 / np.power(counts, 0.25)
-    margins = margins * (max_m / margins.max())
-    return torch.from_numpy(margins.astype(np.float32))
-
-
 def _compute_monitor_score(monitor: str, val_metrics: dict) -> float:
     """Map a monitor name → a scalar to MAXIMIZE (higher = better).
 
@@ -860,19 +695,14 @@ def _compute_train_loss(
     loss_type: str = "ce",
     label_smoothing: float = 0.0,
     focal_gamma: float = 2.0,
-    ldam_margins: torch.Tensor | None = None,
-    ldam_scale: float = 30.0,
 ) -> torch.Tensor:
-    """Unified training loss: CE | Focal | LDAM.
+    """Unified training loss: CE | Focal.
 
     - 'ce': F.cross_entropy with optional label_smoothing. Best for mild imbalance.
-    - 'focal': FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t). Down-weights easy
-      examples. Designed for severe imbalance. Paper default focal_gamma=2.0.
-    - 'ldam': Label-Distribution-Aware Margin (Cao et al. 2019). Per-class margin
-      Δ_y = max_m / n_y^(1/4) — minority classes get larger margins → better
-      generalization on long-tail. State-of-art for severe imbalance.
+    - 'focal'/'cb_focal': FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t). Down-weights
+      easy examples. Designed for severe imbalance. Paper default focal_gamma=2.0.
 
-    Eval loss must stay plain CE (no smoothing/margin) for raw loss comparability.
+    Eval loss must stay plain CE (no smoothing) for raw loss comparability.
     """
     if loss_type in ("focal", "cb_focal"):
         # Focal loss (Lin et al. ICCV 2017): FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t).
@@ -899,18 +729,6 @@ def _compute_train_loss(
             alpha_t = weight.gather(dim=0, index=labels)
             loss = alpha_t * loss
         return loss.mean()
-    if loss_type == "ldam":
-        if ldam_margins is None:
-            raise ValueError("loss_type='ldam' requires ldam_margins tensor.")
-        target_margins = ldam_margins.to(logits.device).gather(dim=0, index=labels)
-        adjustment = torch.zeros_like(logits)
-        adjustment.scatter_(1, labels.unsqueeze(1), target_margins.unsqueeze(1))
-        adjusted_logits = (logits - adjustment) * ldam_scale
-        return F.cross_entropy(
-            adjusted_logits, labels,
-            weight=weight,
-            label_smoothing=label_smoothing,
-        )
     return F.cross_entropy(
         logits, labels,
         weight=weight,
@@ -1028,26 +846,11 @@ def _to_device(value: Any, device: torch.device, non_blocking: bool, dtype: Any 
     return t.to(device, non_blocking=non_blocking)
 
 
-# Phase 3 — HPE-HGT module-level slot for the Laplacian Positional Encoding
-# tensor. Populated once at the start of training (see
-# ``train_neighbor_sampling``) and read by ``to_torch_batch`` on every batch.
-# Module-level singleton keeps the wiring surgical — no need to thread an
-# extra kwarg through ``_multi_gpu_train_step``, ``_multi_gpu_eval_step``,
-# and ``evaluate_neighbor_sampling``.
-_HPE_FLOW_PE: torch.Tensor | None = None
-# v8.5 TEW — module state (mirrors the _HPE_FLOW_PE pattern so we don't have to
-# thread two extra kwargs through 6 call sites of to_torch_batch).
+# v8.5 TEW — module-level state read by ``to_torch_batch`` on every batch. A
+# module singleton keeps the wiring surgical — no need to thread two extra
+# kwargs through every call site of to_torch_batch.
 _TEW_ENABLED: bool = False
 _TEW_EPSILON: float = 1.0e-3
-
-
-def _set_hpe_flow_pe(pe: torch.Tensor | None) -> None:
-    """Install the Laplacian PE tensor used by :func:`to_torch_batch`.
-
-    Pass ``None`` to disable PE concatenation (no-op path).
-    """
-    global _HPE_FLOW_PE
-    _HPE_FLOW_PE = pe
 
 
 def _set_tew_state(enabled: bool, epsilon: float = 1.0e-3) -> None:
@@ -1113,26 +916,6 @@ def to_torch_batch(
 
     seed_mask = _to_device(batch.seed_mask, device, non_blocking, dtype=bool)
     seed_labels = _to_device(batch.seed_labels, device, non_blocking, dtype=np.int64)
-
-    # Phase 3 — HPE-HGT: concatenate Laplacian PE rows onto flow features when
-    # the full-graph PE tensor has been installed via ``_set_hpe_flow_pe``.
-    # ``local_to_global["flow"]`` gives the global flow IDs for the local
-    # subgraph's flow nodes (built by the neighbor sampler), so we gather
-    # PE rows once per batch on-device. No-op when ``_HPE_FLOW_PE`` is None.
-    if _HPE_FLOW_PE is not None:
-        flow_global = batch.local_to_global.get("flow") if batch.local_to_global else None
-        if flow_global is not None and len(flow_global) > 0:
-            # Build the index tensor on CPU then transfer non-blocking so the H2D
-            # copy can overlap with GPU compute on the next step, matching the
-            # pin_memory/non_blocking pattern used for the rest of the batch.
-            idx_cpu = torch.from_numpy(np.ascontiguousarray(flow_global, dtype=np.int64))
-            if non_blocking and _HPE_FLOW_PE.device.type == "cuda" and not idx_cpu.is_pinned():
-                idx_cpu = idx_cpu.pin_memory()
-            idx = idx_cpu.to(_HPE_FLOW_PE.device, non_blocking=non_blocking)
-            pe_rows = _HPE_FLOW_PE.index_select(0, idx).to(node_tensors["flow"].device)
-            # Match dtype of the flow features (BF16 under AMP, FP32 otherwise).
-            pe_rows = pe_rows.to(dtype=node_tensors["flow"].dtype)
-            node_tensors["flow"] = torch.cat([node_tensors["flow"], pe_rows], dim=1)
 
     return node_tensors, edge_tensors, edge_weights or None, seed_mask, seed_labels
 
@@ -1335,49 +1118,6 @@ def make_neighbor_loader(
     return DataLoader(dataset, **loader_kwargs), dist_sampler
 
 
-def _multi_gpu_eval_step(
-    model: HeteroGraphTransformer,
-    batch_group: list[MiniBatchSubgraph],
-    devices: list[torch.device],
-    edge_types: list[tuple[str, str, str]],
-    use_semantic_edge_weights: bool,
-    use_amp: bool,
-    amp_dtype: torch.dtype = torch.float16,
-) -> tuple[float, list[np.ndarray], list[np.ndarray]]:
-    """Forward replicas across GPUs in parallel; no backward, no grad."""
-    import torch.nn.parallel as P
-
-    n = min(len(batch_group), len(devices))
-    device_ids = [d.index for d in devices[:n]]
-    replicas = P.replicate(model, device_ids, detach=True)
-
-    inputs_args: list[tuple] = []
-    inputs_kwargs: list[dict[str, Any]] = []
-    masks: list[torch.Tensor] = []
-    all_labels: list[torch.Tensor] = []
-
-    for batch, device in zip(batch_group[:n], devices[:n]):
-        nf, ei, ew, sm, sl = to_torch_batch(batch, edge_types, device, use_semantic_edge_weights)
-        inputs_args.append((nf, ei))
-        inputs_kwargs.append({"edge_weight_dict": ew})
-        masks.append(sm)
-        all_labels.append(sl)
-
-    with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
-        all_logits = P.parallel_apply(replicas, inputs_args, inputs_kwargs)
-
-    loss_sum_f = 0.0
-    preds: list[np.ndarray] = []
-    labels_out: list[np.ndarray] = []
-    for logits, sm, sl in zip(all_logits, masks, all_labels):
-        seed_logits = logits[sm].float()
-        loss = F.cross_entropy(seed_logits, sl, reduction="sum")
-        loss_sum_f += float(loss.item())
-        preds.append(seed_logits.argmax(dim=1).cpu().numpy())
-        labels_out.append(sl.detach().cpu().numpy())
-    return loss_sum_f, preds, labels_out
-
-
 def evaluate_neighbor_sampling(
     *,
     model: HeteroGraphTransformer,
@@ -1391,16 +1131,13 @@ def evaluate_neighbor_sampling(
     label_names: dict[int, str],
     epoch: int = 0,
     split_name: str = "eval",
-    devices: list[torch.device] | None = None,
     is_ddp: bool = False,
     logit_adjustment: torch.Tensor | None = None,
 ) -> dict[str, Any]:
-    """Three paths:
+    """Two paths:
       1. DDP (``is_ddp=True``): each rank evaluates its DistributedSampler shard,
          accumulates per-class counts on-device, ``all_reduce`` at the end.
-      2. Legacy multi-GPU (``devices`` given, no DDP): replicate the model and
-         parallel_apply batches across GPUs — kept for Kaggle notebooks.
-      3. Single-device: straight loop.
+      2. Single-device: straight loop.
     """
     model.eval()
     counts_acc = torch.zeros((num_classes, 4), dtype=torch.int64, device=device)
@@ -1413,9 +1150,6 @@ def evaluate_neighbor_sampling(
     progress_every = max(1, total_batches // 10) if total_batches else 0
     start = time.time()
     last_logged = 0
-    n_gpus = len(devices) if devices else 1
-    batches_seen = 0
-    last_logged_batches = 0
     # inference_mode is stricter than no_grad: PyTorch skips version-counter
     # bookkeeping on every output tensor, so eval throughput is ~5-10% higher
     # for graph-transformer workloads that produce many intermediate tensors.
@@ -1456,53 +1190,6 @@ def evaluate_neighbor_sampling(
                 float(loss_sum_t.item()),
                 int(examples_t.item()),
             )
-        elif n_gpus > 1 and devices is not None:
-            it = iter(loader)
-            while True:
-                batch_group: list[MiniBatchSubgraph] = []
-                for _ in range(n_gpus):
-                    try:
-                        batch_group.append(next(it))
-                    except StopIteration:
-                        break
-                if not batch_group:
-                    break
-                if len(batch_group) > 1:
-                    ls, bp, bl = _multi_gpu_eval_step(
-                        model, batch_group, devices, edge_types,
-                        use_semantic_edge_weights, use_amp, amp_dtype,
-                    )
-                    loss_sum += ls
-                    preds.extend(bp)
-                    labels.extend(bl)
-                else:
-                    batch = batch_group[0]
-                    node_features, edge_index, edge_weight, seed_mask, seed_labels = to_torch_batch(
-                        batch, edge_types, device, use_semantic_edge_weights,
-                    )
-                    with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
-                        logits = model(node_features, edge_index, edge_weight_dict=edge_weight)
-                        seed_logits = logits[seed_mask]
-                        loss = F.cross_entropy(seed_logits.float(), seed_labels, reduction="sum")
-                    loss_sum += float(loss.item())
-                    _logits_for_pred = seed_logits.detach().float()
-                    if logit_adjustment is not None:
-                        _logits_for_pred = _logits_for_pred - logit_adjustment.to(_logits_for_pred.device)
-                    preds.append(_logits_for_pred.argmax(dim=1).cpu().numpy())
-                    labels.append(seed_labels.detach().cpu().numpy())
-                batches_seen += len(batch_group)
-                if progress_every and (
-                    batches_seen - last_logged_batches >= progress_every
-                    or batches_seen >= total_batches
-                ):
-                    pct = 100.0 * batches_seen / max(total_batches, 1)
-                    elapsed = time.time() - start
-                    print(
-                        f"Epoch {epoch:03d} | {split_name:<5} {batches_seen:>5}/{total_batches} "
-                        f"({pct:5.1f}%) | {elapsed:6.1f}s",
-                        flush=True,
-                    )
-                    last_logged_batches = batches_seen
         else:
             for i, batch in enumerate(loader, start=1):
                 node_features, edge_index, edge_weight, seed_mask, seed_labels = to_torch_batch(
@@ -1549,25 +1236,11 @@ def train_neighbor_sampling(
     Routing:
       * ``world_size > 1``      → DDP (torchrun): each rank holds one GPU/CPU,
         DistributedSampler shards seed flows, NCCL/Gloo all-reduces gradients.
-      * Single-process, multi GPU visible AND ``train.multi_gpu`` → legacy
-        ``replicate + parallel_apply + foreach_add_`` fallback (Kaggle notebooks
-        without torchrun).
       * Single-process, 1 device (GPU or CPU) → straight loop.
     """
     is_ddp = world_size > 1
-    multi_gpu = bool(config["train"].get("multi_gpu", True))
-    # In DDP each rank owns exactly one device; the legacy multi-GPU primitive
-    # is disabled so we don't double-replicate.
-    if is_ddp:
-        devices = [device]
-        n_gpus = 1
-        if rank == 0:
-            print(f"[DDP] world_size={world_size} backend={dist.get_backend()}", flush=True)
-    else:
-        devices = get_training_devices(device, multi_gpu)
-        n_gpus = len(devices)
-        if n_gpus > 1:
-            print(f"[Multi-GPU legacy] Using {n_gpus} GPUs: {', '.join(str(d) for d in devices)}")
+    if is_ddp and rank == 0:
+        print(f"[DDP] world_size={world_size} backend={dist.get_backend()}", flush=True)
     _tune_cuda_backends(device, enable_tf32=bool(config["train"].get("tf32", True)))
 
     backend = load_neighbor_backend(config)
@@ -1632,45 +1305,23 @@ def train_neighbor_sampling(
     )
     train_labels_np = labels_np[train_idx_np]
     train_loader, train_dist_sampler = make_neighbor_loader(
-        train_idx_np, sampler, config, shuffle=True, n_gpus=n_gpus,
+        train_idx_np, sampler, config, shuffle=True,
         world_size=world_size, rank=rank, seed=seed,
         class_labels=train_labels_np,
     )
     val_loader, _ = make_neighbor_loader(
-        val_idx_np, sampler, config, shuffle=False, n_gpus=n_gpus,
+        val_idx_np, sampler, config, shuffle=False,
         world_size=world_size, rank=rank, seed=seed,
     )
     test_loader, _ = make_neighbor_loader(
-        test_idx_np, sampler, config, shuffle=False, n_gpus=n_gpus,
+        test_idx_np, sampler, config, shuffle=False,
         world_size=world_size, rank=rank, seed=seed,
     )
 
     edge_types = list(backend.edge_types)
 
-    # Phase 3 — HPE-HGT Laplacian Positional Encoding. Loaded once here so
-    # downstream node_input_dims["flow"] reflects the augmented width.
-    # When ``data.laplacian_pe_path`` is absent / blank the variable stays
-    # None and the per-batch concat hook becomes a no-op.
-    flow_pe: torch.Tensor | None = None
-    flow_pe_k: int = 0
-    _pe_path = (config.get("data") or {}).get("laplacian_pe_path")
-    if _pe_path:
-        from graphslm_ids.offline.training.laplacian_pe import load_laplacian_pe
-        _pe_np = load_laplacian_pe(_pe_path)
-        flow_pe = torch.from_numpy(_pe_np).to(device)
-        flow_pe_k = int(_pe_np.shape[1])
-        if rank == 0:
-            print(
-                f"[hpe] Loaded Laplacian PE: shape={tuple(_pe_np.shape)} "
-                f"k={flow_pe_k} path={_pe_path}",
-                flush=True,
-            )
-    # Install (or clear) the module-level singleton read by to_torch_batch.
-    _set_hpe_flow_pe(flow_pe)
-
-    flow_feat_dim = int(backend.feature_dims["flow"]) + flow_pe_k
     node_input_dims = {
-        "flow": flow_feat_dim,
+        "flow": int(backend.feature_dims["flow"]),
         "packet": int(backend.feature_dims["packet"]),
         "technique": int(backend.feature_dims["technique"]),
     }
@@ -1824,17 +1475,10 @@ def train_neighbor_sampling(
     loss_type = str(config["train"].get("loss_type", "ce")).lower()
     label_smoothing = float(config["train"].get("label_smoothing", 0.0))
     focal_gamma = float(config["train"].get("focal_gamma", 2.0))
-    ldam_max_m = float(config["train"].get("ldam_max_m", 0.5))
-    ldam_scale = float(config["train"].get("ldam_scale", 30.0))
-    if loss_type not in {"ce", "focal", "cb_focal", "ldam"}:
+    if loss_type not in {"ce", "focal", "cb_focal"}:
         raise ValueError(
-            f"Unknown loss_type {loss_type!r}. Supported: 'ce', 'focal', 'cb_focal', 'ldam'."
+            f"Unknown loss_type {loss_type!r}. Supported: 'ce', 'focal', 'cb_focal'."
         )
-    ldam_margins = None
-    if loss_type == "ldam":
-        train_labels_np = backend.get_flow_labels(np.asarray(train_idx_np, dtype=np.int64))
-        train_class_counts = np.bincount(train_labels_np, minlength=num_classes).astype(np.float64)
-        ldam_margins = _compute_ldam_margins(train_class_counts, max_m=ldam_max_m).to(device)
     if rank == 0:
         _drw_msg = (
             f"drw_start_epoch={drw_start_epoch}/{int(config['train']['epochs'])}"
@@ -1843,7 +1487,7 @@ def train_neighbor_sampling(
         )
         print(
             f"[loss] type={loss_type} label_smoothing={label_smoothing} "
-            f"focal_gamma={focal_gamma} ldam_max_m={ldam_max_m} ldam_scale={ldam_scale} "
+            f"focal_gamma={focal_gamma} "
             f"class_weight_method={_weight_method} "
             f"cb_beta={_cb_beta_used if _cb_beta_used is not None else 'n/a'} "
             f"{_drw_msg}",
@@ -1997,106 +1641,68 @@ def train_neighbor_sampling(
         last_logged_batches = 0
         epoch_start = time.time()
         while True:
-            # In DDP mode each rank takes one batch at a time (DDP handles
-            # cross-rank parallelism through all-reduce). In legacy mode we
-            # still gather one batch per visible GPU.
-            group_size = 1 if is_ddp else n_gpus
-            batch_group: list[MiniBatchSubgraph] = []
-            for _ in range(group_size):
-                try:
-                    raw_batch = next(train_iter)
-                except StopIteration:
-                    break
-                # HGAA hook — may return raw_batch unchanged when disabled or
-                # when probabilistic gate didn't fire. Failure inside the
-                # pipeline is logged and falls back to raw_batch so a bug
-                # in augmentation cannot abort training.
-                if hgaa_pipeline is not None:
-                    raw_batch = hgaa_pipeline.maybe_augment(raw_batch)
-                batch_group.append(raw_batch)
-            if not batch_group:
+            try:
+                raw_batch = next(train_iter)
+            except StopIteration:
                 break
+            # HGAA hook — may return raw_batch unchanged when disabled or when
+            # the probabilistic gate didn't fire. Failure inside the pipeline is
+            # logged and falls back to raw_batch so an augmentation bug cannot
+            # abort training.
+            if hgaa_pipeline is not None:
+                raw_batch = hgaa_pipeline.maybe_augment(raw_batch)
+            batch = raw_batch
 
-            if (not is_ddp) and n_gpus > 1 and len(batch_group) > 1:
-                # Legacy single-process multi-GPU: replicate + parallel_apply.
-                ls, ex, bp, bl, ns, es = _multi_gpu_train_step(
-                    model, batch_group, devices, edge_types, weight,
-                    scaler, use_semantic_edge_weights, grad_accum_steps,
+            nf, ei, ew, sm, sl = to_torch_batch(
+                batch, edge_types, device, use_semantic_edge_weights,
+            )
+            # In DDP, suppress the all-reduce on mid-accumulation backwards.
+            # The trailing backward (or the only backward when accum=1) still
+            # syncs gradients, so the optimizer step sees correct averages.
+            sync_ctx = (
+                model.no_sync()
+                if is_ddp and (step + 1) % grad_accum_steps != 0
+                else _nullcontext()
+            )
+            if drop_edge_prob > 0.0:
+                ei, ew = _drop_edges(ei, ew, drop_edge_prob)
+            with sync_ctx, torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
+                logits = model(nf, ei, edge_weight_dict=ew)
+                seed_logits = logits[sm].float()
+                loss = _compute_train_loss(
+                    seed_logits, sl, weight,
                     loss_type=loss_type,
                     label_smoothing=label_smoothing,
                     focal_gamma=focal_gamma,
-                    drop_edge_prob=drop_edge_prob,
-                    ldam_margins=ldam_margins,
-                    ldam_scale=ldam_scale,
                 )
-                train_loss_sum_t += float(ls)
-                train_examples_t += int(ex)
-                for p_np, l_np in zip(bp, bl):
-                    local_counts = _per_class_counts_tensor(
-                        torch.from_numpy(p_np), torch.from_numpy(l_np), num_classes,
-                    ).to(device)
-                    train_counts.add_(local_counts)
-                for nt, cnts in ns.items():
-                    sampled_node_sum[nt] = sampled_node_sum.get(nt, 0) + sum(cnts)
-                    sampled_node_cnt[nt] = sampled_node_cnt.get(nt, 0) + len(cnts)
-                for et, cnts in es.items():
-                    sampled_edge_sum[et] = sampled_edge_sum.get(et, 0) + sum(cnts)
-                    sampled_edge_cnt[et] = sampled_edge_cnt.get(et, 0) + len(cnts)
+            batch_count = int(sl.numel())
+            _loss_ok = bool(torch.isfinite(loss).item())
+            if _loss_ok:
+                scaler.scale(loss / grad_accum_steps).backward()
             else:
-                # DDP or single-device: one forward + backward per step.
-                batch = batch_group[0]
-                nf, ei, ew, sm, sl = to_torch_batch(
-                    batch, edge_types, device, use_semantic_edge_weights,
+                nonfinite_loss_count += 1
+            loss_val = float(loss.detach().item()) if _loss_ok else float("nan")
+            if step == 0 and epoch == 1 and rank == 0:
+                n_seeds_in_mask = int(sm.sum().item())
+                print(
+                    f"[diag] step=0 seeds_in_mask={n_seeds_in_mask} "
+                    f"seed_labels_n={batch_count} loss={loss_val:.6f} "
+                    f"logits_shape={tuple(seed_logits.shape)}",
+                    flush=True,
                 )
-                # In DDP, suppress the all-reduce on mid-accumulation backwards.
-                # The trailing backward (or the only backward when accum=1) still
-                # syncs gradients, so the optimizer step sees correct averages.
-                sync_ctx = (
-                    model.no_sync()
-                    if is_ddp and (step + 1) % grad_accum_steps != 0
-                    else _nullcontext()
-                )
-                if drop_edge_prob > 0.0:
-                    ei, ew = _drop_edges(ei, ew, drop_edge_prob)
-                with sync_ctx, torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
-                    logits = model(nf, ei, edge_weight_dict=ew)
-                    seed_logits = logits[sm].float()
-                    loss = _compute_train_loss(
-                        seed_logits, sl, weight,
-                        loss_type=loss_type,
-                        label_smoothing=label_smoothing,
-                        focal_gamma=focal_gamma,
-                        ldam_margins=ldam_margins,
-                        ldam_scale=ldam_scale,
-                    )
-                batch_count = int(sl.numel())
-                _loss_ok = bool(torch.isfinite(loss).item())
-                if _loss_ok:
-                    scaler.scale(loss / grad_accum_steps).backward()
-                else:
-                    nonfinite_loss_count += 1
-                loss_val = float(loss.detach().item()) if _loss_ok else float("nan")
-                if step == 0 and epoch == 1 and rank == 0:
-                    n_seeds_in_mask = int(sm.sum().item())
-                    print(
-                        f"[diag] step=0 seeds_in_mask={n_seeds_in_mask} "
-                        f"seed_labels_n={batch_count} loss={loss_val:.6f} "
-                        f"logits_shape={tuple(seed_logits.shape)}",
-                        flush=True,
-                    )
-                if _loss_ok:
-                    train_loss_sum_t += loss_val * batch_count
-                    train_examples_t += batch_count
-                    pred = seed_logits.detach().float().argmax(dim=1)
-                    train_counts.add_(_per_class_counts_tensor(pred, sl, num_classes))
-                for node_type, count in batch.stats.get("nodes", {}).items():
-                    c = int(count)
-                    sampled_node_sum[node_type] = sampled_node_sum.get(node_type, 0) + c
-                    sampled_node_cnt[node_type] = sampled_node_cnt.get(node_type, 0) + 1
-                for edge_name, count in batch.stats.get("edges", {}).items():
-                    c = int(count)
-                    sampled_edge_sum[edge_name] = sampled_edge_sum.get(edge_name, 0) + c
-                    sampled_edge_cnt[edge_name] = sampled_edge_cnt.get(edge_name, 0) + 1
+            if _loss_ok:
+                train_loss_sum_t += loss_val * batch_count
+                train_examples_t += batch_count
+                pred = seed_logits.detach().float().argmax(dim=1)
+                train_counts.add_(_per_class_counts_tensor(pred, sl, num_classes))
+            for node_type, count in batch.stats.get("nodes", {}).items():
+                c = int(count)
+                sampled_node_sum[node_type] = sampled_node_sum.get(node_type, 0) + c
+                sampled_node_cnt[node_type] = sampled_node_cnt.get(node_type, 0) + 1
+            for edge_name, count in batch.stats.get("edges", {}).items():
+                c = int(count)
+                sampled_edge_sum[edge_name] = sampled_edge_sum.get(edge_name, 0) + c
+                sampled_edge_cnt[edge_name] = sampled_edge_cnt.get(edge_name, 0) + 1
 
             pending_step = True
             if (step + 1) % grad_accum_steps == 0:
@@ -2130,8 +1736,6 @@ def train_neighbor_sampling(
                                 loss_type=loss_type,
                                 label_smoothing=label_smoothing,
                                 focal_gamma=focal_gamma,
-                                ldam_margins=ldam_margins,
-                                ldam_scale=ldam_scale,
                             )
                         if torch.isfinite(_loss_sam):
                             _loss_sam.backward()
@@ -2232,7 +1836,7 @@ def train_neighbor_sampling(
                                 )
                 pending_step = False
             step += 1
-            batches_seen += len(batch_group)
+            batches_seen += 1
             if rank == 0 and train_progress_every and (
                 batches_seen - last_logged_batches >= train_progress_every
                 or batches_seen >= train_batches_total
@@ -2334,7 +1938,6 @@ def train_neighbor_sampling(
                 label_names=label_names,
                 epoch=epoch,
                 split_name="val",
-                devices=devices if (n_gpus > 1 and not is_ddp) else None,
                 is_ddp=is_ddp,
                 logit_adjustment=eval_logit_adjustment,
             )
@@ -2491,10 +2094,7 @@ def train_neighbor_sampling(
             is_ddp=False,
             logit_adjustment=eval_logit_adjustment,
         )
-        device_str = (
-            f"{device} x{world_size}" if is_ddp else
-            str(device) + (f" x{n_gpus}" if n_gpus > 1 else "")
-        )
+        device_str = f"{device} x{world_size}" if is_ddp else str(device)
         summary = {
             "created_at_utc": datetime.now(timezone.utc).isoformat(),
             "config": config,
