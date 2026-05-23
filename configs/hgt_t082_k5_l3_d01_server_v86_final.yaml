@@ -92,10 +92,12 @@ train:
   ldam_max_m: 0.5
   ldam_scale: 30.0
 
-  # Class weights — class-balanced, MODERATE cap (auto-recomputed from counts)
+  # Class weights — class-balanced, LIGHT cap (sampling does the heavy balancing).
   class_weight: balanced
   class_weight_method: cb       # effective-number weighting; bounded, stable
-  class_weight_cap: 5.0         # moderate: v7=3 (too gentle for macro_f1), v8.5=20 (destroyed acc)
+  class_weight_cap: 3.0         # LIGHT: stratified sampling already balances batches,
+                                # so the loss only needs a gentle nudge (cap=20 double-
+                                # corrected and destroyed accuracy in v8.5).
   cb_beta: 0.9999
   drw_start_pct: 0.0            # weights active from epoch 1 (no deferral)
   use_manifest_class_weights: false  # AUTO-ADAPT: always recompute from current split
@@ -104,7 +106,11 @@ train:
 
   val_ratio: 0.1
   test_ratio: 0.1
-  stratified_batch_sampling: false
+  # Class-balanced batch sampling — THE macro_f1 lever. WeightedRandomSampler with
+  # 1/count weights makes every batch see all classes ~equally, so rare classes are
+  # learned without distorting the loss. Auto-adaptive: weights recompute from the
+  # current split's counts, so it scales correctly when the dataset grows/changes.
+  stratified_batch_sampling: true
   drop_edge_prob: 0.05
   ema_enabled: true
   ema_decay: 0.999
