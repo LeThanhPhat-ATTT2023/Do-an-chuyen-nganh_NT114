@@ -63,7 +63,7 @@ train:
 
   class_weight: balanced
   class_weight_method: cb
-  class_weight_cap: 5.0
+  class_weight_cap: 3.0
   cb_beta: 0.9999
   drw_start_pct: 0.0
   use_manifest_class_weights: false
@@ -72,7 +72,7 @@ train:
 
   val_ratio: 0.1
   test_ratio: 0.1
-  stratified_batch_sampling: false
+  stratified_batch_sampling: true
   drop_edge_prob: 0.05
   ema_enabled: false           # smoke: clean per-epoch signal
   ema_decay: 0.999
