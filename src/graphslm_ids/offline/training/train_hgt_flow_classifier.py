@@ -878,12 +878,23 @@ def _compute_train_loss(
         # Focal loss (Lin et al. ICCV 2017): FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t).
         # cb_focal is identical at the function level; the behavioral difference is
         # that cb_focal expects `weight` to come from Class-Balanced method (Cui et al. 2019).
+        # Label smoothing: focal modulation is still keyed on TRUE-class probability,
+        # but the per-sample CE component is replaced by smoothed CE
+        #     (1-eps)·NLL_true + eps·(-mean(log_probs))
+        # so configs that set label_smoothing>0 actually get regularization (prior
+        # focal path silently dropped it — see BUG #1 in v8.x audit).
         log_probs = F.log_softmax(logits, dim=-1)
         targets = labels.unsqueeze(-1)
         log_p_t = log_probs.gather(dim=-1, index=targets).squeeze(-1)
         p_t = log_p_t.exp()
         focal_factor = (1.0 - p_t).pow(focal_gamma)
-        loss = -focal_factor * log_p_t
+        if label_smoothing > 0.0:
+            nll_true = -log_p_t
+            nll_uniform = -log_probs.mean(dim=-1)
+            base_loss = (1.0 - label_smoothing) * nll_true + label_smoothing * nll_uniform
+        else:
+            base_loss = -log_p_t
+        loss = focal_factor * base_loss
         if weight is not None:
             alpha_t = weight.gather(dim=0, index=labels)
             loss = alpha_t * loss
