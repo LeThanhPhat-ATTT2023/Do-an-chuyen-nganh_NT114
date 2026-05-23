@@ -688,6 +688,24 @@ def _compute_monitor_score(monitor: str, val_metrics: dict) -> float:
     )
 
 
+def _tau_norm_divisor(classifier: torch.nn.Module, tau: float) -> torch.Tensor | None:
+    """Per-class divisor ||w_c||^tau for tau-normalized inference (Kang et al. ICLR 2020).
+
+    During long-tail training the final classifier's per-class weight vectors grow
+    larger for majority classes (more gradient updates). Dividing each class logit
+    by ||w_c||^tau shrinks those over-grown majority norms, rebalancing decisions
+    toward rare classes WITHOUT any retraining — a cheap post-hoc decoupling step.
+    Returns None when tau<=0 (no-op).
+    """
+    if tau <= 0.0:
+        return None
+    linears = [m for m in classifier.modules() if isinstance(m, torch.nn.Linear)]
+    if not linears:
+        return None
+    w = linears[-1].weight.detach()
+    return w.norm(dim=1).clamp_min(1e-12).pow(tau)
+
+
 def _compute_train_loss(
     logits: torch.Tensor,
     labels: torch.Tensor,
@@ -1133,6 +1151,7 @@ def evaluate_neighbor_sampling(
     split_name: str = "eval",
     is_ddp: bool = False,
     logit_adjustment: torch.Tensor | None = None,
+    tau_norm_divisor: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     """Two paths:
       1. DDP (``is_ddp=True``): each rank evaluates its DistributedSampler shard,
@@ -1151,10 +1170,12 @@ def evaluate_neighbor_sampling(
     model.eval()
     counts_acc = torch.zeros((num_classes, 4), dtype=torch.int64, device=device)
     counts_acc_adj = torch.zeros((num_classes, 4), dtype=torch.int64, device=device)
+    counts_acc_tau = torch.zeros((num_classes, 4), dtype=torch.int64, device=device)
     loss_sum_t = torch.zeros(1, dtype=torch.float64, device=device)
     examples_t = torch.zeros(1, dtype=torch.int64, device=device)
     preds: list[np.ndarray] = []
     preds_adj: list[np.ndarray] = []
+    preds_tau: list[np.ndarray] = []
     labels: list[np.ndarray] = []
     loss_sum = 0.0
     total_batches = len(loader)
@@ -1181,6 +1202,9 @@ def evaluate_neighbor_sampling(
                 if logit_adjustment is not None:
                     _logits_adj = _logits_raw - logit_adjustment.to(_logits_raw.device)
                     counts_acc_adj += _per_class_counts_tensor(_logits_adj.argmax(dim=1), seed_labels, num_classes)
+                if tau_norm_divisor is not None:
+                    _logits_tau = _logits_raw / tau_norm_divisor.to(_logits_raw.device)
+                    counts_acc_tau += _per_class_counts_tensor(_logits_tau.argmax(dim=1), seed_labels, num_classes)
                 if progress_every and (i - last_logged >= progress_every or i == total_batches):
                     if not dist.is_initialized() or dist.get_rank() == 0:
                         pct = 100.0 * i / total_batches
@@ -1209,6 +1233,14 @@ def evaluate_neighbor_sampling(
                     float(loss_sum_t.item()),
                     int(examples_t.item()),
                 )
+            if tau_norm_divisor is not None:
+                dist.all_reduce(counts_acc_tau, op=dist.ReduceOp.SUM)
+                metrics["tau_normalized"] = _metrics_from_counts(
+                    counts_acc_tau.cpu().numpy(),
+                    label_names,
+                    float(loss_sum_t.item()),
+                    int(examples_t.item()),
+                )
             return metrics
         else:
             for i, batch in enumerate(loader, start=1):
@@ -1228,6 +1260,9 @@ def evaluate_neighbor_sampling(
                 if logit_adjustment is not None:
                     _logits_adj = _logits_raw - logit_adjustment.to(_logits_raw.device)
                     preds_adj.append(_logits_adj.argmax(dim=1).cpu().numpy())
+                if tau_norm_divisor is not None:
+                    _logits_tau = _logits_raw / tau_norm_divisor.to(_logits_raw.device)
+                    preds_tau.append(_logits_tau.argmax(dim=1).cpu().numpy())
                 labels.append(seed_labels.detach().cpu().numpy())
                 if progress_every and (i - last_logged >= progress_every or i == total_batches):
                     pct = 100.0 * i / total_batches
@@ -1245,6 +1280,11 @@ def evaluate_neighbor_sampling(
         adj_np = np.concatenate(preds_adj) if preds_adj else np.empty((0,), dtype=np.int64)
         metrics["logit_adjusted"] = metrics_from_predictions(
             adj_np, label_np, num_classes, label_names, loss_sum
+        )
+    if tau_norm_divisor is not None:
+        tau_np = np.concatenate(preds_tau) if preds_tau else np.empty((0,), dtype=np.int64)
+        metrics["tau_normalized"] = metrics_from_predictions(
+            tau_np, label_np, num_classes, label_names, loss_sum
         )
     return metrics
 
@@ -1542,6 +1582,13 @@ def train_neighbor_sampling(
                 f"adj_max={eval_logit_adjustment.max().item():.3f}",
                 flush=True,
             )
+
+    # tau-normalized inference (Kang et al. ICLR 2020): post-hoc decoupling that
+    # shrinks over-grown majority-class classifier weight norms. Recomputed each
+    # eval from the current (or EMA) classifier weights. 0 = off.
+    tau_norm = float(config["train"].get("tau_norm", 0.0))
+    if rank == 0 and tau_norm > 0.0:
+        print(f"[tau_norm] tau={tau_norm} (post-hoc classifier weight normalization)", flush=True)
 
     drop_edge_prob = float(config["train"].get("drop_edge_prob", 0.0))
     if rank == 0 and drop_edge_prob > 0.0:
@@ -1953,6 +2000,9 @@ def train_neighbor_sampling(
         if do_val and ema is not None:
             ema.apply_shadow(raw_model)
         if do_val:
+            # Computed inside the EMA bracket so the divisor reflects the EMA
+            # classifier weights actually used for this eval.
+            _tau_div = _tau_norm_divisor(raw_model.classifier, tau_norm)
             val_metrics = evaluate_neighbor_sampling(
                 model=model,
                 loader=val_loader,
@@ -1967,6 +2017,7 @@ def train_neighbor_sampling(
                 split_name="val",
                 is_ddp=is_ddp,
                 logit_adjustment=eval_logit_adjustment,
+                tau_norm_divisor=_tau_div,
             )
         else:
             val_metrics = {
@@ -2072,10 +2123,15 @@ def train_neighbor_sampling(
                 f" | LA: val_acc={_la['accuracy']:.4f} val_macro_f1={_la['macro_f1']:.4f}"
                 if isinstance(_la, dict) else ""
             )
+            _tn = val_metrics.get("tau_normalized") if isinstance(val_metrics, dict) else None
+            _tn_str = (
+                f" | TauNorm: val_acc={_tn['accuracy']:.4f} val_macro_f1={_tn['macro_f1']:.4f}"
+                if isinstance(_tn, dict) else ""
+            )
             print(
                 f"Epoch {epoch:03d} | loss={_loss:.4f} {_train_acc_str}"
                 f"val_acc={val_metrics['accuracy']:.4f} "
-                f"val_macro_f1={val_metrics['macro_f1']:.4f}{_la_str} "
+                f"val_macro_f1={val_metrics['macro_f1']:.4f}{_la_str}{_tn_str} "
                 f"avg_flow_nodes={avg_nodes.get('flow', 0.0):.1f} "
                 f"avg_packet_nodes={avg_nodes.get('packet', 0.0):.1f}"
             )
@@ -2127,6 +2183,7 @@ def train_neighbor_sampling(
             split_name="test",
             is_ddp=False,
             logit_adjustment=eval_logit_adjustment,
+            tau_norm_divisor=_tau_norm_divisor(state_holder.classifier, tau_norm),
         )
         device_str = f"{device} x{world_size}" if is_ddp else str(device)
         summary = {
