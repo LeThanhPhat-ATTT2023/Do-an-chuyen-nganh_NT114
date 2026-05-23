@@ -1,0 +1,129 @@
+# NT114 HGT v8.6 SMOKE — validates the balanced cb-focal + val_balanced pipeline.
+#
+# Pass criteria (epoch 5, small subset):
+#   - startup logs: SAM(AdamW), BufferGraph enabled, TEW enabled
+#   - monitor=val_balanced selects checkpoint (logged as best_score)
+#   - val_acc should recover ABOVE the v8.5 failure (>0.30 by ep5, not 0.17) —
+#     gentle weighting lets the model keep the majority classes
+#   - macro_f1 climbing, no NaN, [warn][SAM] < 5
+
+experiment:
+  source_name: "NT114 HGT v8.6 SMOKE — balanced cb-focal + val_balanced pre-flight"
+  rationale: >
+    Validates v8.6 (gentle cb-focal cap=5 + SAM + BufferGraph + TEW +
+    monitor=val_balanced) before the full run.
+
+data:
+  source: graph_store
+  graph_npz: /home/ubuntu/dataset/graph3/graph_artifact_3tier_14gb.npz
+  graph_meta_json: /home/ubuntu/dataset/graph3/graph_artifact_3tier_14gb.meta.json
+  graph_store_root: /home/ubuntu/dataset/graph_store_v1
+  read_sealed_only: true
+  packet_feature: semantic
+  add_reverse_edges: true
+  standardize_flow_features: true
+  use_semantic_edge_weights: true
+  use_temporal_edge_weights: true
+  tew_epsilon: 1.0e-3
+  laplacian_pe_path: null
+
+model:
+  hidden_dim: 384
+  num_layers: 4
+  num_heads: 12
+  dropout: 0.20
+  ffn_multiplier: 4
+
+train:
+  output_dir: /home/ubuntu/outputs/smoke_v86_final
+  epochs: 5
+  max_train_flows: 200000
+  patience: 5
+  batch_mode: neighbor_sampling
+  batch_seed_flows: 768
+  grad_accum_steps: 1
+
+  lr: 0.001
+  weight_decay: 0.0003
+  grad_clip_norm: 1.0
+  adamw_eps: 1.0e-6
+  adamw_betas: [0.9, 0.95]
+  sam_enabled: true
+  sam_rho: 0.05
+
+  scheduler: onecycle
+  scheduler_pct_start: 0.10
+  scheduler_eta_min: 1.0e-5
+
+  loss_type: cb_focal
+  focal_gamma: 2.0
+  label_smoothing: 0.1
+  ldam_max_m: 0.5
+  ldam_scale: 30.0
+
+  class_weight: balanced
+  class_weight_method: cb
+  class_weight_cap: 5.0
+  cb_beta: 0.9999
+  drw_start_pct: 0.0
+  use_manifest_class_weights: false
+
+  logit_adjustment: 0.0
+
+  val_ratio: 0.1
+  test_ratio: 0.1
+  stratified_batch_sampling: false
+  drop_edge_prob: 0.05
+  ema_enabled: false           # smoke: clean per-epoch signal
+  ema_decay: 0.999
+  seed: 42
+  device: cuda
+  monitor: val_balanced
+  log_every: 1
+  amp: true
+  amp_dtype: auto
+  activation_checkpointing: false
+  compile: true
+  multi_gpu: false
+  skip_val_first_epoch: true
+
+  hgaa:
+    enabled: true
+    ops: [edge_addition, node_feature_swap, edge_direction_swap, edge_perturbation]
+    eta_per_op: 0.1
+    aug_ratio_in_batch: 0.5
+    smoothing: 1.0
+    bias_selection_method: top_k
+    bias_top_k_rarest: 3
+    bias_min_class_freq: 0.01
+    bias_factor_T: 0.5
+    bias_preferred_op: node_feature_swap
+    buffer_enabled: true
+    buffer_pressure_threshold: 3
+    buffer_max_per_batch: 100
+
+sampler:
+  hops: 4
+  fanouts:
+    flow__contains__packet: 6
+    packet__next_packet__packet: 3
+    packet__matches_technique__technique: 5
+    flow__matches_technique__technique: 5
+    technique__belongs_to_tactic__tactic: 1
+  reverse_fanouts:
+    rev_contains: 3
+    rev_next_packet: 2
+    rev_matches_technique: 2
+    rev_belongs_to_tactic: 0
+  always_include_all_tactics: true
+  always_include_all_techniques: true
+
+dataloader:
+  num_workers: 8
+  prefetch_factor: 16
+  pin_memory: true
+  persistent_workers: true
+
+wandb:
+  project: nt114-hgt-paper-variants
+  run_name: smoke_v86_final

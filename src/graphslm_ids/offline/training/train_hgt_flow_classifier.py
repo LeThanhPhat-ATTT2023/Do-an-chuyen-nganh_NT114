@@ -764,6 +764,7 @@ def class_weights_from_backend(
     max_weight: float = float("inf"),
     weight_method: str = "inverse",
     cb_beta: float = 0.999,
+    use_manifest_weights: bool = False,
 ) -> torch.Tensor:
     """Compute per-class loss weights from training labels.
 
@@ -774,13 +775,19 @@ def class_weights_from_backend(
         classes than inverse frequency, more stable under severe imbalance.
 
     Weights are normalized so mean = 1.0 (loss scale comparable to unweighted CE).
+
+    Auto-adaptation: weights are always derived from the CURRENT split's label
+    counts at runtime. ``use_manifest_weights`` (default False) must be set
+    explicitly to honor manifest-baked weights — otherwise swapping/growing the
+    dataset would silently reuse a stale distribution.
     """
-    manifest_weights = (backend.manifest or {}).get("class_weights")
-    if isinstance(manifest_weights, list) and len(manifest_weights) >= num_classes:
-        weights = np.array(manifest_weights[:num_classes], dtype=np.float32)
-        if max_weight < float("inf"):
-            weights = np.minimum(weights, max_weight)
-        return torch.from_numpy(weights)
+    if use_manifest_weights:
+        manifest_weights = (backend.manifest or {}).get("class_weights")
+        if isinstance(manifest_weights, list) and len(manifest_weights) >= num_classes:
+            weights = np.array(manifest_weights[:num_classes], dtype=np.float32)
+            if max_weight < float("inf"):
+                weights = np.minimum(weights, max_weight)
+            return torch.from_numpy(weights)
     labels = backend.get_flow_labels(np.asarray(train_idx, dtype=np.int64))
     counts = np.bincount(labels, minlength=num_classes).astype(np.float64)
     if weight_method == "cb":
@@ -813,6 +820,37 @@ def _compute_ldam_margins(
     margins = 1.0 / np.power(counts, 0.25)
     margins = margins * (max_m / margins.max())
     return torch.from_numpy(margins.astype(np.float32))
+
+
+def _compute_monitor_score(monitor: str, val_metrics: dict) -> float:
+    """Map a monitor name → a scalar to MAXIMIZE (higher = better).
+
+    Dataset-agnostic: reads only the per-epoch ``val_metrics`` dict, so it
+    works unchanged for any num_classes / class distribution.
+
+    Supported monitors:
+      - "val_macro_f1": macro-averaged F1 (favors minority-class balance).
+      - "val_accuracy": overall accuracy (favors majority classes).
+      - "val_balanced": 0.5·(accuracy + macro_f1) — optimizes BOTH jointly, so
+        checkpoint selection prefers a model strong on majority AND minority.
+      - "val_loss": negative validation loss (lower loss → higher score).
+
+    NaN propagates (e.g. epoch-1 val skipped) and the caller's isnan guard
+    handles it.
+    """
+    if monitor == "val_macro_f1":
+        return float(val_metrics["macro_f1"])
+    if monitor == "val_accuracy":
+        return float(val_metrics["accuracy"])
+    if monitor == "val_balanced":
+        return 0.5 * (float(val_metrics["accuracy"]) + float(val_metrics["macro_f1"]))
+    if monitor == "val_loss":
+        vl = val_metrics.get("loss")
+        return -(float(vl) if vl is not None else float("inf"))
+    raise ValueError(
+        f"Unknown monitor metric {monitor!r}. Supported: "
+        f"'val_macro_f1', 'val_accuracy', 'val_balanced', 'val_loss'."
+    )
 
 
 def _compute_train_loss(
@@ -1752,11 +1790,16 @@ def train_neighbor_sampling(
         _max_w = float(config["train"].get("class_weight_cap", float("inf")))
         _weight_method = str(config["train"].get("class_weight_method", "inverse")).lower()
         _cb_beta_used = float(config["train"].get("cb_beta", 0.999))
+        # Auto-adaptation: by default recompute class weights from the CURRENT
+        # split's label counts. Reusing manifest-baked weights would silently
+        # apply a previous dataset's distribution when the data is swapped/grown.
+        _use_manifest_w = bool(config["train"].get("use_manifest_class_weights", False))
         target_weight = class_weights_from_backend(
             backend, train_idx_np, num_classes,
             max_weight=_max_w,
             weight_method=_weight_method,
             cb_beta=_cb_beta_used,
+            use_manifest_weights=_use_manifest_w,
         ).to(device)
     drw_start_pct = float(config["train"].get("drw_start_pct", 0.0))
     drw_start_epoch = max(1, int(int(config["train"]["epochs"]) * drw_start_pct))
@@ -1859,8 +1902,11 @@ def train_neighbor_sampling(
     best_checkpoint = output_dir / "hgt_flow_best.pt"
     label_names = label_name_mapping(backend.manifest, labels_np)
     monitor = str(config["train"]["monitor"])
-    if monitor not in {"val_macro_f1", "val_loss"}:
-        raise ValueError(f"Unknown monitor metric {monitor!r}. Supported: 'val_macro_f1', 'val_loss'.")
+    if monitor not in {"val_macro_f1", "val_accuracy", "val_balanced", "val_loss"}:
+        raise ValueError(
+            f"Unknown monitor metric {monitor!r}. Supported: "
+            f"'val_macro_f1', 'val_accuracy', 'val_balanced', 'val_loss'."
+        )
     log_every = max(1, int(config["train"]["log_every"]))
     use_amp, amp_dtype = resolve_amp(config, device)
     if rank == 0:
@@ -2328,11 +2374,7 @@ def train_neighbor_sampling(
             )
         _wandb_log(entry, use_wandb)
 
-        _val_loss = val_metrics["loss"]
-        monitor_score = float(
-            val_metrics["macro_f1"] if monitor == "val_macro_f1"
-            else -(_val_loss if _val_loss is not None else float("inf"))
-        )
+        monitor_score = _compute_monitor_score(monitor, val_metrics)
         if do_val and monitor_score > best_score and not math.isnan(monitor_score):
             best_score = monitor_score
             best_epoch = epoch
