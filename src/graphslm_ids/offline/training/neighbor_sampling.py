@@ -311,6 +311,7 @@ class HeteroNeighborSampler:
         flow_feature_stats: dict[str, Any] | None = None,
         standardize_flow_features: bool = True,
         seed: int = 42,
+        defer_packet_features: bool = False,
     ) -> None:
         self.backend = backend
         self.hops = int(hops)
@@ -321,6 +322,7 @@ class HeteroNeighborSampler:
         self.flow_feature_stats = dict(flow_feature_stats or {})
         self.standardize_flow_features = bool(standardize_flow_features)
         self.rng = np.random.default_rng(seed)
+        self.defer_packet_features = bool(defer_packet_features)
         # Cache mean/std arrays so we don't re-allocate them on every batch.
         self._mean_arr: np.ndarray | None = None
         self._std_arr: np.ndarray | None = None
@@ -442,9 +444,11 @@ class HeteroNeighborSampler:
 
         node_features = {
             "flow": flow_x.astype(np.float32, copy=False),
-            "packet": self.backend.get_packet_features(packet_ids).astype(np.float32, copy=False)
-            if packet_ids.size
-            else np.empty((0, self.backend.feature_dims["packet"]), dtype=np.float32),
+            "packet": (
+                np.empty((0, self.backend.feature_dims["packet"]), dtype=np.float32)
+                if self.defer_packet_features or not packet_ids.size
+                else self.backend.get_packet_features(packet_ids).astype(np.float32, copy=False)
+            ),
             "technique": self.backend.get_technique_features(technique_ids).astype(np.float32, copy=False)
             if technique_ids.size
             else np.empty((0, self.backend.feature_dims["technique"]), dtype=np.float32),
