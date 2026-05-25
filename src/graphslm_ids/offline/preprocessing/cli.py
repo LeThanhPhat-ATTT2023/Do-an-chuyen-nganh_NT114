@@ -35,7 +35,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from graphslm_ids.offline.preprocessing.extractor import extract_packets_dir
+from graphslm_ids.offline.preprocessing.extractor import (
+    extract_packets_dir,
+    _payload_class_worker,
+)
 from graphslm_ids.offline.preprocessing.flows import (
     assign_flows,
     build_flow_features,
@@ -260,64 +263,61 @@ def main() -> None:
 def _build_payload_matrix_from_pcaps(
     raw_root: Path, packets_df, payload_length: int
 ) -> np.ndarray:
-    """Re-walk the pcaps and copy each kept packet's payload bytes into a matrix.
+    """Re-walk the pcaps and copy payload bytes — parallel version.
 
-    The extractor emits per-packet metadata but not the raw bytes (keeping the
-    metadata path lightweight). For the graph artifact we need the actual
-    bytes so payload features and evidence edges can fire on real content.
-    This helper does a SECOND deterministic pass aligned to the metadata DF:
-    for each row we already extracted, we re-open the same pcap and copy the
-    payload of the packet at the recorded ``(pcap, packet_index)`` position.
-
-    NOTE: rows are grouped by pcap path (inferred from label folder layout)
-    and each pcap walked once. Rows that don't survive matching are zero-padded.
+    Builds a per-label row_index map, then spawns one worker per class
+    directory. Each worker writes directly to its non-overlapping rows of a
+    shared memmap so no large arrays cross process boundaries.
     """
+    import multiprocessing as _mp
+    import os
+    import tempfile
+
     n = len(packets_df)
-    out = np.zeros((n, payload_length), dtype=np.uint8)
-    row_index: dict[tuple[str, int], list[int]] = {}
     if "label" not in packets_df.columns:
-        return out
+        return np.zeros((n, payload_length), dtype=np.uint8)
+
+    # ── Build per-label row_index: label -> {pos: [row_indices]} ────────────
+    per_label_index: dict[str, dict[int, list[int]]] = {}
     cum_per_label: dict[str, int] = {}
     for i, label in enumerate(packets_df["label"].astype(str).tolist()):
         pos = cum_per_label.get(label, 0)
-        row_index.setdefault((label, pos), []).append(i)
+        per_label_index.setdefault(label, {}).setdefault(pos, []).append(i)
         cum_per_label[label] = pos + 1
 
-    import dpkt
-    import socket  # noqa: F401  # imported for symmetry with extractor
+    # ── Create shared memmap (workers write, main reads back) ───────────────
+    tmp_fd, mmap_path = tempfile.mkstemp(prefix="payload_matrix_", suffix=".mmap")
+    import os as _os
+    _os.close(tmp_fd)
+    out_mmap = np.memmap(mmap_path, dtype=np.uint8, mode="w+", shape=(n, payload_length))
+    out_mmap.flush()
+    del out_mmap  # close so workers can open in 'r+' mode
 
+    # ── Build task list (one task per class directory) ───────────────────────
+    tasks: list[tuple] = []
     for cls_dir in sorted(p for p in raw_root.iterdir() if p.is_dir()):
         label = cls_dir.name
-        running_pos = 0
-        for pcap in sorted(cls_dir.glob("*.pcap")):
-            try:
-                f = open(pcap, "rb")
-            except OSError:
-                continue
-            with f:
-                try:
-                    reader = dpkt.pcap.Reader(f)
-                except Exception:
-                    continue
-                dlt = reader.datalink()
-                for _, (_ts, buf) in enumerate(reader):
-                    try:
-                        ip = _decode_ip(buf, dlt, dpkt)
-                    except Exception:
-                        ip = None
-                    if not isinstance(ip, dpkt.ip.IP):
-                        continue
-                    rows = row_index.get((label, running_pos))
-                    if rows:
-                        payload = _extract_payload(ip, dpkt)
-                        if payload:
-                            vec = np.zeros(payload_length, dtype=np.uint8)
-                            k = min(payload_length, len(payload))
-                            vec[:k] = np.frombuffer(payload[:k], dtype=np.uint8)
-                            for r in rows:
-                                out[r] = vec
-                    running_pos += 1
-    return out
+        slice_ = per_label_index.get(label, {})
+        if not slice_:
+            continue
+        tasks.append((str(cls_dir), label, slice_, payload_length, mmap_path, n))
+
+    # Cap at 4 workers: each re-reads a full PCAP (≤2 GB) into worker RAM.
+    n_workers = min(len(tasks), 4)
+    ctx = _mp.get_context("spawn")
+    with ctx.Pool(processes=n_workers) as pool:
+        for done_label in pool.imap_unordered(_payload_class_worker, tasks):
+            pass  # progress visible in worker logs / task manager
+
+    # ── Load completed matrix into RAM (or keep as memmap if too large) ──────
+    result = np.array(
+        np.memmap(mmap_path, dtype=np.uint8, mode="r", shape=(n, payload_length))
+    )
+    try:
+        _os.unlink(mmap_path)
+    except OSError:
+        pass  # Windows: file locked until GC; will be cleaned by OS
+    return result
 
 
 def _decode_ip(buf: bytes, dlt: int, dpkt_mod):

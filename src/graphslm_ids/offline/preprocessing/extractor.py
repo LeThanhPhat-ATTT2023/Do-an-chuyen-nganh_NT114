@@ -12,6 +12,8 @@ for flow assembly.
 """
 from __future__ import annotations
 
+import multiprocessing as _mp
+import os
 import socket
 from pathlib import Path
 
@@ -123,21 +125,100 @@ def extract_packets(
     return pd.DataFrame(rows, columns=COLUMNS)
 
 
-def extract_packets_dir(
-    raw_root: Path, max_per_class: int | None = None
-) -> pd.DataFrame:
-    """Iterate ``<raw_root>/<class>/*.pcap`` and concatenate results.
+def _extract_pcap_worker(args: tuple) -> pd.DataFrame:
+    """Top-level worker (picklable on Windows spawn) — parse one PCAP file."""
+    pcap_path_str, label, max_packets = args
+    return extract_packets(Path(pcap_path_str), label=label, max_packets=max_packets)
 
-    Label is inferred from the immediate parent folder name (matches the
-    project's per-pcap-folder labeling convention).
+
+def _payload_class_worker(args: tuple) -> str:
+    """Stage-2 worker: re-read one class dir's PCAPs and write payload bytes
+    directly into a pre-created memmap (shape ``(n_rows, payload_length)``).
+
+    ``row_index_slice`` maps local packet position (int) → list of row indices
+    in the output matrix that correspond to that packet.  Workers write to
+    non-overlapping row ranges so no locking is needed.
+
+    Returns ``label`` for progress logging.
     """
-    parts: list[pd.DataFrame] = []
+    import numpy as np
+
+    cls_dir_str, label, row_index_slice, payload_length, mmap_path, n_rows = args
+    out = np.memmap(mmap_path, dtype=np.uint8, mode="r+", shape=(n_rows, payload_length))
+
+    running_pos = 0
+    for pcap in sorted(Path(cls_dir_str).glob("*.pcap")):
+        try:
+            fh = open(pcap, "rb")
+        except OSError:
+            continue
+        with fh:
+            try:
+                reader = dpkt.pcap.Reader(fh)
+                dlt = reader.datalink()
+            except Exception:
+                continue
+            for _ts, buf in reader:
+                ip = _decode_ip(buf, dlt)
+                if not isinstance(ip, dpkt.ip.IP):
+                    continue
+                rows = row_index_slice.get(running_pos)
+                if rows:
+                    t = ip.data
+                    if isinstance(t, dpkt.tcp.TCP):
+                        payload = bytes(t.data)
+                    elif isinstance(t, dpkt.udp.UDP):
+                        payload = bytes(t.data)
+                    elif isinstance(t, dpkt.icmp.ICMP):
+                        payload = bytes(t.data)
+                    else:
+                        payload = b""
+                    if payload:
+                        vec = np.zeros(payload_length, dtype=np.uint8)
+                        k = min(payload_length, len(payload))
+                        vec[:k] = np.frombuffer(payload[:k], dtype=np.uint8)
+                        for r in rows:
+                            out[r] = vec
+                running_pos += 1
+    out.flush()
+    return label
+
+
+def extract_packets_dir(
+    raw_root: Path,
+    max_per_class: int | None = None,
+    n_workers: int | None = None,
+) -> pd.DataFrame:
+    """Iterate ``<raw_root>/<class>/*.pcap`` and concatenate results — parallel.
+
+    Each PCAP is parsed in a separate worker process (one per file). With 18
+    PCAPs and 16 CPUs the wall-clock time drops from ~N×single to ~ceil(18/16)
+    rounds, limited only by disk throughput. Label is inferred from the
+    immediate parent folder name.
+    """
+    tasks: list[tuple] = []
     for cls_dir in sorted(p for p in raw_root.iterdir() if p.is_dir()):
         label = cls_dir.name
         for pcap in sorted(cls_dir.glob("*.pcap")):
-            parts.append(
-                extract_packets(pcap, label=label, max_packets=max_per_class)
-            )
+            tasks.append((str(pcap), label, max_per_class))
+
+    if not tasks:
+        return pd.DataFrame(columns=COLUMNS)
+
+    if n_workers is None:
+        # Each worker loads an entire PCAP into RAM (up to ~2 GB for DDoS files).
+        # Cap at 4 concurrent workers so peak RAM stays ≤ 4×~3 GB ≈ 12 GB,
+        # leaving headroom for the main process and OS.
+        n_workers = min(len(tasks), 4)
+
+    ctx = _mp.get_context("spawn")
+    parts: list[pd.DataFrame] = []
+    # Use imap so finished worker RAM is freed before the next task starts.
+    with ctx.Pool(processes=n_workers) as pool:
+        for df in pool.imap(_extract_pcap_worker, tasks):
+            if not df.empty:
+                parts.append(df)
+
     if not parts:
         return pd.DataFrame(columns=COLUMNS)
     return pd.concat(parts, ignore_index=True)
