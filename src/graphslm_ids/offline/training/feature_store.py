@@ -161,3 +161,35 @@ class TieredFeatureStore:
 
     def state_dict(self) -> dict:
         return {"freq_order": self._cached_ids, "capacity": self.capacity}
+
+
+def compute_access_frequency(
+    *,
+    sampler,
+    seed_flow_ids: np.ndarray,
+    num_packets: int,
+    batch_size: int,
+    n_warmup_batches: int,
+    seed: int = 42,
+) -> np.ndarray:
+    """Count how often each packet node is sampled over warmup batches.
+
+    Deterministic given ``seed``: seeds are shuffled with a fixed RNG and
+    consumed in fixed-size batches. Returns an int64 array of length
+    ``num_packets`` (use ``argsort(desc)`` to get freq_order for the cache).
+    """
+    seeds = np.asarray(seed_flow_ids, dtype=np.int64)
+    rng = np.random.default_rng(seed)
+    order = rng.permutation(seeds.shape[0])
+    seeds = seeds[order]
+    freq = np.zeros(int(num_packets), dtype=np.int64)
+    n = min(n_warmup_batches, max(1, seeds.shape[0] // max(1, batch_size)))
+    for b in range(n):
+        chunk = seeds[b * batch_size : (b + 1) * batch_size]
+        if chunk.size == 0:
+            break
+        batch = sampler.sample(chunk.tolist())
+        pkt = np.asarray(batch.local_to_global["packet"], dtype=np.int64)
+        if pkt.size:
+            np.add.at(freq, pkt, 1)
+    return freq

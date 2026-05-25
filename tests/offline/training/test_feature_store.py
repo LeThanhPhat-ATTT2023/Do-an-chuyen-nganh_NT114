@@ -144,3 +144,28 @@ def test_tiered_store_partial_cache_mixed():
     ids = np.array([7, 0, 6, 1], dtype=np.int64)  # hit, miss, hit, miss
     out = store.gather(ids)
     np.testing.assert_allclose(out.cpu().numpy(), data[ids].astype(np.float32))
+
+
+def test_compute_access_frequency_deterministic_and_counts():
+    from graphslm_ids.offline.training.feature_store import compute_access_frequency
+
+    class FakeSampler:
+        def sample(self, seed_flow_ids):
+            import numpy as _np
+            base = int(seed_flow_ids[0])
+            class B:
+                local_to_global = {"packet": _np.array([base, base + 1], dtype=_np.int64)}
+            return B()
+
+    seeds = np.array([0, 2, 4, 6], dtype=np.int64)
+    f1 = compute_access_frequency(
+        sampler=FakeSampler(), seed_flow_ids=seeds, num_packets=10,
+        batch_size=2, n_warmup_batches=2, seed=42,
+    )
+    f2 = compute_access_frequency(
+        sampler=FakeSampler(), seed_flow_ids=seeds, num_packets=10,
+        batch_size=2, n_warmup_batches=2, seed=42,
+    )
+    assert f1.shape == (10,)
+    np.testing.assert_array_equal(f1, f2)
+    assert int(f1.sum()) > 0
