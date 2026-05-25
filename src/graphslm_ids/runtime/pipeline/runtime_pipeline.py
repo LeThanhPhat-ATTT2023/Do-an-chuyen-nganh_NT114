@@ -19,7 +19,6 @@ from graphslm_ids.runtime.fast_path import (
     PolicyEngine,
     SigcEdgeFilter,
     SigcEdgeFilterConfig,
-    StudentRuntime,
     SubgraphBuilder,
 )
 from graphslm_ids.runtime.pipeline.cold_store import ColdStore
@@ -47,7 +46,6 @@ class FastPathPipeline:
         self.cfg = cfg
         self.flow_tracker = FlowTracker(cfg.hot_graph.ttl_seconds)
         self.payload_extractor = PayloadExtractor(cfg.fast_path.payload_length)
-        self.student_runtime = StudentRuntime(cfg.fast_path.student_onnx)
         self.mitre_index = MitreIndex(
             cfg.fast_path.mitre_embeddings,
             cfg.fast_path.techniques_csv,
@@ -139,13 +137,11 @@ class FastPathPipeline:
         now = time.time()
         flow_state = self.flow_tracker.update(raw_pkt, now)
         extracted = self.payload_extractor.extract(raw_pkt)
-        embedding = self.student_runtime.embed(extracted.payload_u8)
-        mitre_topk = self.mitre_index.topk(
-            embedding,
-            k=self.cfg.fast_path.mitre_topk,
-            threshold=self.cfg.fast_path.mitre_threshold,
-        )
-        mitre_topk = self.sigc_filter.filter_mitre_topk(mitre_topk)
+        # TODO(v3): replace with PMI-based technique assignment from v3 ensemble;
+        # student CNN embedding removed — mitre_topk now empty until v3 runtime
+        # edge-assignment is wired in.
+        embedding: Any = None
+        mitre_topk: list[Any] = []
 
         packet_id = self._make_packet_id(flow_state.flow_id)
         if self.graph_store is not None:

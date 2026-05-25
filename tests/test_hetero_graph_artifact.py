@@ -36,3 +36,27 @@ def test_load_three_tier_graph_artifact_adds_reverse_edges(tmp_path) -> None:
     assert artifact.node_features["tactic"].shape == (2, 1)
     assert ("packet", "rev_contains", "flow") in artifact.edge_index
     assert artifact.edge_index[("packet", "rev_contains", "flow")].shape == (2, 3)
+
+
+def test_load_v3_artifact_preserves_packet_dtype(tmp_path):
+    import json
+    import numpy as np
+    from graphslm_ids.offline.training.hetero_graph_artifact import load_v3_artifact
+
+    npz = tmp_path / "g.npz"
+    meta = tmp_path / "g.meta.json"
+    np.savez(
+        str(npz),
+        flow_x=np.zeros((2, 4), dtype=np.float32),
+        flow_y=np.array([0, 1], dtype=np.int64),
+        packet_x=np.ones((3, 2323), dtype=np.float16),
+        host_x=np.zeros((1, 4), dtype=np.float32),
+        technique_x=np.zeros((5, 8), dtype=np.float32),
+    )
+    meta.write_text(json.dumps({"artifact_version": "v3", "num_tactics": 2}))
+
+    art32 = load_v3_artifact(npz, meta)
+    assert art32.node_features["packet"].dtype == np.float32
+
+    art16 = load_v3_artifact(npz, meta, packet_dtype="preserve")
+    assert art16.node_features["packet"].dtype == np.float16
