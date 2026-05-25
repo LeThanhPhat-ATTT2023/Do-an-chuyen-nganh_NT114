@@ -42,6 +42,7 @@ build).
 """
 from __future__ import annotations
 
+import gc
 import logging
 import multiprocessing as _mp
 import os
@@ -559,6 +560,9 @@ def build_v3_graph_artifact(
         _coerce_payload(p) for p in packets_kept.get("payload", pd.Series([])).tolist()
     ]
     payload_lens = packets_kept["payload_len"].astype(int).tolist()
+    # Payload bytes now live in `payloads`; drop column so the DF doesn't
+    # hold a second set of references to the same large bytes objects.
+    packets_kept = packets_kept.drop(columns=["payload"], errors="ignore")
 
     # ─── 3. packet_x ────────────────────────────────────────────────────────
     # Write to a memmap file so the full (n_packets, 2323) matrix never lives
@@ -574,13 +578,21 @@ def build_v3_graph_artifact(
     )
     _LOG.info("packet_x: shape=%s dtype=%s mmap=%s (%.1fs)",
               packet_x.shape, packet_x.dtype, packet_x_mmap_path, time.time() - t0)
+    del payload_lens
+    gc.collect()
 
     # ─── 4. Host tier ───────────────────────────────────────────────────────
     t0 = time.time()
-    feats_df_local = feats_df.copy()  # _build_host_tier may add src/dst columns
+    # Skip the full copy when feats_df already has src_ip/dst_ip — the fast
+    # path in _build_host_tier reads those columns but never writes back.
+    _host_needs_copy = "src_ip" not in feats_df.columns or "dst_ip" not in feats_df.columns
+    feats_df_local = feats_df.copy() if _host_needs_copy else feats_df
     host_x, host_to_idx, from_host_eidx, to_host_eidx, fwd_bytes, bwd_bytes = (
         _build_host_tier(feats_df_local, packets_df)
     )
+    # packets_df (unfiltered, raw=1327920 rows) no longer needed after host_tier.
+    del packets_df
+    gc.collect()
     from_host_edge_attr = fwd_bytes.reshape(-1, 1)
     to_host_edge_attr = bwd_bytes.reshape(-1, 1)
     _LOG.info("host nodes: n=%d (%.1fs)", host_x.shape[0], time.time() - t0)
@@ -608,6 +620,10 @@ def build_v3_graph_artifact(
         link_edge_index = np.empty((2, 0), dtype=np.int64)
         link_edge_attr = np.empty((0, 1), dtype=np.float32)
 
+    # packets_kept ts was the last column we needed; drop the whole DataFrame.
+    del packets_kept
+    gc.collect()
+
     # ─── 7. burst_neighbor (flow -> flow homophily) ─────────────────────────
     t0 = time.time()
     burst_eidx, burst_attr = _build_burst_neighbor_edges(feats_df_local)
@@ -616,6 +632,10 @@ def build_v3_graph_artifact(
         burst_eidx.shape[1],
         time.time() - t0,
     )
+    # feats_df_local is only a copy when the fallback IP-column path was taken.
+    if feats_df_local is not feats_df:
+        del feats_df_local
+        gc.collect()
 
     # ─── 8. MITRE technique tier ────────────────────────────────────────────
     techniques_df = pd.read_csv(mitre_techniques_csv)
@@ -683,6 +703,11 @@ def build_v3_graph_artifact(
             batch.append((pidx, payloads[pidx], flow_consensus_map.get(flow_id, {})))
         batches.append(batch)
 
+    # payloads bytes are now referenced inside `batches` tuples; release the
+    # top-level list so GC can reclaim it once batches are consumed by workers.
+    del payloads
+    gc.collect()
+
     _LOG.info(
         "evidence: %d packets → %d batches × ~%d, %d workers",
         n_packets, len(batches), batch_size, n_workers_ev,
@@ -705,6 +730,9 @@ def build_v3_graph_artifact(
                     if tidx is None or writer is None:
                         continue
                     writer.append(src=pidx, dst=tidx, attr=float(weight))
+
+    del batches
+    gc.collect()
 
     finalized: dict[str, tuple[np.ndarray, np.ndarray]] = {}
     for fam, w in evidence_writers.items():
