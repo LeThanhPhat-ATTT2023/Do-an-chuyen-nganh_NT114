@@ -226,3 +226,50 @@ def test_to_torch_batch_gathers_packet_from_store(tiny_backend):
         node_tensors["packet"].cpu().numpy(),
         packet_x[pkt_ids].astype(np.float32), rtol=1e-2, atol=1e-2,
     )
+
+
+def test_build_packet_store_disabled_returns_none(tiny_backend):
+    from graphslm_ids.offline.training.neighbor_sampling import HeteroNeighborSampler
+    from graphslm_ids.offline.training.train_hgt_flow_classifier import build_packet_store
+
+    sampler = HeteroNeighborSampler(
+        backend=tiny_backend, hops=1,
+        fanouts={"contains": 2, "next_packet": 1},
+        always_include_all_techniques=False, always_include_all_tactics=False,
+        defer_packet_features=True,
+    )
+    cfg = {"feature_store": {"enabled": False}, "dataloader": {"batch_size": 2}, "seed": 42}
+    store = build_packet_store(
+        cfg, tiny_backend, sampler,
+        train_flow_ids=np.array([0, 1, 2, 3], dtype=np.int64),
+        device=torch.device("cpu"),
+    )
+    assert store is None
+
+
+def test_build_packet_store_cpu_enabled_capacity_zero(tiny_backend):
+    from graphslm_ids.offline.training.neighbor_sampling import HeteroNeighborSampler
+    from graphslm_ids.offline.training.train_hgt_flow_classifier import build_packet_store
+
+    sampler = HeteroNeighborSampler(
+        backend=tiny_backend, hops=1,
+        fanouts={"contains": 2, "next_packet": 1},
+        always_include_all_techniques=False, always_include_all_tactics=False,
+        defer_packet_features=True,
+    )
+    cfg = {
+        "feature_store": {
+            "enabled": True, "cache_fraction": 0.6, "model_reserve_gb": 0.0,
+            "n_warmup_batches": 2, "memmap": False, "cache_dtype": "float32",
+        },
+        "dataloader": {"batch_size": 2}, "seed": 42,
+    }
+    store = build_packet_store(
+        cfg, tiny_backend, sampler,
+        train_flow_ids=np.array([0, 1, 2, 3], dtype=np.int64),
+        device=torch.device("cpu"),
+    )
+    assert store is not None
+    assert store.capacity == 0  # CPU device -> no GPU cache tier
+    out = store.gather(np.array([0, 5], dtype=np.int64))
+    assert out.shape == (2, tiny_backend.feature_dims["packet"])
