@@ -221,11 +221,15 @@ class InMemoryNeighborBackend:
         self.artifact = artifact
         self.manifest = dict(artifact.metadata)
         self.edge_types = list(artifact.edge_index.keys())
+        # v2 schema → {flow, packet, technique}. v3 adds ``host``; tactic stays
+        # id-only (no Linear projection) so it is intentionally absent.
         self.feature_dims = {
             "flow": int(artifact.node_features["flow"].shape[1]),
             "packet": int(artifact.node_features["packet"].shape[1]),
             "technique": int(artifact.node_features["technique"].shape[1]),
         }
+        if "host" in artifact.node_features:
+            self.feature_dims["host"] = int(artifact.node_features["host"].shape[1])
         self._edge_csr: dict[EdgeKey, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
         for edge_key, edge_index in artifact.edge_index.items():
             indptr, indices, attr = edge_index_to_csr(
