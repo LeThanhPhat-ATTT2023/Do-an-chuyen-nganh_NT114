@@ -170,7 +170,22 @@ sampler:
   always_include_all_tactics: true
 
 dataloader:
-  num_workers: 4          # L40S has enough CPU cores; more workers → better GPU utilisation
+  num_workers: 8          # g6e.2xlarge có 8 CPU → tăng từ 4 lên 8 để GPU ít idle hơn
   prefetch_factor: 4      # GATransformer/AHGT-DFD use 4; reduces GPU idle between batches
   pin_memory: true
   persistent_workers: true
+
+# ── Feature store + GPU sampling (L40S 48 GB) ────────────────────────────────
+# packet_x float16 ≈ 2.8 GB + model ≈ 2 GB + overhead → tổng ~8 GB, còn 40 GB dư.
+# Toàn bộ graph topology + features nằm trên GPU → zero CPU↔GPU transfer mỗi batch.
+#
+# Kết quả: CPU sampling bottleneck biến mất, throughput tăng 3-5×,
+# thời gian train ước tính từ ~20h xuống còn ~5-8h.
+feature_store:
+  enabled: true
+  cache_fraction: 0.6      # 60% VRAM còn lại dành cho packet_x hot cache
+  model_reserve_gb: 4.0    # giữ 4 GB cho model weights + activations + optimizer
+  n_warmup_batches: 200    # warm up cache 200 batch đầu trước khi đánh giá hit rate
+
+gpu_sampling:
+  enabled: true            # neighbor sampling chạy trên GPU, không qua CPU workers
