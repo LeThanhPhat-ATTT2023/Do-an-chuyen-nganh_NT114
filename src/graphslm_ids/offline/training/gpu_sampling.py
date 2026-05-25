@@ -55,17 +55,21 @@ def gather_csr_neighbors_torch(
         selected = global_edge
     else:
         keys = torch.rand(total_in, device=device, generator=generator)
-        # Sort by (row asc, key asc); keep first counts[r] per row.
-        order = torch.argsort(row_of_edge.to(torch.float64) * (keys.max() + 1.0) + keys, stable=True)
+        # Sort by (row asc, key asc) via two stable sorts. Avoids the
+        # float64 mantissa trick (row*(max_key+1)+key), which silently breaks
+        # once n_src*(max_key+1) exceeds 2^52.
+        inner = torch.argsort(keys, stable=True)
+        order = inner[torch.argsort(row_of_edge[inner], stable=True)]
         sorted_row = row_of_edge[order]
         pos_in_seg = torch.arange(total_in, device=device, dtype=torch.int64) - cum_in[sorted_row]
         keep = pos_in_seg < counts[sorted_row]
         selected_in_order = order[keep]
-        # Restore CSR-ascending order within each row.
+        # Restore CSR-ascending order within each row -- same two-stable-sort
+        # idiom keyed on (row asc, global_edge asc).
         sel_rows = row_of_edge[selected_in_order]
         sel_glob = global_edge[selected_in_order]
-        max_glob = int(global_edge.max().item()) + 1
-        perm = torch.argsort(sel_rows * max_glob + sel_glob, stable=True)
+        inner = torch.argsort(sel_glob, stable=True)
+        perm = inner[torch.argsort(sel_rows[inner], stable=True)]
         selected = selected_in_order[perm]
 
     local_indptr = torch.zeros(n_src + 1, dtype=torch.int64, device=device)
