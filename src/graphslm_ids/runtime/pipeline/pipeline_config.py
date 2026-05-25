@@ -12,7 +12,6 @@ from graphslm_ids.utils.io import read_yaml
 
 @dataclass
 class FastPathCfg:
-    student_onnx: str
     mitre_embeddings: str
     techniques_csv: str
     technique_tactic_csv: str
@@ -130,7 +129,6 @@ class PipelineConfig:
         checkpoint = hgt_raw.get("checkpoint") or str(Path(hgt_output_dir) / "hgt_flow_best.pt")
 
         fast_path = FastPathCfg(
-            student_onnx=str(fast_raw.get("student_onnx", "outputs/student_cnn/student_cnn.onnx")),
             mitre_embeddings=str(
                 fast_raw.get("mitre_embeddings", mitre_raw.get("embedding_path", "data/mitre/mitre_techniques_embeddings.npy"))
             ),

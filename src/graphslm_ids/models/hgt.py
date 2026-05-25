@@ -210,15 +210,29 @@ class HeteroGraphTransformer(nn.Module):
         dropout: float = 0.2,
         ffn_multiplier: int = 2,
         activation_checkpointing: bool = False,
+        node_types: list[str] | None = None,
     ) -> None:
         super().__init__()
-        node_types = ["flow", "packet", "technique", "tactic"]
-        self.node_types = node_types
+        # Backwards-compatible default: v2 four-type schema. v3 callers pass the
+        # full ["flow", "packet", "host", "technique", "tactic"] list. Any extra
+        # node type (e.g. ``host``) is wired through input_projection iff its
+        # dim is present in ``node_input_dims`` — otherwise it is treated like
+        # ``tactic`` (id-only embedding).
+        if node_types is None:
+            node_types = ["flow", "packet", "technique", "tactic"]
+        # ``tactic`` must remain the id-only node — its embedding table is keyed
+        # by integer tactic_id. Every other node_type is projected from its
+        # feature matrix via Linear.
+        self.node_types = list(node_types)
         self.edge_types = edge_types
         self.hidden_dim = hidden_dim
         self.num_tactics = num_tactics
         self.activation_checkpointing = activation_checkpointing
 
+        # All non-tactic node types with a declared input dim get a Linear
+        # projection. v2: {flow, packet, technique}. v3 adds {host}.
+        projected_types = [nt for nt in self.node_types if nt != "tactic" and nt in node_input_dims]
+        self._projected_types = projected_types
         self.input_projection = nn.ModuleDict(
             {
                 node_type: nn.Sequential(
@@ -227,7 +241,7 @@ class HeteroGraphTransformer(nn.Module):
                     nn.GELU(),
                     nn.Dropout(dropout),
                 )
-                for node_type in ["flow", "packet", "technique"]
+                for node_type in projected_types
             }
         )
         self.tactic_embedding = nn.Embedding(max(num_tactics, 1), hidden_dim)
@@ -235,7 +249,7 @@ class HeteroGraphTransformer(nn.Module):
         self.layers = nn.ModuleList(
             [
                 HGTLayer(
-                    node_types=node_types,
+                    node_types=self.node_types,
                     edge_types=edge_types,
                     hidden_dim=hidden_dim,
                     num_heads=num_heads,
@@ -261,10 +275,12 @@ class HeteroGraphTransformer(nn.Module):
         edge_weight_dict: dict[EdgeKey, torch.Tensor] | None = None,
         return_attention: bool = False,
     ) -> dict[str, torch.Tensor] | tuple[dict[str, torch.Tensor], dict[EdgeKey, torch.Tensor]]:
-        x_dict = {
-            "flow": self.input_projection["flow"](node_features["flow"].float()),
-            "packet": self.input_projection["packet"](node_features["packet"].float()),
-            "technique": self.input_projection["technique"](node_features["technique"].float()),
+        # Project every declared non-tactic type. v2 path → {flow, packet, technique};
+        # v3 path → {flow, packet, host, technique}. ``tactic`` is handled below
+        # via the id-only embedding table.
+        x_dict: dict[str, torch.Tensor] = {
+            node_type: self.input_projection[node_type](node_features[node_type].float())
+            for node_type in self._projected_types
         }
 
         tactic_raw = node_features["tactic"].to(device=node_features["flow"].device)

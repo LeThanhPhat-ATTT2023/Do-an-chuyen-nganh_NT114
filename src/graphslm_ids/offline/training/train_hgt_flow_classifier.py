@@ -4,6 +4,7 @@ import argparse
 from contextlib import nullcontext as _nullcontext
 from copy import deepcopy
 from datetime import datetime, timezone
+import logging
 import math
 import os
 from pathlib import Path
@@ -11,7 +12,12 @@ import random
 import threading
 import time
 import warnings
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+_LOG = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from graphslm_ids.offline.training.feature_store import TieredFeatureStore
 
 import numpy as np
 import torch
@@ -24,6 +30,8 @@ from torch.utils.data.distributed import DistributedSampler
 from graphslm_ids.offline.training.hetero_graph_artifact import (
     load_graph_store_artifact,
     load_three_tier_graph_artifact,
+    load_v2_artifact,
+    load_v3_artifact,
 )
 from graphslm_ids.offline.training.neighbor_sampling import (
     FlowSeedDataset,
@@ -100,10 +108,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # Optimizer numerics (BF16-stable defaults)
         "adamw_eps": 1.0e-6,
         "adamw_betas": (0.9, 0.95),
-        # SAM (Sharpness-Aware Minimization, Foret et al. ICLR 2021).
-        # Requires grad_accum_steps=1.
-        "sam_enabled": False,
-        "sam_rho": 0.05,
         # Skip val eval at epoch 1 (OneCycle warmup → near-random val anyway)
         "skip_val_first_epoch": False,
     },
@@ -131,6 +135,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "pin_memory": True,
         "persistent_workers": True,
     },
+    "feature_store": {
+        "enabled": False,
+        "cache_fraction": 0.6,
+        "model_reserve_gb": 4.0,
+        "cache_dtype": None,
+        "n_warmup_batches": 200,
+        "memmap": False,
+        "memmap_bin": "",
+    },
+    "gpu_sampling": {"enabled": False},
 }
 
 
@@ -295,6 +309,17 @@ def parse_args() -> argparse.Namespace:
         "--no-scheduler", dest="no_scheduler", action="store_true",
         help="Disable OneCycleLR scheduler (use constant LR).",
     )
+    parser.add_argument(
+        "--split-protocol",
+        choices=["random", "temporal"],
+        default=None,
+        help=(
+            "v3 only — override config's data.split_protocol. Selects which "
+            "key of splits.json is loaded when running with artifact_version=v3. "
+            "Used by scripts that train both random and temporal protocols "
+            "sequentially without authoring two config files."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -357,6 +382,10 @@ def apply_cli_overrides(config: dict[str, Any], args: argparse.Namespace) -> dic
         config["train"]["tf32"] = False
     if getattr(args, "no_scheduler", False):
         config["train"]["scheduler"] = "none"
+    if getattr(args, "split_protocol", None) is not None:
+        # v3 splits.json contains both 'random' and 'temporal' keys; this CLI
+        # override lets the same config train either by selecting one at launch.
+        config["data"]["split_protocol"] = args.split_protocol
     return config
 
 
@@ -529,6 +558,28 @@ def label_name_mapping(metadata: dict[str, Any], labels: np.ndarray) -> dict[int
 
 
 def load_neighbor_backend(config: dict[str, Any]) -> NeighborBackend:
+    # v2/v3 evidence-grounded graph artifact: explicit version switch via config
+    # so a misconfigured run fails loudly instead of silently falling back to v1
+    # cosine-edge artifacts.
+    _artifact_version = str(config["data"].get("artifact_version", "")).lower()
+    if _artifact_version == "v2":
+        artifact = load_v2_artifact(
+            graph_npz=Path(config["data"]["graph_npz"]),
+            graph_meta_json=Path(config["data"]["graph_meta_json"]),
+            add_reverse_edges=bool(config["data"].get("add_reverse_edges", True)),
+        )
+        return InMemoryNeighborBackend(artifact)
+    if _artifact_version == "v3":
+        # v3 Smart-BOTH Hybrid: 5 node types (adds host) + 5 typed-evidence edge
+        # families. Loader contract is identical to v2 — same HeteroGraphArtifact
+        # shape — so InMemoryNeighborBackend handles host nodes uniformly.
+        artifact = load_v3_artifact(
+            graph_npz=Path(config["data"]["graph_npz"]),
+            graph_meta_json=Path(config["data"]["graph_meta_json"]),
+            add_reverse_edges=bool(config["data"].get("add_reverse_edges", True)),
+        )
+        return InMemoryNeighborBackend(artifact)
+
     source = str(config["data"].get("source", "npz")).lower()
     if source in {"on_disk_graph_store", "graph_store_csr", "graph_store"}:
         graph_store_root = Path(config["data"]["graph_store_root"])
@@ -554,12 +605,185 @@ def load_neighbor_backend(config: dict[str, Any]) -> NeighborBackend:
     return InMemoryNeighborBackend(artifact)
 
 
+def build_packet_store(config, backend, sampler, train_flow_ids, device):
+    """Construct a TieredFeatureStore for packet_x, or return None if disabled."""
+    fs = config.get("feature_store", {})
+    if not fs.get("enabled", False):
+        return None
+    from graphslm_ids.offline.training.feature_store import (
+        ArrayPacketSource, MemmapPacketSource, TieredFeatureStore,
+        compute_access_frequency, compute_cache_capacity,
+    )
+    if fs.get("memmap", False):
+        source = MemmapPacketSource(
+            Path(fs["memmap_bin"]),
+            num_rows=int(backend.artifact.node_features["packet"].shape[0]),
+            dim=int(backend.feature_dims["packet"]),
+            dtype="float16",
+        )
+    else:
+        source = ArrayPacketSource(backend.artifact.node_features["packet"])
+
+    freq = compute_access_frequency(
+        sampler=sampler, seed_flow_ids=train_flow_ids,
+        num_packets=source.num_rows,
+        batch_size=int(config["train"].get("batch_seed_flows", 256)),
+        n_warmup_batches=int(fs.get("n_warmup_batches", 200)),
+        seed=int(config.get("seed", 42)),
+    )
+    freq_order = np.argsort(freq)[::-1].copy()
+    row_bytes = source.dim * 2  # bf16/fp16 = 2 bytes/elem
+    capacity = compute_cache_capacity(
+        device=device, num_rows=source.num_rows, row_bytes=row_bytes,
+        model_reserve_bytes=int(fs.get("model_reserve_gb", 4.0) * 1024**3),
+        cache_fraction=float(fs.get("cache_fraction", 0.6)),
+    )
+    return TieredFeatureStore(
+        source=source, device=device, freq_order=freq_order,
+        capacity=capacity, cache_dtype=fs.get("cache_dtype"),
+    )
+
+
+def maybe_build_gpu_sampling(config, in_memory_backend, device, flow_feature_stats=None):
+    """Build (GpuNeighborBackend, TorchHeteroNeighborSampler) when enabled, else None.
+
+    Requires ``feature_store.enabled=True`` because the torch sampler always
+    defers packet features and only the store can gather them.
+
+    ``flow_feature_stats`` (``{"mean":..., "std":...}``) is forwarded so the
+    torch sampler standardizes flow_x in-line with the same cached stats as the
+    numpy sampler (parity).
+    """
+    if not config.get("gpu_sampling", {}).get("enabled", False):
+        return None
+    if not config.get("feature_store", {}).get("enabled", False):
+        raise ValueError(
+            "gpu_sampling.enabled=True requires feature_store.enabled=True"
+        )
+    from graphslm_ids.offline.training.gpu_sampling import (
+        GpuNeighborBackend, TorchHeteroNeighborSampler,
+    )
+    sampler_cfg = config.get("sampler", {}) or {}
+    hops = sampler_cfg.get("hops")
+    if hops is None:
+        hops = int(config.get("model", {}).get("num_layers", 2))
+    gpu_backend = GpuNeighborBackend(in_memory_backend, device=device)
+    sampler = TorchHeteroNeighborSampler(
+        backend=gpu_backend,
+        hops=int(hops),
+        fanouts=sampler_cfg.get("fanouts"),
+        reverse_fanouts=sampler_cfg.get("reverse_fanouts"),
+        always_include_all_tactics=bool(sampler_cfg.get("always_include_all_tactics", True)),
+        always_include_all_techniques=bool(sampler_cfg.get("always_include_all_techniques", True)),
+        standardize_flow_features=bool(config.get("data", {}).get("standardize_flow_features", True)),
+        flow_feature_stats=flow_feature_stats,
+        seed=int(config.get("train", {}).get("seed", 42)),
+    )
+    return gpu_backend, sampler
+
+
+def _load_v3_splits_json(
+    splits_json_path: Path,
+    protocol: str,
+    flow_id_order: list[str] | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """Load (train, val, test) flow-INDEX arrays from a v3 splits.json.
+
+    splits.json stores flow IDs as STRINGS (the canonical 5-tuple flow keys
+    produced by v3/split.py). The trainer's neighbor sampler expects INTEGER
+    node indices into ``flow_x``, so we map strings -> ints via
+    ``flow_id_order`` (the ordered list of flow IDs as they appear in
+    ``flow_x``, persisted by graph_builder.py into metadata).
+
+    Args:
+        splits_json_path: path to outputs/v3/splits.json.
+        protocol: 'random' or 'temporal'.
+        flow_id_order: ordered list of string flow IDs (from artifact metadata
+            key ``flow_id_order``). REQUIRED when splits.json contains string
+            IDs (the normal case). If ``None`` and the file already contains
+            integers (e.g. a pre-converted splits file), they are returned
+            as-is.
+
+    Returns ``None`` if the file does not exist (caller falls back to
+    stratified random split).
+    """
+    from graphslm_ids.utils.io import read_json
+
+    if not splits_json_path.exists():
+        return None
+    payload = read_json(splits_json_path)
+    if not isinstance(payload, dict):
+        return None
+    protocol_block = payload.get(protocol)
+    if not isinstance(protocol_block, dict):
+        raise ValueError(
+            f"splits.json at {splits_json_path} has no '{protocol}' block. "
+            f"Available keys: {sorted(payload.keys())}."
+        )
+    try:
+        raw_train = protocol_block["train"]
+        raw_val = protocol_block["val"]
+        raw_test = protocol_block["test"]
+    except KeyError as exc:
+        raise ValueError(
+            f"splits.json '{protocol}' block missing required key {exc!s}."
+        ) from exc
+
+    # Detect string vs int format. v3/split.py emits strings; an external tool
+    # may pre-convert to ints — handle both.
+    def _looks_like_strings(arr: list) -> bool:
+        return len(arr) > 0 and isinstance(arr[0], str)
+
+    if _looks_like_strings(raw_train) or _looks_like_strings(raw_val) or _looks_like_strings(raw_test):
+        if flow_id_order is None:
+            raise ValueError(
+                f"splits.json at {splits_json_path} contains STRING flow IDs but "
+                f"no flow_id_order mapping was provided. Pass the artifact's "
+                f"metadata['flow_id_order'] to _load_v3_splits_json."
+            )
+        id_to_idx = {fid: i for i, fid in enumerate(flow_id_order)}
+        def _to_idx(arr: list) -> np.ndarray:
+            mapped = [id_to_idx[str(x)] for x in arr if str(x) in id_to_idx]
+            return np.asarray(mapped, dtype=np.int64)
+        return _to_idx(raw_train), _to_idx(raw_val), _to_idx(raw_test)
+
+    # Integer format: cast directly.
+    return (
+        np.asarray(raw_train, dtype=np.int64),
+        np.asarray(raw_val, dtype=np.int64),
+        np.asarray(raw_test, dtype=np.int64),
+    )
+
+
 def backend_splits(
     backend: NeighborBackend,
     labels: np.ndarray,
     config: dict[str, Any],
     seed: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    # v3 priority path — if artifact_version is v3 and a splits.json path is
+    # configured, load the protocol-specific (random | temporal) split first.
+    # Falling through to the legacy backend/stratified path keeps v1/v2 callers
+    # behaviour unchanged.
+    if str(config["data"].get("artifact_version", "")).lower() == "v3":
+        splits_path_str = config["data"].get("splits_json")
+        if splits_path_str:
+            protocol = str(config["data"].get("split_protocol", "random")).lower()
+            if protocol not in {"random", "temporal"}:
+                raise ValueError(
+                    f"data.split_protocol must be 'random' or 'temporal', got {protocol!r}."
+                )
+            # Pull flow_id_order from backend manifest if present — splits.json
+            # stores STRING flow IDs from v3/split.py, so we need the artifact's
+            # canonical flow ordering to map them to integer node indices.
+            manifest = getattr(backend, "manifest", None) or {}
+            flow_id_order = manifest.get("flow_id_order") if isinstance(manifest, dict) else None
+            loaded = _load_v3_splits_json(
+                Path(splits_path_str), protocol, flow_id_order=flow_id_order,
+            )
+            if loaded is not None:
+                return loaded
+
     split_ids = getattr(backend, "split_ids", None)
     if callable(split_ids):
         train = split_ids("train")
@@ -754,6 +978,172 @@ def _compute_train_loss(
     )
 
 
+def load_class_technique_map(
+    csv_path: Path,
+    label_mapping: dict[str, int],
+    num_techniques: int,
+    technique_id_to_idx: dict[str, int],
+) -> dict[int, list[tuple[int, float]]]:
+    """Read ``class_technique_map.csv`` -> ``{class_idx: [(tech_idx, weight)]}``.
+
+    The CSV is expected to have columns ``class,technique,weight,note`` (the
+    ``note`` column is informational and ignored here). Rows whose ``class``
+    is not in ``label_mapping`` or whose ``technique`` is not in
+    ``technique_id_to_idx`` are silently skipped — the file is hand-edited and
+    may carry techniques pruned out of the current graph build.
+
+    Empty ``technique`` cells (e.g. ``Benign`` rows) are skipped without error.
+    """
+    import csv
+
+    mapping: dict[int, list[tuple[int, float]]] = {}
+    if not csv_path.exists():
+        return mapping
+    with csv_path.open("r", encoding="utf-8", newline="") as fh:
+        reader = csv.DictReader(fh)
+        for row in reader:
+            class_name = (row.get("class") or "").strip()
+            tech_id = (row.get("technique") or "").strip()
+            if not class_name or not tech_id:
+                continue
+            if class_name not in label_mapping:
+                continue
+            if tech_id not in technique_id_to_idx:
+                continue
+            tech_idx = int(technique_id_to_idx[tech_id])
+            if tech_idx < 0 or tech_idx >= num_techniques:
+                continue
+            try:
+                weight = float(row.get("weight") or 1.0)
+            except ValueError:
+                weight = 1.0
+            class_idx = int(label_mapping[class_name])
+            mapping.setdefault(class_idx, []).append((tech_idx, weight))
+    return mapping
+
+
+def gcl_auxiliary_loss(
+    node_embeddings: dict[str, torch.Tensor],
+    seed_packet_ids: torch.Tensor,
+    seed_packet_flow_label_idx: torch.Tensor,
+    class_to_technique_idx: dict[int, list[tuple[int, float]]],
+    num_techniques: int,
+    temperature: float = 0.1,
+    n_negatives: int = 16,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    """InfoNCE auxiliary loss pulling packet embeddings toward their flow-class
+    MITRE technique embeddings (v3 Smart-BOTH Hybrid contribution).
+
+    For each packet in the batch:
+      * **Positive set**: technique indices mapped from the packet's *flow's*
+        class label via ``class_to_technique_idx`` (built from
+        ``data/mitre/class_technique_map.csv``).
+      * **Negative set**: ``n_negatives`` techniques sampled uniformly at random
+        from indices NOT in the positive set.
+
+    Loss is mean over packets of
+    ``-log(sum exp(sim+) / (sum exp(sim+) + sum exp(sim-)))`` where
+    ``sim = cos(packet_emb, tech_emb) / temperature``.
+
+    Returns a scalar tensor. Safe no-op (returns ``0.0`` with grad) if no packet
+    in the batch has any mapped positive technique — keeps the total-loss
+    pathway differentiable even on degenerate batches.
+
+    Args:
+      node_embeddings: dict produced by ``HeteroGraphTransformer.encode(...)``;
+        must contain keys ``packet`` of shape ``(N_pkt_sub, H)`` and
+        ``technique`` of shape ``(N_tech_sub, H)``.
+      seed_packet_ids: 1-D int64 tensor of *local* packet indices into
+        ``node_embeddings['packet']`` that are anchors (typically all packets
+        belonging to seed flows in the subgraph).
+      seed_packet_flow_label_idx: 1-D int64 tensor (same length as
+        ``seed_packet_ids``) giving the class index of each anchor's flow.
+      class_to_technique_idx: ``class_idx -> [(tech_local_idx, weight)]`` where
+        ``tech_local_idx`` indexes into ``node_embeddings['technique']``.
+      num_techniques: total technique count in the subgraph (= length of
+        ``node_embeddings['technique']``).
+      temperature: InfoNCE softmax temperature.
+      n_negatives: number of negative techniques sampled per anchor.
+      device: optional override for tensor placement.
+    """
+    if device is None:
+        device = node_embeddings["packet"].device
+
+    packet_emb = node_embeddings["packet"]
+    tech_emb = node_embeddings.get("technique")
+    if tech_emb is None or tech_emb.numel() == 0 or num_techniques <= 1:
+        return torch.zeros((), device=device, requires_grad=False)
+    if seed_packet_ids.numel() == 0:
+        return torch.zeros((), device=device, requires_grad=False)
+
+    # Cosine similarity in a temperature-scaled embedding space — same form as
+    # SimCLR / CLIP. L2-norm is on the last dim only; packet_emb / tech_emb are
+    # (N, H) so this gives unit-norm vectors row-wise.
+    pkt_n = F.normalize(packet_emb[seed_packet_ids].float(), dim=-1)
+    tech_n = F.normalize(tech_emb.float(), dim=-1)
+    # (n_anchor, num_techniques) cosine matrix; scaled by 1/temperature so the
+    # softmax in InfoNCE actually concentrates probability mass.
+    sim = (pkt_n @ tech_n.T) / max(temperature, 1e-8)
+
+    # Build positive mask per anchor from the class->technique map. Only anchors
+    # whose class has at least one mapped technique contribute; the rest are
+    # masked out before the reduction.
+    n_anchor = seed_packet_ids.shape[0]
+    pos_mask = torch.zeros((n_anchor, num_techniques), dtype=torch.bool, device=device)
+    has_positive = torch.zeros((n_anchor,), dtype=torch.bool, device=device)
+    # CPU loop over the batch is acceptable here: n_anchor is at most a few
+    # thousand and the body is pure indexing (no autograd-tracked ops).
+    flow_labels_cpu = seed_packet_flow_label_idx.detach().to("cpu").tolist()
+    for i, class_idx in enumerate(flow_labels_cpu):
+        techs = class_to_technique_idx.get(int(class_idx))
+        if not techs:
+            continue
+        idxs = [t for t, _w in techs if 0 <= t < num_techniques]
+        if not idxs:
+            continue
+        pos_mask[i, idxs] = True
+        has_positive[i] = True
+
+    if not bool(has_positive.any().item()):
+        return torch.zeros((), device=device, requires_grad=False)
+
+    # Negative sampling: per anchor draw n_negatives indices uniformly from the
+    # ~num_techniques pool, then mask out positives. The handful that collide
+    # with positives are dropped by the boolean mask — n_negatives is an upper
+    # bound, not an exact count, which is the standard InfoNCE relaxation.
+    n_neg = min(int(n_negatives), int(num_techniques))
+    rand_neg = torch.randint(
+        low=0, high=int(num_techniques), size=(n_anchor, n_neg), device=device
+    )
+    # neg_mask[i, j] starts True for sampled indices, then we OR with pos_mask
+    # to detect collisions and flip those off so they don't pollute the
+    # denominator.
+    neg_mask = torch.zeros((n_anchor, num_techniques), dtype=torch.bool, device=device)
+    neg_mask.scatter_(1, rand_neg, True)
+    neg_mask = neg_mask & (~pos_mask)
+
+    # InfoNCE numerator = logsumexp(sim over positives); denominator includes
+    # both positives and negatives. log(num/den) = log(num) - log(num+neg_sum).
+    very_negative = torch.full_like(sim, fill_value=-1.0e30)
+    pos_sim = torch.where(pos_mask, sim, very_negative)
+    neg_sim = torch.where(neg_mask, sim, very_negative)
+
+    pos_lse = torch.logsumexp(pos_sim, dim=1)  # (n_anchor,)
+    # logsumexp over (positives ∪ negatives) — concatenation avoids constructing
+    # a giant intermediate union mask.
+    all_sim = torch.cat([pos_sim, neg_sim], dim=1)
+    all_lse = torch.logsumexp(all_sim, dim=1)
+    per_anchor_loss = -(pos_lse - all_lse)
+
+    # Drop anchors with no positives — their per_anchor_loss is degenerate
+    # (logsumexp(-inf) = -inf). has_positive mask handles this cleanly.
+    valid = per_anchor_loss[has_positive]
+    if valid.numel() == 0:
+        return torch.zeros((), device=device, requires_grad=False)
+    return valid.mean()
+
+
 def _drop_edges(
     edge_index: dict[tuple[str, str, str], torch.Tensor],
     edge_weight: dict[tuple[str, str, str], torch.Tensor] | None,
@@ -890,6 +1280,7 @@ def to_torch_batch(
     use_semantic_edge_weights: bool,
     *,
     non_blocking: bool = True,
+    packet_store: "TieredFeatureStore | None" = None,
 ) -> tuple[
     dict[str, torch.Tensor],
     dict[tuple[str, str, str], torch.Tensor],
@@ -901,6 +1292,10 @@ def to_torch_batch(
         key: _to_device(value, device, non_blocking)
         for key, value in batch.node_features.items()
     }
+    if packet_store is not None:
+        pkt_ids = batch.local_to_global.get("packet")
+        if pkt_ids is not None:
+            node_tensors["packet"] = packet_store.gather(np.asarray(pkt_ids))
     edge_tensors: dict[tuple[str, str, str], torch.Tensor] = {}
     for edge_type in edge_types:
         value = batch.edge_index.get(edge_type)
@@ -1152,6 +1547,7 @@ def evaluate_neighbor_sampling(
     is_ddp: bool = False,
     logit_adjustment: torch.Tensor | None = None,
     tau_norm_divisor: torch.Tensor | None = None,
+    packet_store: "TieredFeatureStore | None" = None,
 ) -> dict[str, Any]:
     """Two paths:
       1. DDP (``is_ddp=True``): each rank evaluates its DistributedSampler shard,
@@ -1190,6 +1586,7 @@ def evaluate_neighbor_sampling(
             for i, batch in enumerate(loader, start=1):
                 node_features, edge_index, edge_weight, seed_mask, seed_labels = to_torch_batch(
                     batch, edge_types, device, use_semantic_edge_weights,
+                    packet_store=packet_store,
                 )
                 with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
                     logits = model(node_features, edge_index, edge_weight_dict=edge_weight)
@@ -1249,6 +1646,7 @@ def evaluate_neighbor_sampling(
                     edge_types,
                     device,
                     use_semantic_edge_weights,
+                    packet_store=packet_store,
                 )
                 with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
                     logits = model(node_features, edge_index, edge_weight_dict=edge_weight)
@@ -1385,17 +1783,41 @@ def train_neighbor_sampling(
     # Per-rank RNG seed so ranks don't all pick identical neighbour subsamples
     # (each rank already sees a different flow shard via DistributedSampler, but
     # diverging samplers help hide any residual correlation in random keys).
-    sampler = HeteroNeighborSampler(
-        backend,
-        hops=int(sampler_hops),
-        fanouts=dict(sampler_cfg.get("fanouts") or {}),
-        reverse_fanouts=dict(sampler_cfg.get("reverse_fanouts") or {}),
-        always_include_all_tactics=bool(sampler_cfg.get("always_include_all_tactics", True)),
-        always_include_all_techniques=bool(sampler_cfg.get("always_include_all_techniques", True)),
-        flow_feature_stats=flow_feature_stats,
-        standardize_flow_features=bool(config["data"]["standardize_flow_features"]),
-        seed=seed + rank,
+    gpu_sampling = maybe_build_gpu_sampling(
+        config, backend, device, flow_feature_stats=flow_feature_stats
     )
+    if gpu_sampling is not None:
+        # GPU-side sampler holds CSR on device and returns torch tensors. CUDA
+        # contexts cannot fork into DataLoader workers, and pin_memory() would
+        # mishandle the returned torch tensors — force single-process / unpinned
+        # loaders. feature_store.enabled is required (validated in the helper)
+        # because the torch sampler always defers packet features.
+        _gpu_backend, sampler = gpu_sampling
+        dl_cfg = config.setdefault("dataloader", {})
+        forced = {"num_workers": 0, "pin_memory": False, "persistent_workers": False}
+        overrides = {
+            k: (dl_cfg.get(k), v) for k, v in forced.items() if dl_cfg.get(k) != v
+        }
+        if overrides:
+            _LOG.warning(
+                "gpu_sampling.enabled=True: overriding dataloader settings %s",
+                {k: f"{orig!r} -> {new!r}" for k, (orig, new) in overrides.items()},
+            )
+        dl_cfg.update(forced)
+    else:
+        sampler = HeteroNeighborSampler(
+            backend,
+            hops=int(sampler_hops),
+            fanouts=dict(sampler_cfg.get("fanouts") or {}),
+            reverse_fanouts=dict(sampler_cfg.get("reverse_fanouts") or {}),
+            always_include_all_tactics=bool(sampler_cfg.get("always_include_all_tactics", True)),
+            always_include_all_techniques=bool(sampler_cfg.get("always_include_all_techniques", True)),
+            flow_feature_stats=flow_feature_stats,
+            standardize_flow_features=bool(config["data"]["standardize_flow_features"]),
+            seed=seed + rank,
+            defer_packet_features=bool(config.get("feature_store", {}).get("enabled", False)),
+        )
+    packet_store = build_packet_store(config, backend, sampler, train_idx_np, device)
     train_labels_np = labels_np[train_idx_np]
     train_loader, train_dist_sampler = make_neighbor_loader(
         train_idx_np, sampler, config, shuffle=True,
@@ -1413,11 +1835,14 @@ def train_neighbor_sampling(
 
     edge_types = list(backend.edge_types)
 
-    node_input_dims = {
-        "flow": int(backend.feature_dims["flow"]),
-        "packet": int(backend.feature_dims["packet"]),
-        "technique": int(backend.feature_dims["technique"]),
-    }
+    # Auto-derive node_input_dims from whatever the backend exposes. v2 backend
+    # → {flow, packet, technique}; v3 backend adds ``host``. ``tactic`` is
+    # intentionally NOT in feature_dims (id-only embedding inside HGT).
+    node_input_dims = {nt: int(d) for nt, d in backend.feature_dims.items()}
+    # node_types passed to HGT mirrors backend dims + the implicit tactic node.
+    # Order matters only for layer construction (deterministic param naming);
+    # the rest of the model keys by string.
+    derived_node_types = list(node_input_dims.keys()) + ["tactic"]
     raw_model = HeteroGraphTransformer(
         node_input_dims=node_input_dims,
         edge_types=edge_types,
@@ -1429,6 +1854,7 @@ def train_neighbor_sampling(
         dropout=float(config["model"]["dropout"]),
         ffn_multiplier=int(config["model"]["ffn_multiplier"]),
         activation_checkpointing=bool(config["train"].get("activation_checkpointing", False)),
+        node_types=derived_node_types,
     ).to(device)
 
     # Compile the plain module FIRST, then wrap with DDP — this is the order
@@ -1473,31 +1899,7 @@ def train_neighbor_sampling(
         betas=tuple(config["train"].get("adamw_betas", (0.9, 0.95))),
         fused=(device.type == "cuda"),
     )
-    sam_enabled = bool(config["train"].get("sam_enabled", False))
-    sam_rho = float(config["train"].get("sam_rho", 0.05))
-    if sam_enabled and is_ddp:
-        if rank == 0:
-            print("[SAM] DDP + SAM unsupported — disabling SAM, using AdamW.", flush=True)
-        sam_enabled = False
-    if sam_enabled and grad_accum_steps > 1:
-        if rank == 0:
-            print(
-                f"[SAM] grad_accum_steps={grad_accum_steps} > 1 is incompatible — disabling SAM.",
-                flush=True,
-            )
-        sam_enabled = False
-    if sam_enabled:
-        from graphslm_ids.offline.training.sam_optimizer import SAM
-        optimizer = SAM(
-            model.parameters(),
-            base_optimizer=torch.optim.AdamW,
-            rho=sam_rho,
-            **_adamw_kwargs,
-        )
-        if rank == 0:
-            print(f"[optimizer] SAM(AdamW) rho={sam_rho}", flush=True)
-    else:
-        optimizer = torch.optim.AdamW(model.parameters(), **_adamw_kwargs)
+    optimizer = torch.optim.AdamW(model.parameters(), **_adamw_kwargs)
     grad_clip_norm = float(config["train"].get("grad_clip_norm", 0.0))
 
     _scheduler_type = str(config["train"].get("scheduler", "onecycle")).lower()
@@ -1587,6 +1989,53 @@ def train_neighbor_sampling(
             flush=True,
         )
 
+    # --- GCL (Graph Contrastive Loss) auxiliary supervision (v3 only) ---
+    # InfoNCE-style auxiliary loss that pulls each packet's HGT embedding toward
+    # the technique-embedding of the MITRE techniques mapped from its flow's
+    # class label. Provides extra supervision via the class -> technique map
+    # without adding any learned encoder. Gated entirely behind gcl_enabled.
+    gcl_enabled = bool(config["train"].get("gcl_enabled", False))
+    gcl_weight = float(config["train"].get("gcl_weight", 0.2))
+    gcl_temperature = float(config["train"].get("gcl_temperature", 0.1))
+    gcl_n_negatives = int(config["train"].get("gcl_n_negatives", 16))
+    class_to_technique_idx: dict[int, list[tuple[int, float]]] = {}
+    if gcl_enabled:
+        # Class name -> int idx (encoded into the artifact's label_mapping at
+        # build time). Technique id (e.g. 'T1190') -> int idx is recorded in
+        # metadata['technique_id_to_idx']. Both come from the artifact, so the
+        # mapping CSV is consistent with the indices the HGT sees.
+        _manifest = backend.manifest or {}
+        _label_mapping = _manifest.get("label_mapping") or {}
+        _technique_id_to_idx = _manifest.get("technique_id_to_idx") or {}
+        _ctm_path = Path(
+            config["train"].get("class_technique_map_csv", "data/mitre/class_technique_map.csv")
+        )
+        if not _ctm_path.exists() and rank == 0:
+            print(
+                f"[gcl] WARN class_technique_map.csv not found at {_ctm_path} — "
+                f"GCL will be a no-op every batch.",
+                flush=True,
+            )
+        # Use the manifest's num_techniques (full graph count) for validation of
+        # technique idx ranges. The per-batch aux loss uses the subgraph's local
+        # technique count instead — that's recomputed inside the training step.
+        _num_techniques_full = int(_manifest.get("num_techniques", 0))
+        class_to_technique_idx = load_class_technique_map(
+            csv_path=_ctm_path,
+            label_mapping={str(k): int(v) for k, v in _label_mapping.items()},
+            num_techniques=_num_techniques_full,
+            technique_id_to_idx={str(k): int(v) for k, v in _technique_id_to_idx.items()},
+        )
+        if rank == 0:
+            n_classes_with_pos = len(class_to_technique_idx)
+            n_pairs = sum(len(v) for v in class_to_technique_idx.values())
+            print(
+                f"[gcl] enabled — weight={gcl_weight} temperature={gcl_temperature} "
+                f"n_negatives={gcl_n_negatives} "
+                f"classes_with_positives={n_classes_with_pos} pairs={n_pairs}",
+                flush=True,
+            )
+
     # Logit Adjustment (Menon et al. ICLR 2021): subtract τ·log(prior) from eval
     # logits to debias inference toward rare classes. τ=1.0 paper default. Set 0
     # to disable.
@@ -1620,27 +2069,6 @@ def train_neighbor_sampling(
     if rank == 0 and drop_edge_prob > 0.0:
         print(f"[drop_edge] prob={drop_edge_prob}", flush=True)
 
-    # HGAA Phase 2 — Adaptive heterogeneous-graph augmentation. Gated entirely
-    # by ``train.hgaa.enabled`` in config; when off the factory returns None
-    # and the per-batch hook below is a no-op. Dataset-portable: tail classes
-    # are auto-detected from the train labels (no hardcoded class IDs per
-    # spec §1.5 DC-2).
-    from graphslm_ids.offline.training.hgaa_augmentation import (
-        build_hgaa_pipeline_from_config,
-    )
-    hgaa_train_labels_for_detect = backend.get_flow_labels(
-        np.asarray(train_idx_np, dtype=np.int64)
-    )
-    # Build on all ranks — each rank's dataloader produces its own batches, so
-    # each rank applies its own augmentation independently (seed offset by rank
-    # to avoid identical RNG sequences across ranks).
-    hgaa_pipeline = build_hgaa_pipeline_from_config(
-        config=config,
-        train_labels=hgaa_train_labels_for_detect,
-        num_classes=num_classes,
-        seed=int(config["train"].get("seed", 42)) + rank,
-    )
-    del hgaa_train_labels_for_detect  # free memory; not needed beyond detect
 
     skip_val_first_epoch = bool(config["train"].get("skip_val_first_epoch", False))
     # Run full-split validation only every K epochs (always on the final epoch).
@@ -1659,6 +2087,21 @@ def train_neighbor_sampling(
     ema = EMA(raw_model, decay=ema_decay) if ema_enabled else None
     if rank == 0 and ema_enabled:
         print(f"[ema] enabled — decay={ema_decay} (shadow tracks ~{int(1/(1-ema_decay))} steps)", flush=True)
+
+    # HGAA — Adaptive heterogeneous-graph augmentation (Zhao et al. Symmetry 2025).
+    # Gated by train.hgaa.enabled; when off, factory returns None → per-batch hook
+    # is a no-op. Tail classes auto-detected from train labels (no hardcoded IDs).
+    from graphslm_ids.offline.training.hgaa_augmentation import (
+        build_hgaa_pipeline_from_config,
+    )
+    _hgaa_train_labels = backend.get_flow_labels(np.asarray(train_idx_np, dtype=np.int64))
+    hgaa_pipeline = build_hgaa_pipeline_from_config(
+        config=config,
+        train_labels=_hgaa_train_labels,
+        num_classes=num_classes,
+        seed=int(config["train"].get("seed", 42)) + rank,
+    )
+    del _hgaa_train_labels
 
     output_dir = ensure_dir(Path(config["train"]["output_dir"])) if rank == 0 else Path(config["train"]["output_dir"])
     best_checkpoint = output_dir / "hgt_flow_best.pt"
@@ -1752,16 +2195,14 @@ def train_neighbor_sampling(
                 raw_batch = next(train_iter)
             except StopIteration:
                 break
-            # HGAA hook — may return raw_batch unchanged when disabled or when
-            # the probabilistic gate didn't fire. Failure inside the pipeline is
-            # logged and falls back to raw_batch so an augmentation bug cannot
-            # abort training.
+            # HGAA hook — no-op when hgaa_pipeline is None (disabled in config).
             if hgaa_pipeline is not None:
                 raw_batch = hgaa_pipeline.maybe_augment(raw_batch)
             batch = raw_batch
 
             nf, ei, ew, sm, sl = to_torch_batch(
                 batch, edge_types, device, use_semantic_edge_weights,
+                packet_store=packet_store,
             )
             # In DDP, suppress the all-reduce on mid-accumulation backwards.
             # The trailing backward (or the only backward when accum=1) still
@@ -1774,14 +2215,107 @@ def train_neighbor_sampling(
             if drop_edge_prob > 0.0:
                 ei, ew = _drop_edges(ei, ew, drop_edge_prob)
             with sync_ctx, torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
-                logits = model(nf, ei, edge_weight_dict=ew)
+                if gcl_enabled:
+                    # Two-step path: call encode() to capture per-node-type
+                    # embeddings, then run the classifier head manually. This is
+                    # functionally identical to model(nf, ei, ...) but gives us
+                    # the packet embeddings needed for the InfoNCE aux loss.
+                    # raw_model is the un-wrapped HeteroGraphTransformer; under
+                    # DDP/compile the wrappers still share parameter storage so
+                    # gradients flow correctly.
+                    _encode_module = raw_model
+                    x_dict = _encode_module.encode(nf, ei, edge_weight_dict=ew)
+                    logits = _encode_module.classifier(x_dict["flow"])
+                else:
+                    logits = model(nf, ei, edge_weight_dict=ew)
+                    x_dict = None
                 seed_logits = logits[sm].float()
-                loss = _compute_train_loss(
+                primary_loss = _compute_train_loss(
                     seed_logits, sl, weight,
                     loss_type=loss_type,
                     label_smoothing=label_smoothing,
                     focal_gamma=focal_gamma,
                 )
+                aux_loss_val_for_log = 0.0
+                if gcl_enabled and x_dict is not None and class_to_technique_idx:
+                    # Map each packet in the subgraph to its parent flow's class.
+                    # The flow->contains->packet edge_index gives this directly:
+                    # edge_index[0] = local flow id, edge_index[1] = local pkt id.
+                    # Then look up the flow's seed-side label by indexing into
+                    # the per-flow label tensor. Flows that are not seeds (sampled
+                    # only as neighbours) have no ground-truth label here, so we
+                    # restrict GCL to packets whose parent flow is in the seed
+                    # mask — matches the spec (anchor = seed packets).
+                    contains_key = ("flow", "contains", "packet")
+                    contains_ei = ei.get(contains_key)
+                    if contains_ei is not None and contains_ei.numel() > 0:
+                        flow_local = contains_ei[0]
+                        pkt_local = contains_ei[1]
+                        # Keep only edges whose flow is in seed_mask (sm).
+                        keep = sm[flow_local]
+                        if bool(keep.any().item()):
+                            kept_flow_local = flow_local[keep]
+                            kept_pkt_local = pkt_local[keep]
+                            # sl is per-seed (compact, indexed by the sm bool's
+                            # cumsum). Build a flow_local -> seed_label tensor by
+                            # scattering sl into a dense vector of length num_flow.
+                            num_flow_local = int(nf["flow"].shape[0])
+                            seed_flow_local = torch.nonzero(sm, as_tuple=False).reshape(-1)
+                            flow_label_dense = torch.full(
+                                (num_flow_local,), fill_value=-1,
+                                dtype=torch.long, device=device,
+                            )
+                            flow_label_dense[seed_flow_local] = sl
+                            pkt_class = flow_label_dense[kept_flow_local]
+                            valid_pkt = pkt_class >= 0
+                            if bool(valid_pkt.any().item()):
+                                anchor_pkt = kept_pkt_local[valid_pkt]
+                                anchor_cls = pkt_class[valid_pkt]
+                                num_tech_local = int(x_dict["technique"].shape[0])
+                                # Global technique idx (from CSV) -> local idx
+                                # in this subgraph. always_include_all_techniques
+                                # guarantees a complete set is present but the
+                                # local ordering is sampler-defined.
+                                tech_g2l: dict[int, int] = {}
+                                _tech_lg = batch.local_to_global.get("technique")
+                                if _tech_lg is not None:
+                                    for _li, _gi in enumerate(_tech_lg.tolist()):
+                                        tech_g2l[int(_gi)] = int(_li)
+                                local_ctm: dict[int, list[tuple[int, float]]] = {}
+                                for _cls_idx, _pairs in class_to_technique_idx.items():
+                                    _remapped = [
+                                        (tech_g2l[int(t_g)], float(w))
+                                        for (t_g, w) in _pairs
+                                        if int(t_g) in tech_g2l
+                                    ]
+                                    if _remapped:
+                                        local_ctm[int(_cls_idx)] = _remapped
+                                if local_ctm:
+                                    aux_loss = gcl_auxiliary_loss(
+                                        node_embeddings={
+                                            "packet": x_dict["packet"],
+                                            "technique": x_dict["technique"],
+                                        },
+                                        seed_packet_ids=anchor_pkt,
+                                        seed_packet_flow_label_idx=anchor_cls,
+                                        class_to_technique_idx=local_ctm,
+                                        num_techniques=num_tech_local,
+                                        temperature=gcl_temperature,
+                                        n_negatives=gcl_n_negatives,
+                                        device=device,
+                                    )
+                                    aux_loss_val_for_log = float(aux_loss.detach().item())
+                                    loss = primary_loss + gcl_weight * aux_loss
+                                else:
+                                    loss = primary_loss
+                            else:
+                                loss = primary_loss
+                        else:
+                            loss = primary_loss
+                    else:
+                        loss = primary_loss
+                else:
+                    loss = primary_loss
             batch_count = int(sl.numel())
             _loss_ok = bool(torch.isfinite(loss).item())
             if _loss_ok:
@@ -1813,134 +2347,74 @@ def train_neighbor_sampling(
 
             pending_step = True
             if (step + 1) % grad_accum_steps == 0:
-                if sam_enabled and _loss_ok:
-                    # --- SAM two-step update ---
-                    # Step 1: clip gradient, perturb weights toward sharpness direction.
-                    scaler.unscale_(optimizer)
-                    if grad_clip_norm > 0.0:
-                        total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
-                        _bad_grads = not total_norm.isfinite()
-                    else:
-                        _bad_grads = False
-                        total_norm = torch.tensor(0.0)
-                    if _bad_grads:
-                        optimizer.zero_grad(set_to_none=True)
-                        skipped_steps += 1
-                        if rank == 0 and skipped_steps <= 5:
-                            print(
-                                f"[warn][SAM] first step skipped — non-finite grad norm "
-                                f"(total_norm={float(total_norm):.3e}) at epoch {epoch} batch {step+1}.",
-                                flush=True,
-                            )
-                    else:
-                        optimizer.first_step(zero_grad=True)
-                        # Step 2: second forward at perturbed weights (same batch).
-                        with _nullcontext(), torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
-                            _logits_sam = model(nf, ei, edge_weight_dict=ew)
-                            _seed_logits_sam = _logits_sam[sm].float()
-                            _loss_sam = _compute_train_loss(
-                                _seed_logits_sam, sl, weight,
-                                loss_type=loss_type,
-                                label_smoothing=label_smoothing,
-                                focal_gamma=focal_gamma,
-                            )
-                        if torch.isfinite(_loss_sam):
-                            _loss_sam.backward()
-                            if grad_clip_norm > 0.0:
-                                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
-                            optimizer.second_step(zero_grad=True)
-                            optimizer_steps += 1
-                            if scheduler is not None:
-                                scheduler.step()
-                            if ema is not None:
-                                ema.update(raw_model)
-                            if epoch == 1 and optimizer_steps == 1 and rank == 0:
-                                _cur_lr = optimizer.param_groups[0]["lr"]
-                                print(
-                                    f"[diag] first optimizer step (SAM) | grad_norm={float(total_norm):.4e} "
-                                    f"lr={_cur_lr:.3e}",
-                                    flush=True,
-                                )
-                        else:
-                            # Perturbed loss non-finite: restore weights, skip update.
-                            optimizer.restore_weights()
-                            skipped_steps += 1
-                            if rank == 0 and skipped_steps <= 5:
-                                print(
-                                    f"[warn][SAM] second step skipped — non-finite perturbed loss "
-                                    f"at epoch {epoch} batch {step+1}.",
-                                    flush=True,
-                                )
+                scaler.unscale_(optimizer)
+                if grad_clip_norm > 0.0:
+                    # clip_grad_norm_ returns total_norm as a scalar tensor.
+                    # When any grad is inf: total_norm=inf → clip_coef=0 → inf*0=NaN.
+                    # Checking total_norm.isfinite() after the call is O(1) and catches
+                    # this before the NaN gradients can be applied to weights.
+                    total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                    _bad_grads = not total_norm.isfinite()
                 else:
-                    # Standard AdamW path (also used when sam_enabled but _loss_ok=False).
-                    scaler.unscale_(optimizer)
-                    if grad_clip_norm > 0.0:
-                        # clip_grad_norm_ returns total_norm as a scalar tensor.
-                        # When any grad is inf: total_norm=inf → clip_coef=0 → inf*0=NaN.
-                        # Checking total_norm.isfinite() after the call is O(1) and catches
-                        # this before the NaN gradients can be applied to weights.
-                        total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
-                        _bad_grads = not total_norm.isfinite()
-                    else:
-                        _bad_grads = False
-                    if _bad_grads:
-                        # Discard NaN/inf gradients before step to avoid weight corruption.
-                        optimizer.zero_grad(set_to_none=True)
-                        scaler.update()
+                    _bad_grads = False
+                if _bad_grads:
+                    # Discard NaN/inf gradients before step to avoid weight corruption.
+                    optimizer.zero_grad(set_to_none=True)
+                    scaler.update()
+                    skipped_steps += 1
+                    # Loud warning: a silently-skipped step is invisible, and if EVERY
+                    # step skips the model never learns (loss frozen at ln(num_classes)).
+                    if rank == 0 and skipped_steps <= 5:
+                        print(
+                            f"[warn] optimizer step skipped — non-finite grad norm "
+                            f"(total_norm={float(total_norm):.3e}) at epoch {epoch} batch {step+1}. "
+                            f"Persistent skips freeze training; run in FP32 (amp: false) if this repeats.",
+                            flush=True,
+                        )
+                else:
+                    _scale_before = scaler.get_scale()
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
+                    if scaler.get_scale() < _scale_before:
+                        # scaler halved → step was skipped due to inf/NaN gradients
                         skipped_steps += 1
-                        # Loud warning: a silently-skipped step is invisible, and if EVERY
-                        # step skips the model never learns (loss frozen at ln(num_classes)).
                         if rank == 0 and skipped_steps <= 5:
                             print(
-                                f"[warn] optimizer step skipped — non-finite grad norm "
-                                f"(total_norm={float(total_norm):.3e}) at epoch {epoch} batch {step+1}. "
-                                f"Persistent skips freeze training; run in FP32 (amp: false) if this repeats.",
+                                f"[AMP] step skipped (inf/NaN grad) at batch {step+1}, "
+                                f"scale {_scale_before:.0f}→{scaler.get_scale():.0f}",
                                 flush=True,
                             )
                     else:
-                        _scale_before = scaler.get_scale()
-                        scaler.step(optimizer)
-                        scaler.update()
-                        optimizer.zero_grad(set_to_none=True)
-                        if scaler.get_scale() < _scale_before:
-                            # scaler halved → step was skipped due to inf/NaN gradients
-                            skipped_steps += 1
-                            if rank == 0 and skipped_steps <= 5:
-                                print(
-                                    f"[AMP] step skipped (inf/NaN grad) at batch {step+1}, "
-                                    f"scale {_scale_before:.0f}→{scaler.get_scale():.0f}",
-                                    flush=True,
-                                )
-                        else:
-                            optimizer_steps += 1
-                            if scheduler is not None:
-                                scheduler.step()
-                            if ema is not None:
-                                ema.update(raw_model)
-                            # First-step learning-signal probe: a healthy run shows a
-                            # non-trivial gradient norm here. A norm of ~0 means the
-                            # backward graph is detached / weights will never move —
-                            # the fingerprint of a frozen-loss run.
-                            if epoch == 1 and optimizer_steps == 1 and rank == 0:
-                                _gn = (
-                                    float(total_norm) if grad_clip_norm > 0.0
-                                    else float(
-                                        torch.norm(
-                                            torch.stack([
-                                                p.grad.detach().norm()
-                                                for p in model.parameters()
-                                                if p.grad is not None
-                                            ])
-                                        )
-                                    ) if any(p.grad is not None for p in model.parameters())
-                                    else 0.0
-                                )
-                                _cur_lr = optimizer.param_groups[0]["lr"]
-                                print(
-                                    f"[diag] first optimizer step | grad_norm={_gn:.4e} "
-                                    f"lr={_cur_lr:.3e}",
-                                    flush=True,
-                                )
+                        optimizer_steps += 1
+                        if scheduler is not None:
+                            scheduler.step()
+                        if ema is not None:
+                            ema.update(raw_model)
+                        # First-step learning-signal probe: a healthy run shows a
+                        # non-trivial gradient norm here. A norm of ~0 means the
+                        # backward graph is detached / weights will never move —
+                        # the fingerprint of a frozen-loss run.
+                        if epoch == 1 and optimizer_steps == 1 and rank == 0:
+                            _gn = (
+                                float(total_norm) if grad_clip_norm > 0.0
+                                else float(
+                                    torch.norm(
+                                        torch.stack([
+                                            p.grad.detach().norm()
+                                            for p in model.parameters()
+                                            if p.grad is not None
+                                        ])
+                                    )
+                                ) if any(p.grad is not None for p in model.parameters())
+                                else 0.0
+                            )
+                            _cur_lr = optimizer.param_groups[0]["lr"]
+                            print(
+                                f"[diag] first optimizer step | grad_norm={_gn:.4e} "
+                                f"lr={_cur_lr:.3e}",
+                                flush=True,
+                            )
                 pending_step = False
             step += 1
             batches_seen += 1
@@ -2055,6 +2529,7 @@ def train_neighbor_sampling(
                 is_ddp=is_ddp,
                 logit_adjustment=eval_logit_adjustment,
                 tau_norm_divisor=_tau_div,
+                packet_store=packet_store,
             )
         else:
             val_metrics = {
@@ -2223,6 +2698,7 @@ def train_neighbor_sampling(
             is_ddp=False,
             logit_adjustment=eval_logit_adjustment,
             tau_norm_divisor=_tau_norm_divisor(state_holder.classifier, tau_norm),
+            packet_store=packet_store,
         )
         device_str = f"{device} x{world_size}" if is_ddp else str(device)
         summary = {

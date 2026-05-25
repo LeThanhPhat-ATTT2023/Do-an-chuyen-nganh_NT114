@@ -187,3 +187,43 @@ def test_sampler_is_deterministic_given_seed() -> None:
         assert ei_a.shape == ei_b.shape
         if ei_a.size:
             assert np.array_equal(ei_a, ei_b)
+
+
+@pytest.fixture
+def tiny_backend():
+    from graphslm_ids.offline.training.hetero_graph_artifact import HeteroGraphArtifact
+
+    nf = {
+        "flow": np.random.RandomState(0).rand(4, 5).astype(np.float32),
+        "packet": (np.arange(6 * 2323).reshape(6, 2323) % 50).astype(np.float32),
+        "technique": np.random.RandomState(1).rand(3, 8).astype(np.float32),
+        "tactic": np.zeros((2, 1), dtype=np.float32),
+        "host": np.zeros((2, 4), dtype=np.float32),
+    }
+    ei = {
+        ("flow", "contains", "packet"): np.array([[0, 0, 1, 2, 3], [0, 1, 2, 3, 4]], dtype=np.int64),
+        ("packet", "next_packet", "packet"): np.array([[0, 1], [1, 2]], dtype=np.int64),
+        ("technique", "belongs_to_tactic", "tactic"): np.array([[0, 1], [0, 1]], dtype=np.int64),
+    }
+    ea = {k: np.ones((v.shape[1],), dtype=np.float32) for k, v in ei.items()}
+    art = HeteroGraphArtifact(
+        node_features=nf, edge_index=ei, edge_attr=ea,
+        flow_y=np.array([0, 1, 0, 1], dtype=np.int64), metadata={},
+    )
+    return InMemoryNeighborBackend(art)
+
+
+def test_sampler_defer_packet_features_omits_packet_array(tiny_backend):
+    sampler = HeteroNeighborSampler(
+        backend=tiny_backend, hops=2,
+        fanouts={"contains": 4, "next_packet": 2},
+        always_include_all_techniques=False,
+        always_include_all_tactics=False,
+        defer_packet_features=True,
+    )
+    batch = sampler.sample([0, 1])
+    # Packet feature array is NOT materialized.
+    pkt = batch.node_features.get("packet")
+    assert pkt is None or pkt.shape[0] == 0
+    # Packet global ids ARE available for the store to gather.
+    assert "packet" in batch.local_to_global
