@@ -289,6 +289,7 @@ def _build_packet_x(
     payloads: list[bytes],
     payload_lengths: list[int],
     payload_length: int = 256,
+    store_dtype: str = "float16",
 ) -> np.ndarray:
     """Compute the (n_packets, 2323) packet feature matrix.
 
@@ -296,6 +297,10 @@ def _build_packet_x(
     memory — only one fixed-width vector per packet at a time. ``payloads``
     here are the raw bytes for each packet AFTER control packets have been
     dropped, so length == number of packet nodes in the final graph.
+
+    Features are COMPUTED in float32 (accumulation accuracy) then cast to
+    ``store_dtype`` for storage. Default float16 halves disk/RAM footprint;
+    numpy has no bfloat16, so float16 is the on-disk low-precision dtype.
     """
     n = len(payloads)
     out = np.zeros((n, PAYLOAD_FEATURE_DIM), dtype=np.float32)
@@ -306,7 +311,9 @@ def _build_packet_x(
         k = min(payload_length, len(raw))
         buf[:k] = np.frombuffer(raw[:k], dtype=np.uint8)
         out[i] = compute_packet_payload_features(buf, min(plen, payload_length))
-    return out
+    if store_dtype == "float32":
+        return out
+    return out.astype(np.dtype(store_dtype))
 
 
 def _flow_evidence_summary(

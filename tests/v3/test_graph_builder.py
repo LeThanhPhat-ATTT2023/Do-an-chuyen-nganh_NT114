@@ -247,7 +247,7 @@ def test_build_v3_artifact_smoke(gb_fixture: dict) -> None:
     # Node features have the documented dtypes and shapes.
     assert arts["flow_x"].dtype == np.float32
     assert arts["packet_x"].shape == (4, PAYLOAD_FEATURE_DIM)
-    assert arts["packet_x"].dtype == np.float32
+    assert arts["packet_x"].dtype == np.float16  # default store_dtype is float16
 
     # Contain edges: one per kept packet.
     assert arts["contain_edge_index"].shape[1] == 4
@@ -314,3 +314,22 @@ def test_build_v3_artifact_empty_packets_raises(gb_fixture: dict) -> None:
             technique_family_csv=gb_fixture["tech_family_csv"],
             pmi_table_parquet=gb_fixture["pmi_table"],
         )
+
+
+def test_build_packet_x_stores_float16_within_tolerance():
+    from graphslm_ids.offline.preprocessing.v3.graph_builder import (
+        _build_packet_x,
+        PAYLOAD_FEATURE_DIM,
+    )
+    payloads = [bytes([i % 256 for i in range(200)]), b"", bytes(range(50))]
+    lengths = [200, 0, 50]
+
+    out16 = _build_packet_x(payloads, lengths, store_dtype="float16")
+    out32 = _build_packet_x(payloads, lengths, store_dtype="float32")
+
+    assert out16.dtype == np.float16
+    assert out16.shape == (3, PAYLOAD_FEATURE_DIM)
+    np.testing.assert_allclose(
+        out16.astype(np.float32), out32, rtol=1e-2, atol=1e-2
+    )
+    assert np.isfinite(out16.astype(np.float32)).all()
