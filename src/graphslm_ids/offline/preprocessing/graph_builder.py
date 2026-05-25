@@ -43,6 +43,8 @@ build).
 from __future__ import annotations
 
 import logging
+import multiprocessing as _mp
+import os
 import tempfile
 import time
 from pathlib import Path
@@ -66,6 +68,68 @@ from graphslm_ids.offline.preprocessing.flow_consensus import flow_consensus_hit
 from graphslm_ids.offline.preprocessing.procedure_matcher import ProcedureMatcher
 
 _LOG = logging.getLogger(__name__)
+
+# ─── Parallel worker functions (module-level so they are picklable on Windows) ──
+
+def _packet_x_worker(args: tuple) -> tuple[int, int]:
+    """Compute payload features for one chunk and write directly to a memmap slice.
+
+    Args delivered as a single tuple (required by Pool.map):
+        (start_idx, payloads_chunk, plens_chunk, payload_length, store_dtype,
+         mmap_path_str, n_total)
+    Returns (start_idx, chunk_len) for progress logging.
+    """
+    start_idx, payloads_chunk, plens_chunk, payload_length, store_dtype, mmap_path_str, n_total = args
+    dtype = np.dtype(store_dtype)
+    # Open the pre-created memmap in read-write mode; each worker writes only
+    # its own slice so no locking is needed.
+    out = np.memmap(mmap_path_str, dtype=dtype, mode="r+", shape=(n_total, PAYLOAD_FEATURE_DIM))
+    buf = np.zeros(payload_length, dtype=np.uint8)
+    for i, (raw, plen) in enumerate(zip(payloads_chunk, plens_chunk, strict=True)):
+        if not raw:
+            continue
+        buf[:] = 0
+        k = min(payload_length, len(raw))
+        buf[:k] = np.frombuffer(raw[:k], dtype=np.uint8)
+        row_f32 = compute_packet_payload_features(buf, min(plen, payload_length))
+        out[start_idx + i] = row_f32 if dtype == np.dtype("float32") else row_f32.astype(dtype)
+    out.flush()
+    return start_idx, len(payloads_chunk)
+
+
+# Per-worker globals for the evidence pool (initializer sets these once per process).
+_g_proc_matcher: Any = None
+_g_pmi_lookup: Any = None
+_g_tech_family: Any = None
+
+
+def _evidence_worker_init(stix_json_path: str, pmi_lookup: dict, technique_family_map: dict) -> None:
+    """Pool initializer: build ProcedureMatcher once per worker process."""
+    global _g_proc_matcher, _g_pmi_lookup, _g_tech_family
+    _g_proc_matcher = ProcedureMatcher(Path(stix_json_path))
+    _g_pmi_lookup = pmi_lookup
+    _g_tech_family = technique_family_map
+
+
+def _evidence_batch_worker(batch: list[tuple]) -> list[tuple[int, list]]:
+    """Process a batch of packets and return evidence edges.
+
+    Args:
+        batch: list of (pidx, payload_bytes, flow_hits_dict)
+
+    Returns:
+        list of (pidx, [(tech, family, weight), ...]) — only non-empty.
+    """
+    results: list[tuple[int, list]] = []
+    for pidx, payload, flow_hits in batch:
+        if not payload:
+            continue
+        pmi_hits = lookup_pmi_per_packet(payload, _g_pmi_lookup)
+        proc_hits = _g_proc_matcher.weight_per_technique(payload)
+        edges = aggregate_evidence(pmi_hits, proc_hits, flow_hits, _g_tech_family)
+        if edges:
+            results.append((pidx, edges))
+    return results
 
 # The 5 typed evidence edge types in spec-defined order. Keeping the order
 # fixed makes the audit script and the trainer config trivially aligned.
@@ -286,30 +350,74 @@ def _build_packet_x(
     payload_lengths: list[int],
     payload_length: int = 256,
     store_dtype: str = "float16",
+    mmap_path: Path | None = None,
+    n_workers: int | None = None,
 ) -> np.ndarray:
-    """Compute the (n_packets, 2323) packet feature matrix.
+    """Compute the (n_packets, 2323) packet feature matrix — parallel version.
 
-    Streams packet-by-packet so we never hold the full uint8 byte matrix in
-    memory — only one fixed-width vector per packet at a time. ``payloads``
-    here are the raw bytes for each packet AFTER control packets have been
-    dropped, so length == number of packet nodes in the final graph.
+    Uses ``multiprocessing.Pool`` when ``n_workers > 1`` (default = all CPUs).
+    Each worker writes directly to its slice of the memmap file so no large
+    arrays are transferred back over IPC — only (start, len) progress tokens.
 
-    Features are COMPUTED in float32 (accumulation accuracy) then cast to
-    ``store_dtype`` for storage. Default float16 halves disk/RAM footprint;
-    numpy has no bfloat16, so float16 is the on-disk low-precision dtype.
+    If ``mmap_path`` is None a RAM array is used (only safe for small n).
     """
     n = len(payloads)
-    out = np.zeros((n, PAYLOAD_FEATURE_DIM), dtype=np.float32)
-    for i, (raw, plen) in enumerate(zip(payloads, payload_lengths, strict=True)):
-        if not raw:
-            continue
+    dtype = np.dtype(store_dtype)
+    if n_workers is None:
+        n_workers = os.cpu_count() or 1
+
+    # Create / zero the output array BEFORE spawning workers.
+    mmap_path_str: str | None = None
+    if mmap_path is not None:
+        # mode='w+' creates / truncates the file and zeros all entries.
+        out: np.ndarray = np.memmap(
+            mmap_path, dtype=dtype, mode="w+", shape=(n, PAYLOAD_FEATURE_DIM)
+        )
+        out.flush()
+        del out          # close so workers can open in 'r+' mode
+        mmap_path_str = str(mmap_path)
+    else:
+        # Fallback: single-threaded, in-RAM (small datasets / tests).
+        n_workers = 1
+
+    # ── Split into chunks, one per worker ──────────────────────────────────
+    chunk_size = max(1, (n + n_workers - 1) // n_workers)
+    chunks: list[tuple] = []
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+        chunks.append((
+            start,
+            payloads[start:end],
+            payload_lengths[start:end],
+            payload_length,
+            store_dtype,
+            mmap_path_str,
+            n,
+        ))
+
+    if n_workers == 1 or mmap_path_str is None:
+        # Single-process path (tests / no mmap).
         buf = np.zeros(payload_length, dtype=np.uint8)
-        k = min(payload_length, len(raw))
-        buf[:k] = np.frombuffer(raw[:k], dtype=np.uint8)
-        out[i] = compute_packet_payload_features(buf, min(plen, payload_length))
-    if store_dtype == "float32":
-        return out
-    return out.astype(np.dtype(store_dtype))
+        out_arr = np.zeros((n, PAYLOAD_FEATURE_DIM), dtype=dtype)
+        for i, (raw, plen) in enumerate(zip(payloads, payload_lengths, strict=True)):
+            if not raw:
+                continue
+            buf[:] = 0
+            k = min(payload_length, len(raw))
+            buf[:k] = np.frombuffer(raw[:k], dtype=np.uint8)
+            row_f32 = compute_packet_payload_features(buf, min(plen, payload_length))
+            out_arr[i] = row_f32 if dtype == np.dtype("float32") else row_f32.astype(dtype)
+        return out_arr
+
+    _LOG.info("packet_x: launching %d workers for %d packets", n_workers, n)
+    ctx = _mp.get_context("spawn")   # explicit spawn = safe on Windows + Linux
+    with ctx.Pool(processes=n_workers) as pool:
+        for done_start, done_len in pool.imap_unordered(_packet_x_worker, chunks):
+            _LOG.debug("packet_x chunk done: start=%d len=%d", done_start, done_len)
+
+    # Re-open the completed memmap for the caller (read-only is enough but
+    # the rest of the pipeline may index into it, so 'r+' keeps behaviour).
+    return np.memmap(mmap_path, dtype=dtype, mode="r+", shape=(n, PAYLOAD_FEATURE_DIM))
 
 
 def _flow_evidence_summary(
@@ -452,9 +560,18 @@ def build_v3_graph_artifact(
     payload_lens = packets_kept["payload_len"].astype(int).tolist()
 
     # ─── 3. packet_x ────────────────────────────────────────────────────────
+    # Write to a memmap file so the full (n_packets, 2323) matrix never lives
+    # in RAM. Essential when n_packets > 1 M on a 16 GB machine.
     t0 = time.time()
-    packet_x = _build_packet_x(payloads, payload_lens, payload_length=payload_length)
-    _LOG.info("packet_x: shape=%s (%.1fs)", packet_x.shape, time.time() - t0)
+    packet_x_mmap_path = tmp_dir / "packet_x.mmap"
+    packet_x = _build_packet_x(
+        payloads,
+        payload_lens,
+        payload_length=payload_length,
+        mmap_path=packet_x_mmap_path,
+    )
+    _LOG.info("packet_x: shape=%s dtype=%s mmap=%s (%.1fs)",
+              packet_x.shape, packet_x.dtype, packet_x_mmap_path, time.time() - t0)
 
     # ─── 4. Host tier ───────────────────────────────────────────────────────
     t0 = time.time()
@@ -527,8 +644,7 @@ def build_v3_graph_artifact(
         int(pmi_table.shape[0]),
     )
 
-    procedure_matcher = ProcedureMatcher(mitre_stix_json)
-
+    # ProcedureMatcher is built inside each worker via _evidence_worker_init.
     flow_consensus_map = flow_consensus_hits(feats_df)
     _LOG.info("flow_consensus: %d flows had signature hits", len(flow_consensus_map))
 
@@ -547,26 +663,42 @@ def build_v3_graph_artifact(
     # check by storing only the (tech, family, weight) triples, not payloads.
     packet_to_edges: list[list[tuple[str, str, float]]] = [list() for _ in range(n_packets)]
 
-    for pidx in range(n_packets):
-        payload = payloads[pidx]
-        if not payload:
-            continue
-        pmi_hits = lookup_pmi_per_packet(payload, pmi_lookup)
-        proc_hits = procedure_matcher.weight_per_technique(payload)
-        flow_id = packet_flow_ids[pidx]
-        flow_hits = flow_consensus_map.get(flow_id, {})
-        edges = aggregate_evidence(
-            pmi_hits, proc_hits, flow_hits, technique_family_map, tau_edge=tau_edge
-        )
-        if not edges:
-            continue
-        packet_to_edges[pidx] = edges
-        for tech, family, weight in edges:
-            tidx = technique_id_to_idx.get(tech)
-            writer = evidence_writers.get(family)
-            if tidx is None or writer is None:
-                continue
-            writer.append(src=pidx, dst=tidx, attr=float(weight))
+    # Build batches for parallel processing: each batch = list of
+    # (pidx, payload_bytes, flow_hits_dict).  Batch size ~2 K keeps IPC
+    # round-trips and per-batch pickle overhead balanced.
+    n_workers_ev = os.cpu_count() or 1
+    batch_size = max(500, n_packets // (n_workers_ev * 8))
+    batches: list[list[tuple]] = []
+    for b_start in range(0, n_packets, batch_size):
+        b_end = min(b_start + batch_size, n_packets)
+        batch: list[tuple] = []
+        for pidx in range(b_start, b_end):
+            flow_id = packet_flow_ids[pidx]
+            batch.append((pidx, payloads[pidx], flow_consensus_map.get(flow_id, {})))
+        batches.append(batch)
+
+    _LOG.info(
+        "evidence: %d packets → %d batches × ~%d, %d workers",
+        n_packets, len(batches), batch_size, n_workers_ev,
+    )
+
+    ctx = _mp.get_context("spawn")
+    with ctx.Pool(
+        processes=n_workers_ev,
+        initializer=_evidence_worker_init,
+        initargs=(str(mitre_stix_json), pmi_lookup, technique_family_map),
+    ) as pool:
+        for batch_results in pool.imap_unordered(
+            _evidence_batch_worker, batches, chunksize=2
+        ):
+            for pidx, edges in batch_results:
+                packet_to_edges[pidx] = edges
+                for tech, family, weight in edges:
+                    tidx = technique_id_to_idx.get(tech)
+                    writer = evidence_writers.get(family)
+                    if tidx is None or writer is None:
+                        continue
+                    writer.append(src=pidx, dst=tidx, attr=float(weight))
 
     finalized: dict[str, tuple[np.ndarray, np.ndarray]] = {}
     for fam, w in evidence_writers.items():
