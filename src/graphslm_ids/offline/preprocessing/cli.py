@@ -54,7 +54,10 @@ _LOG = logging.getLogger("v3.cli")
 
 
 def _attach_payload_column(
-    raw_root: Path, packets_df: pd.DataFrame, payload_length: int
+    raw_root: Path,
+    packets_df: pd.DataFrame,
+    payload_length: int,
+    n_workers: int | None = None,
 ) -> pd.DataFrame:
     """Reuse the v2 second-pass byte extractor and attach per-row payload bytes.
 
@@ -64,7 +67,7 @@ def _attach_payload_column(
     need to strip the zero pad.
     """
     payload_matrix = _build_payload_matrix_from_pcaps(
-        raw_root, packets_df, payload_length
+        raw_root, packets_df, payload_length, n_workers=n_workers
     )
     plens = packets_df["payload_len"].astype(int).to_numpy()
     payloads: list[bytes] = []
@@ -137,6 +140,29 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--log-level", default="INFO")
 
+    # ── Worker-count overrides (default: auto-detect from available RAM/CPUs) ─
+    ap.add_argument(
+        "--n-workers",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Workers for PCAP-loading stages (Stage 1 + 2).  "
+            "Default: auto-scale from available RAM "
+            "(e.g. 8 on g6e.2xlarge 64 GB, ~1-2 on 16 GB laptop)."
+        ),
+    )
+    ap.add_argument(
+        "--n-compute-workers",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Workers for CPU-compute stages (Stage 6: packet_x + evidence pool).  "
+            "Default: os.cpu_count()."
+        ),
+    )
+
     args = ap.parse_args()
 
     logging.basicConfig(
@@ -151,7 +177,7 @@ def main() -> None:
     # ── Stage 1: extract packet metadata ──────────────────────────────────────
     _LOG.info("[1/6] parsing pcaps from %s (cap=%s) ...", raw_root, cap)
     t0 = time.time()
-    packets_df = extract_packets_dir(raw_root, max_per_class=cap)
+    packets_df = extract_packets_dir(raw_root, max_per_class=cap, n_workers=args.n_workers)
     _LOG.info(
         "  -> packets=%d classes=%d (%.1fs)",
         len(packets_df),
@@ -162,7 +188,7 @@ def main() -> None:
     # ── Stage 2: attach payload bytes ─────────────────────────────────────────
     _LOG.info("[2/6] second pass: copying payload bytes ...")
     t0 = time.time()
-    packets_df = _attach_payload_column(raw_root, packets_df, args.payload_length)
+    packets_df = _attach_payload_column(raw_root, packets_df, args.payload_length, n_workers=args.n_workers)
     _LOG.info("  -> payload column attached (%.1fs)", time.time() - t0)
 
     # ── Stage 3: bidirectional flows + ~80 features ──────────────────────────
@@ -243,6 +269,7 @@ def main() -> None:
         pmi_table_parquet=Path(args.pmi_table),
         payload_length=args.payload_length,
         tau_edge=args.tau_edge,
+        n_workers=args.n_compute_workers,
     )
     save_v3_artifact(arts, Path(args.out_npz), Path(args.out_meta))
     _LOG.info("  -> artifact saved (%.1fs)", time.time() - t0)
@@ -261,13 +288,20 @@ def main() -> None:
 
 
 def _build_payload_matrix_from_pcaps(
-    raw_root: Path, packets_df, payload_length: int
+    raw_root: Path,
+    packets_df,
+    payload_length: int,
+    n_workers: int | None = None,
 ) -> np.ndarray:
     """Re-walk the pcaps and copy payload bytes — parallel version.
 
     Builds a per-label row_index map, then spawns one worker per class
     directory. Each worker writes directly to its non-overlapping rows of a
     shared memmap so no large arrays cross process boundaries.
+
+    ``n_workers`` is auto-detected from available RAM when None (see
+    :func:`_resource.auto_pcap_workers`). Pass an explicit value to override
+    (e.g. ``--n-workers 8`` on a 64 GB cloud instance).
     """
     import multiprocessing as _mp
     import os
@@ -302,8 +336,9 @@ def _build_payload_matrix_from_pcaps(
             continue
         tasks.append((str(cls_dir), label, slice_, payload_length, mmap_path, n))
 
-    # Cap at 4 workers: each re-reads a full PCAP (≤2 GB) into worker RAM.
-    n_workers = min(len(tasks), 4)
+    # Auto-scale workers based on available RAM; respect explicit override.
+    from graphslm_ids.offline.preprocessing._resource import auto_pcap_workers
+    n_workers = auto_pcap_workers(len(tasks), override=n_workers)
     ctx = _mp.get_context("spawn")
     with ctx.Pool(processes=n_workers) as pool:
         for done_label in pool.imap_unordered(_payload_class_worker, tasks):

@@ -206,10 +206,11 @@ def extract_packets_dir(
         return pd.DataFrame(columns=COLUMNS)
 
     if n_workers is None:
-        # Each worker loads an entire PCAP into RAM (up to ~2 GB for DDoS files).
-        # Cap at 4 concurrent workers so peak RAM stays ≤ 4×~3 GB ≈ 12 GB,
-        # leaving headroom for the main process and OS.
-        n_workers = min(len(tasks), 4)
+        # Auto-scale: read available RAM at runtime so the worker count adapts
+        # to the machine.  On a 16 GB laptop this stays at ~1-2; on a 64 GB
+        # cloud instance (g6e.2xlarge) it scales up to use all 8 CPUs.
+        from graphslm_ids.offline.preprocessing._resource import auto_pcap_workers
+        n_workers = auto_pcap_workers(len(tasks))
 
     ctx = _mp.get_context("spawn")
     parts: list[pd.DataFrame] = []
