@@ -87,3 +87,77 @@ def compute_cache_capacity(
     usable = max(0, free - int(model_reserve_bytes)) * float(cache_fraction)
     k = int(usable // int(row_bytes))
     return max(0, min(k, int(num_rows)))
+
+
+class TieredFeatureStore:
+    """Gathers packet rows from a GPU hot cache, falling back to the source.
+
+    The hottest ``capacity`` rows (by ``freq_order``) live on ``device`` as a
+    contiguous cache tensor; ``id_to_slot[g]`` gives the cache slot of global id
+    ``g`` or -1 if not cached. ``gather`` returns rows on ``device`` in
+    ``cache_dtype`` (bfloat16 on cuda, float32 on cpu by default).
+    """
+
+    def __init__(
+        self,
+        *,
+        source: PacketSource,
+        device: torch.device,
+        freq_order: np.ndarray,
+        capacity: int,
+        cache_dtype: str | None = None,
+    ) -> None:
+        self.source = source
+        self.device = device
+        self.dim = int(source.dim)
+        self.num_rows = int(source.num_rows)
+        if cache_dtype is None:
+            cache_dtype = "bfloat16" if device.type == "cuda" else "float32"
+        self._torch_dtype = getattr(torch, cache_dtype)
+        self.capacity = int(max(0, min(capacity, self.num_rows)))
+
+        self._id_to_slot = np.full(self.num_rows, -1, dtype=np.int64)
+        if self.capacity > 0:
+            cached_ids = np.asarray(freq_order, dtype=np.int64)[: self.capacity]
+            self._cached_ids = cached_ids
+            self._id_to_slot[cached_ids] = np.arange(self.capacity, dtype=np.int64)
+            rows = np.asarray(source.gather(cached_ids), dtype=np.float32)
+            self._cache = torch.from_numpy(rows).to(
+                device=device, dtype=self._torch_dtype
+            )
+            _LOG.info(
+                "TieredFeatureStore: cached %d/%d rows on %s (%.2f GB)",
+                self.capacity,
+                self.num_rows,
+                device,
+                self._cache.element_size() * self._cache.nelement() / 1024**3,
+            )
+        else:
+            self._cached_ids = np.empty(0, dtype=np.int64)
+            self._cache = torch.empty((0, self.dim), device=device, dtype=self._torch_dtype)
+
+    def gather(self, packet_ids: np.ndarray) -> torch.Tensor:
+        ids = np.asarray(packet_ids, dtype=np.int64).reshape(-1)
+        n = ids.shape[0]
+        out = torch.empty((n, self.dim), device=self.device, dtype=self._torch_dtype)
+        if n == 0:
+            return out
+
+        slots = self._id_to_slot[ids]
+        hit = slots >= 0
+        if hit.any():
+            hit_idx = torch.from_numpy(np.nonzero(hit)[0]).to(self.device)
+            hit_slots = torch.from_numpy(slots[hit]).to(self.device)
+            out.index_copy_(0, hit_idx, self._cache.index_select(0, hit_slots))
+        miss = ~hit
+        if miss.any():
+            miss_pos = np.nonzero(miss)[0]
+            miss_rows = np.asarray(self.source.gather(ids[miss]), dtype=np.float32)
+            miss_t = torch.from_numpy(miss_rows).to(
+                device=self.device, dtype=self._torch_dtype
+            )
+            out.index_copy_(0, torch.from_numpy(miss_pos).to(self.device), miss_t)
+        return out
+
+    def state_dict(self) -> dict:
+        return {"freq_order": self._cached_ids, "capacity": self.capacity}
