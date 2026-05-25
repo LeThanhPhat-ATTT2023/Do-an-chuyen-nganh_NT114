@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from graphslm_ids.offline.preprocessing.v2._signature_rules import (
+from graphslm_ids.offline.preprocessing._signature_rules import (
     ALL_REFERENCED_TECHNIQUES,
     FLOW_SIGNATURES,
     PAYLOAD_SIGNATURES,

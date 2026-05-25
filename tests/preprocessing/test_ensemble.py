@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from graphslm_ids.offline.preprocessing.v3.ensemble import (
+from graphslm_ids.offline.preprocessing.ensemble import (
     aggregate_evidence,
     build_pmi_lookup_from_table,
     iter_packet_evidence,

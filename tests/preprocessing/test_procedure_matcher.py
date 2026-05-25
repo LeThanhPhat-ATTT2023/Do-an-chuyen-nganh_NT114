@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from graphslm_ids.offline.preprocessing.v3.procedure_matcher import (
+from graphslm_ids.offline.preprocessing.procedure_matcher import (
     ProcedureMatcher,
     _extract_patterns,
     extract_technique_id_from_stix_obj,

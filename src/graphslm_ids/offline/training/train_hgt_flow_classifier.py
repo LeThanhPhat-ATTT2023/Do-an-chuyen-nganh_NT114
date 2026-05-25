@@ -30,7 +30,6 @@ from torch.utils.data.distributed import DistributedSampler
 from graphslm_ids.offline.training.hetero_graph_artifact import (
     load_graph_store_artifact,
     load_three_tier_graph_artifact,
-    load_v2_artifact,
     load_v3_artifact,
 )
 from graphslm_ids.offline.training.neighbor_sampling import (
@@ -558,21 +557,14 @@ def label_name_mapping(metadata: dict[str, Any], labels: np.ndarray) -> dict[int
 
 
 def load_neighbor_backend(config: dict[str, Any]) -> NeighborBackend:
-    # v2/v3 evidence-grounded graph artifact: explicit version switch via config
-    # so a misconfigured run fails loudly instead of silently falling back to v1
-    # cosine-edge artifacts.
+    # Smart-BOTH Hybrid graph artifact: explicit version gate via config so a
+    # misconfigured run fails loudly instead of silently falling back to the
+    # legacy three-tier (v1 cosine-edge) artifact.
     _artifact_version = str(config["data"].get("artifact_version", "")).lower()
-    if _artifact_version == "v2":
-        artifact = load_v2_artifact(
-            graph_npz=Path(config["data"]["graph_npz"]),
-            graph_meta_json=Path(config["data"]["graph_meta_json"]),
-            add_reverse_edges=bool(config["data"].get("add_reverse_edges", True)),
-        )
-        return InMemoryNeighborBackend(artifact)
     if _artifact_version == "v3":
-        # v3 Smart-BOTH Hybrid: 5 node types (adds host) + 5 typed-evidence edge
-        # families. Loader contract is identical to v2 — same HeteroGraphArtifact
-        # shape — so InMemoryNeighborBackend handles host nodes uniformly.
+        # Smart-BOTH Hybrid artifact: 5 node types (flow/packet/host/technique/
+        # tactic) + 5 typed-evidence edge families. InMemoryNeighborBackend
+        # handles host nodes uniformly.
         artifact = load_v3_artifact(
             graph_npz=Path(config["data"]["graph_npz"]),
             graph_meta_json=Path(config["data"]["graph_meta_json"]),

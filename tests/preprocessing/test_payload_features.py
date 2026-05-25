@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from graphslm_ids.offline.preprocessing.v2.payload_features import (
+from graphslm_ids.offline.preprocessing.payload_features import (
     FEATURE_DIM,
     FEATURE_NAMES,
     HASH_OFFSET,

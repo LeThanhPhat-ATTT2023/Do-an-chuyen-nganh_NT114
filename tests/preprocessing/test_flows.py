@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from graphslm_ids.offline.preprocessing.v2.flows import (
+from graphslm_ids.offline.preprocessing.flows import (
     assign_flows,
     build_flow_features,
 )

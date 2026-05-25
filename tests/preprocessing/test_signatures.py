@@ -6,7 +6,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from graphslm_ids.offline.preprocessing.v2.signatures import (
+from graphslm_ids.offline.preprocessing.signatures import (
     match_flow_signatures,
     match_payload_signatures,
     validate_techniques,

@@ -41,7 +41,7 @@ from typing import Iterable
 
 import pandas as pd
 
-from graphslm_ids.offline.preprocessing.v3.tokenizer import tokenize_payload
+from graphslm_ids.offline.preprocessing.tokenizer import tokenize_payload
 
 # Type alias for the PMI lookup: token -> list of (technique, family, weight).
 # A token may evidence multiple techniques (different rows in pmi_table.parquet

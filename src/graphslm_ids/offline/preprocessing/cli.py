@@ -16,7 +16,7 @@ Output:
     <splits-json>       — random + temporal flow-id splits
 
 Usage:
-    D:\\v\\nt114\\Scripts\\python.exe -m graphslm_ids.offline.preprocessing.v3.cli ^
+    D:\\v\\nt114\\Scripts\\python.exe -m graphslm_ids.offline.preprocessing.cli ^
         --raw-root data/raw/14gb ^
         --out-npz outputs/v3/graph.npz ^
         --out-meta outputs/v3/graph.meta.json ^
@@ -35,20 +35,17 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from graphslm_ids.offline.preprocessing.v2.cli import (
-    _build_payload_matrix_from_pcaps,
-)
-from graphslm_ids.offline.preprocessing.v2.extractor import extract_packets_dir
-from graphslm_ids.offline.preprocessing.v2.flows import (
+from graphslm_ids.offline.preprocessing.extractor import extract_packets_dir
+from graphslm_ids.offline.preprocessing.flows import (
     assign_flows,
     build_flow_features,
 )
-from graphslm_ids.offline.preprocessing.v3.graph_builder import (
+from graphslm_ids.offline.preprocessing.graph_builder import (
     build_v3_graph_artifact,
     save_v3_artifact,
 )
-from graphslm_ids.offline.preprocessing.v3.pmi_learner import fit_and_save_pmi_table
-from graphslm_ids.offline.preprocessing.v3.split import make_splits, save_splits
+from graphslm_ids.offline.preprocessing.pmi_learner import fit_and_save_pmi_table
+from graphslm_ids.offline.preprocessing.split import make_splits, save_splits
 
 _LOG = logging.getLogger("v3.cli")
 
@@ -258,6 +255,90 @@ def main() -> None:
         md["evidence_edge_counts"],
         time.time() - t_total,
     )
+
+
+def _build_payload_matrix_from_pcaps(
+    raw_root: Path, packets_df, payload_length: int
+) -> np.ndarray:
+    """Re-walk the pcaps and copy each kept packet's payload bytes into a matrix.
+
+    The extractor emits per-packet metadata but not the raw bytes (keeping the
+    metadata path lightweight). For the graph artifact we need the actual
+    bytes so payload features and evidence edges can fire on real content.
+    This helper does a SECOND deterministic pass aligned to the metadata DF:
+    for each row we already extracted, we re-open the same pcap and copy the
+    payload of the packet at the recorded ``(pcap, packet_index)`` position.
+
+    NOTE: rows are grouped by pcap path (inferred from label folder layout)
+    and each pcap walked once. Rows that don't survive matching are zero-padded.
+    """
+    n = len(packets_df)
+    out = np.zeros((n, payload_length), dtype=np.uint8)
+    row_index: dict[tuple[str, int], list[int]] = {}
+    if "label" not in packets_df.columns:
+        return out
+    cum_per_label: dict[str, int] = {}
+    for i, label in enumerate(packets_df["label"].astype(str).tolist()):
+        pos = cum_per_label.get(label, 0)
+        row_index.setdefault((label, pos), []).append(i)
+        cum_per_label[label] = pos + 1
+
+    import dpkt
+    import socket  # noqa: F401  # imported for symmetry with extractor
+
+    for cls_dir in sorted(p for p in raw_root.iterdir() if p.is_dir()):
+        label = cls_dir.name
+        running_pos = 0
+        for pcap in sorted(cls_dir.glob("*.pcap")):
+            try:
+                f = open(pcap, "rb")
+            except OSError:
+                continue
+            with f:
+                try:
+                    reader = dpkt.pcap.Reader(f)
+                except Exception:
+                    continue
+                dlt = reader.datalink()
+                for _, (_ts, buf) in enumerate(reader):
+                    try:
+                        ip = _decode_ip(buf, dlt, dpkt)
+                    except Exception:
+                        ip = None
+                    if not isinstance(ip, dpkt.ip.IP):
+                        continue
+                    rows = row_index.get((label, running_pos))
+                    if rows:
+                        payload = _extract_payload(ip, dpkt)
+                        if payload:
+                            vec = np.zeros(payload_length, dtype=np.uint8)
+                            k = min(payload_length, len(payload))
+                            vec[:k] = np.frombuffer(payload[:k], dtype=np.uint8)
+                            for r in rows:
+                                out[r] = vec
+                    running_pos += 1
+    return out
+
+
+def _decode_ip(buf: bytes, dlt: int, dpkt_mod):
+    if dlt == 1:  # Ethernet
+        return dpkt_mod.ethernet.Ethernet(buf).data
+    if dlt in (12, 101):
+        return dpkt_mod.ip.IP(buf)
+    if dlt == 113:
+        return dpkt_mod.ip.IP(buf[16:])
+    return dpkt_mod.ethernet.Ethernet(buf).data
+
+
+def _extract_payload(ip, dpkt_mod) -> bytes:
+    t = ip.data
+    if isinstance(t, dpkt_mod.tcp.TCP):
+        return bytes(t.data)
+    if isinstance(t, dpkt_mod.udp.UDP):
+        return bytes(t.data)
+    if isinstance(t, dpkt_mod.icmp.ICMP):
+        return bytes(t.data)
+    return b""
 
 
 if __name__ == "__main__":
