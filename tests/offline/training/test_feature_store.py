@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import torch
 
 pytest.importorskip("torch")
 
@@ -60,3 +61,46 @@ def test_memmap_packet_source_gather(tmp_path):
     assert src.num_rows == 6
     got = src.gather(np.array([5, 1], dtype=np.int64))
     np.testing.assert_array_equal(got, data[[5, 1]])
+
+
+def test_compute_cache_capacity_cpu_is_zero():
+    from graphslm_ids.offline.training.feature_store import compute_cache_capacity
+
+    K = compute_cache_capacity(
+        device=torch.device("cpu"),
+        num_rows=1000,
+        row_bytes=4646,
+        free_bytes_override=None,
+        model_reserve_bytes=0,
+        cache_fraction=0.6,
+    )
+    assert K == 0
+
+
+def test_compute_cache_capacity_caps_at_num_rows():
+    from graphslm_ids.offline.training.feature_store import compute_cache_capacity
+
+    K = compute_cache_capacity(
+        device=torch.device("cpu"),
+        num_rows=500,
+        row_bytes=4646,
+        free_bytes_override=10 * 1024**3,
+        model_reserve_bytes=0,
+        cache_fraction=1.0,
+    )
+    assert K == 500
+
+
+def test_compute_cache_capacity_partial():
+    from graphslm_ids.offline.training.feature_store import compute_cache_capacity
+
+    free = 2 * 4646 * 1000  # *0.5 -> 1000 rows
+    K = compute_cache_capacity(
+        device=torch.device("cpu"),
+        num_rows=100_000,
+        row_bytes=4646,
+        free_bytes_override=free,
+        model_reserve_bytes=0,
+        cache_fraction=0.5,
+    )
+    assert K == 1000

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Protocol
 
 import numpy as np
+import torch
 
 _LOG = logging.getLogger(__name__)
 
@@ -60,3 +61,29 @@ class MemmapPacketSource:
     def gather(self, ids: np.ndarray) -> np.ndarray:
         # Copy out of the memmap so downstream torch.from_numpy owns the buffer.
         return np.asarray(self._mm[np.asarray(ids, dtype=np.int64)])
+
+
+def compute_cache_capacity(
+    *,
+    device: torch.device,
+    num_rows: int,
+    row_bytes: int,
+    free_bytes_override: int | None = None,
+    model_reserve_bytes: int = 2 * 1024**3,
+    cache_fraction: float = 0.6,
+) -> int:
+    """Number of packet rows that fit in the GPU hot cache.
+
+    CPU device with no override -> 0 (no GPU cache tier). When
+    ``free_bytes_override`` is given, it is used regardless of device type
+    (test hook). Result is clamped to ``[0, num_rows]``.
+    """
+    if free_bytes_override is not None:
+        free = int(free_bytes_override)
+    elif device.type == "cuda":
+        free, _total = torch.cuda.mem_get_info(device)
+    else:
+        return 0
+    usable = max(0, free - int(model_reserve_bytes)) * float(cache_fraction)
+    k = int(usable // int(row_bytes))
+    return max(0, min(k, int(num_rows)))
