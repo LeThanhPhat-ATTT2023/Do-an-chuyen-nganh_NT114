@@ -132,6 +132,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "pin_memory": True,
         "persistent_workers": True,
     },
+    "feature_store": {
+        "enabled": False,
+        "cache_fraction": 0.6,
+        "model_reserve_gb": 4.0,
+        "cache_dtype": None,
+        "n_warmup_batches": 200,
+        "memmap": False,
+        "memmap_bin": "",
+    },
 }
 
 
@@ -590,6 +599,45 @@ def load_neighbor_backend(config: dict[str, Any]) -> NeighborBackend:
         add_reverse_edges=bool(config["data"]["add_reverse_edges"]),
     )
     return InMemoryNeighborBackend(artifact)
+
+
+def build_packet_store(config, backend, sampler, train_flow_ids, device):
+    """Construct a TieredFeatureStore for packet_x, or return None if disabled."""
+    fs = config.get("feature_store", {})
+    if not fs.get("enabled", False):
+        return None
+    from graphslm_ids.offline.training.feature_store import (
+        ArrayPacketSource, MemmapPacketSource, TieredFeatureStore,
+        compute_access_frequency, compute_cache_capacity,
+    )
+    if fs.get("memmap", False):
+        source = MemmapPacketSource(
+            Path(fs["memmap_bin"]),
+            num_rows=int(backend.artifact.node_features["packet"].shape[0]),
+            dim=int(backend.feature_dims["packet"]),
+            dtype="float16",
+        )
+    else:
+        source = ArrayPacketSource(backend.artifact.node_features["packet"])
+
+    freq = compute_access_frequency(
+        sampler=sampler, seed_flow_ids=train_flow_ids,
+        num_packets=source.num_rows,
+        batch_size=int(config["dataloader"]["batch_size"]),
+        n_warmup_batches=int(fs.get("n_warmup_batches", 200)),
+        seed=int(config.get("seed", 42)),
+    )
+    freq_order = np.argsort(freq)[::-1].copy()
+    row_bytes = source.dim * 2  # bf16/fp16 = 2 bytes/elem
+    capacity = compute_cache_capacity(
+        device=device, num_rows=source.num_rows, row_bytes=row_bytes,
+        model_reserve_bytes=int(fs.get("model_reserve_gb", 4.0) * 1024**3),
+        cache_fraction=float(fs.get("cache_fraction", 0.6)),
+    )
+    return TieredFeatureStore(
+        source=source, device=device, freq_order=freq_order,
+        capacity=capacity, cache_dtype=fs.get("cache_dtype"),
+    )
 
 
 def _load_v3_splits_json(
@@ -1457,6 +1505,7 @@ def evaluate_neighbor_sampling(
     is_ddp: bool = False,
     logit_adjustment: torch.Tensor | None = None,
     tau_norm_divisor: torch.Tensor | None = None,
+    packet_store: "TieredFeatureStore | None" = None,
 ) -> dict[str, Any]:
     """Two paths:
       1. DDP (``is_ddp=True``): each rank evaluates its DistributedSampler shard,
@@ -1495,6 +1544,7 @@ def evaluate_neighbor_sampling(
             for i, batch in enumerate(loader, start=1):
                 node_features, edge_index, edge_weight, seed_mask, seed_labels = to_torch_batch(
                     batch, edge_types, device, use_semantic_edge_weights,
+                    packet_store=packet_store,
                 )
                 with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
                     logits = model(node_features, edge_index, edge_weight_dict=edge_weight)
@@ -1554,6 +1604,7 @@ def evaluate_neighbor_sampling(
                     edge_types,
                     device,
                     use_semantic_edge_weights,
+                    packet_store=packet_store,
                 )
                 with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
                     logits = model(node_features, edge_index, edge_weight_dict=edge_weight)
@@ -1700,7 +1751,9 @@ def train_neighbor_sampling(
         flow_feature_stats=flow_feature_stats,
         standardize_flow_features=bool(config["data"]["standardize_flow_features"]),
         seed=seed + rank,
+        defer_packet_features=bool(config.get("feature_store", {}).get("enabled", False)),
     )
+    packet_store = build_packet_store(config, backend, sampler, train_idx_np, device)
     train_labels_np = labels_np[train_idx_np]
     train_loader, train_dist_sampler = make_neighbor_loader(
         train_idx_np, sampler, config, shuffle=True,
@@ -2085,6 +2138,7 @@ def train_neighbor_sampling(
 
             nf, ei, ew, sm, sl = to_torch_batch(
                 batch, edge_types, device, use_semantic_edge_weights,
+                packet_store=packet_store,
             )
             # In DDP, suppress the all-reduce on mid-accumulation backwards.
             # The trailing backward (or the only backward when accum=1) still
@@ -2411,6 +2465,7 @@ def train_neighbor_sampling(
                 is_ddp=is_ddp,
                 logit_adjustment=eval_logit_adjustment,
                 tau_norm_divisor=_tau_div,
+                packet_store=packet_store,
             )
         else:
             val_metrics = {
@@ -2579,6 +2634,7 @@ def train_neighbor_sampling(
             is_ddp=False,
             logit_adjustment=eval_logit_adjustment,
             tau_norm_divisor=_tau_norm_divisor(state_holder.classifier, tau_norm),
+            packet_store=packet_store,
         )
         device_str = f"{device} x{world_size}" if is_ddp else str(device)
         summary = {
