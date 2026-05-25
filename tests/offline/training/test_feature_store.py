@@ -238,7 +238,7 @@ def test_build_packet_store_disabled_returns_none(tiny_backend):
         always_include_all_techniques=False, always_include_all_tactics=False,
         defer_packet_features=True,
     )
-    cfg = {"feature_store": {"enabled": False}, "dataloader": {"batch_size": 2}, "seed": 42}
+    cfg = {"feature_store": {"enabled": False}, "train": {"batch_seed_flows": 2}, "seed": 42}
     store = build_packet_store(
         cfg, tiny_backend, sampler,
         train_flow_ids=np.array([0, 1, 2, 3], dtype=np.int64),
@@ -262,7 +262,7 @@ def test_build_packet_store_cpu_enabled_capacity_zero(tiny_backend):
             "enabled": True, "cache_fraction": 0.6, "model_reserve_gb": 0.0,
             "n_warmup_batches": 2, "memmap": False, "cache_dtype": "float32",
         },
-        "dataloader": {"batch_size": 2}, "seed": 42,
+        "train": {"batch_seed_flows": 2}, "seed": 42,
     }
     store = build_packet_store(
         cfg, tiny_backend, sampler,
