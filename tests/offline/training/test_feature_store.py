@@ -247,6 +247,31 @@ def test_build_packet_store_disabled_returns_none(tiny_backend):
     assert store is None
 
 
+def test_tiered_store_state_dict_round_trip():
+    from graphslm_ids.offline.training.feature_store import (
+        ArrayPacketSource, TieredFeatureStore,
+    )
+    data = (np.arange(8 * 3).reshape(8, 3) % 50).astype(np.float16)
+    source = ArrayPacketSource(data)
+    freq_order = np.array([7, 6, 0, 5, 4, 1, 3, 2], dtype=np.int64)
+    s1 = TieredFeatureStore(
+        source=source, device=torch.device("cpu"),
+        freq_order=freq_order, capacity=4, cache_dtype="float32",
+    )
+    state = s1.state_dict()
+    assert np.array_equal(state["freq_order"], freq_order)  # FULL, not top-K
+    assert state["capacity"] == 4
+
+    s2 = TieredFeatureStore(
+        source=source, device=torch.device("cpu"),
+        freq_order=np.zeros(8, dtype=np.int64),  # wrong order
+        capacity=4, cache_dtype="float32",
+    )
+    s2.load_state_dict(state)
+    ids = np.array([7, 0, 6, 1, 4], dtype=np.int64)
+    np.testing.assert_array_equal(s1.gather(ids).cpu().numpy(), s2.gather(ids).cpu().numpy())
+
+
 def test_build_packet_store_cpu_enabled_capacity_zero(tiny_backend):
     from graphslm_ids.offline.training.neighbor_sampling import HeteroNeighborSampler
     from graphslm_ids.offline.training.train_hgt_flow_classifier import build_packet_store
