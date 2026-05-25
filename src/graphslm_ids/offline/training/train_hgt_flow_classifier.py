@@ -11,7 +11,10 @@ import random
 import threading
 import time
 import warnings
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from graphslm_ids.offline.training.feature_store import TieredFeatureStore
 
 import numpy as np
 import torch
@@ -1187,6 +1190,7 @@ def to_torch_batch(
     use_semantic_edge_weights: bool,
     *,
     non_blocking: bool = True,
+    packet_store: "TieredFeatureStore | None" = None,
 ) -> tuple[
     dict[str, torch.Tensor],
     dict[tuple[str, str, str], torch.Tensor],
@@ -1198,6 +1202,10 @@ def to_torch_batch(
         key: _to_device(value, device, non_blocking)
         for key, value in batch.node_features.items()
     }
+    if packet_store is not None:
+        pkt_ids = batch.local_to_global.get("packet")
+        if pkt_ids is not None:
+            node_tensors["packet"] = packet_store.gather(np.asarray(pkt_ids))
     edge_tensors: dict[tuple[str, str, str], torch.Tensor] = {}
     for edge_type in edge_types:
         value = batch.edge_index.get(edge_type)
