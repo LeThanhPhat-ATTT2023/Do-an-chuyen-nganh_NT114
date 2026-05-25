@@ -114,11 +114,15 @@ class TieredFeatureStore:
         if cache_dtype is None:
             cache_dtype = "bfloat16" if device.type == "cuda" else "float32"
         self._torch_dtype = getattr(torch, cache_dtype)
+        # Preserve the FULL incoming priority ordering before any top-K slicing
+        # so state_dict() can persist it and a resume can rebuild a cache of a
+        # possibly-different capacity without re-running warmup.
+        self._freq_order = np.asarray(freq_order, dtype=np.int64).copy()
         self.capacity = int(max(0, min(capacity, self.num_rows)))
 
         self._id_to_slot = np.full(self.num_rows, -1, dtype=np.int64)
         if self.capacity > 0:
-            cached_ids = np.asarray(freq_order, dtype=np.int64)[: self.capacity]
+            cached_ids = self._freq_order[: self.capacity]
             self._cached_ids = cached_ids
             self._id_to_slot[cached_ids] = np.arange(self.capacity, dtype=np.int64)
             rows = np.asarray(source.gather(cached_ids), dtype=np.float32)
@@ -160,7 +164,37 @@ class TieredFeatureStore:
         return out
 
     def state_dict(self) -> dict:
-        return {"freq_order": self._cached_ids, "capacity": self.capacity}
+        """Return the FULL frequency ordering + capacity used at construction.
+
+        Persisting the full ordering (not just the top-K already cached) lets a
+        resume restore the exact same cache OR rebuild with a different
+        capacity without re-running warmup.
+        """
+        return {"freq_order": self._freq_order, "capacity": self.capacity}
+
+    def load_state_dict(self, state: dict) -> None:
+        """Rebuild the cache in-place from a previously saved ``state_dict``.
+
+        Mirrors ``__init__``'s cache construction so a resume skips warmup:
+        the saved (full) ``freq_order`` and ``capacity`` are reapplied and the
+        hot rows are re-gathered from ``source``.
+        """
+        self._freq_order = np.asarray(state["freq_order"], dtype=np.int64).copy()
+        self.capacity = int(max(0, min(int(state["capacity"]), self.num_rows)))
+        self._id_to_slot = np.full(self.num_rows, -1, dtype=np.int64)
+        if self.capacity > 0:
+            cached_ids = self._freq_order[: self.capacity]
+            self._cached_ids = cached_ids
+            self._id_to_slot[cached_ids] = np.arange(self.capacity, dtype=np.int64)
+            rows = np.asarray(self.source.gather(cached_ids), dtype=np.float32)
+            self._cache = torch.from_numpy(rows).to(
+                device=self.device, dtype=self._torch_dtype
+            )
+        else:
+            self._cached_ids = np.empty(0, dtype=np.int64)
+            self._cache = torch.empty(
+                (0, self.dim), device=self.device, dtype=self._torch_dtype
+            )
 
 
 def compute_access_frequency(
