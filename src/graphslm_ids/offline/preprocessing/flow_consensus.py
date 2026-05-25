@@ -1,7 +1,7 @@
 """Flow-level signature consensus (Source 3 of the v3 PMI Ensemble).
 
 This module is intentionally thin: it wraps v2's
-:func:`graphslm_ids.offline.preprocessing.v2.signatures.match_flow_signatures`
+:func:`graphslm_ids.offline.preprocessing.signatures.match_flow_signatures`
 in a single batch call that returns ``{flow_id: {technique_id: weight}}``.
 
 Why a separate module instead of inlining the wrap into ``ensemble.py``?
@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from graphslm_ids.offline.preprocessing.v2.signatures import match_flow_signatures
+from graphslm_ids.offline.preprocessing.signatures import match_flow_signatures
 
 
 def flow_consensus_hits(feats_df: pd.DataFrame) -> dict[str, dict[str, float]]:

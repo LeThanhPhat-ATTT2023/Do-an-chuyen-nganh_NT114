@@ -10,7 +10,7 @@ Tokenizer guarantees we lock in:
 """
 from __future__ import annotations
 
-from graphslm_ids.offline.preprocessing.v3.tokenizer import (
+from graphslm_ids.offline.preprocessing.tokenizer import (
     BYTE4_PREFIX,
     BYTE8_PREFIX,
     TEXT_PREFIX,

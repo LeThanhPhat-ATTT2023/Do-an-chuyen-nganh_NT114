@@ -23,7 +23,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from graphslm_ids.offline.preprocessing.v3.pmi_learner import (
+from graphslm_ids.offline.preprocessing.pmi_learner import (
     filter_pmi_candidates,
     fit_and_save_pmi_table,
     fit_l1_logistic,

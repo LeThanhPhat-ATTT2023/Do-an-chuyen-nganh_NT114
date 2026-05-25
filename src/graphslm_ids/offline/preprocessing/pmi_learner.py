@@ -42,7 +42,7 @@ from scipy.sparse import csr_matrix, lil_matrix
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.linear_model import LogisticRegression
 
-from graphslm_ids.offline.preprocessing.v3.tokenizer import tokenize_payload
+from graphslm_ids.offline.preprocessing.tokenizer import tokenize_payload
 
 _LOG = logging.getLogger(__name__)
 

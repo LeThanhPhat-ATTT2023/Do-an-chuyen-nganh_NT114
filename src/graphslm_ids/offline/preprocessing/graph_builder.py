@@ -51,23 +51,19 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from graphslm_ids.offline.preprocessing.v2.graph_builder import (
-    _jsonable,
-    _load_mitre_tactics,
-)
-from graphslm_ids.offline.preprocessing.v2.payload_features import (
+from graphslm_ids.offline.preprocessing.payload_features import (
     FEATURE_DIM as PAYLOAD_FEATURE_DIM,
     FEATURE_NAMES as PAYLOAD_FEATURE_NAMES,
     compute_packet_payload_features,
 )
-from graphslm_ids.offline.preprocessing.v3.edge_writers import MemmapEdgeWriter
-from graphslm_ids.offline.preprocessing.v3.ensemble import (
+from graphslm_ids.offline.preprocessing.edge_writers import MemmapEdgeWriter
+from graphslm_ids.offline.preprocessing.ensemble import (
     aggregate_evidence,
     build_pmi_lookup_from_table,
     lookup_pmi_per_packet,
 )
-from graphslm_ids.offline.preprocessing.v3.flow_consensus import flow_consensus_hits
-from graphslm_ids.offline.preprocessing.v3.procedure_matcher import ProcedureMatcher
+from graphslm_ids.offline.preprocessing.flow_consensus import flow_consensus_hits
+from graphslm_ids.offline.preprocessing.procedure_matcher import ProcedureMatcher
 
 _LOG = logging.getLogger(__name__)
 
@@ -722,6 +718,56 @@ def save_v3_artifact(arts: dict[str, Any], out_npz: Path, out_meta_json: Path) -
     np.savez(str(out_npz), **arrays)
     with out_meta_json.open("w", encoding="utf-8") as f:
         json.dump(_jsonable(arts["metadata"]), f, indent=2)
+
+
+def _load_mitre_tactics(
+    technique_tactic_csv: Path,
+    techniques_csv: Path,
+    technique_id_to_idx: dict[str, int],
+) -> tuple[np.ndarray, np.ndarray, dict[str, int], int]:
+    """Read MITRE technique<->tactic edges -> (edge_index, edge_attr, mapping, n_tactics)."""
+    edges_df = pd.read_csv(technique_tactic_csv)
+    required = {"technique_id", "tactic_shortname"}
+    if not required.issubset(edges_df.columns):
+        raise ValueError(
+            f"technique_tactic_csv must contain {sorted(required)}, got {list(edges_df.columns)}"
+        )
+    tactics = sorted({str(t) for t in edges_df["tactic_shortname"].tolist()})
+    tactic_to_idx = {t: i for i, t in enumerate(tactics)}
+
+    src: list[int] = []
+    dst: list[int] = []
+    for _, row in edges_df.iterrows():
+        tid = str(row["technique_id"])
+        tac = str(row["tactic_shortname"])
+        if tid not in technique_id_to_idx:
+            continue
+        src.append(technique_id_to_idx[tid])
+        dst.append(tactic_to_idx[tac])
+    if src:
+        edge_index = np.vstack(
+            [np.array(src, dtype=np.int64), np.array(dst, dtype=np.int64)]
+        )
+        edge_attr = np.ones((edge_index.shape[1], 1), dtype=np.float32)
+    else:
+        edge_index = np.empty((2, 0), dtype=np.int64)
+        edge_attr = np.empty((0, 1), dtype=np.float32)
+    return edge_index, edge_attr, tactic_to_idx, len(tactics)
+
+
+def _jsonable(obj: Any) -> Any:
+    """Recursively convert numpy / pandas types so json.dump won't choke."""
+    if isinstance(obj, dict):
+        return {str(k): _jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_jsonable(v) for v in obj]
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    return obj
 
 
 __all__ = [

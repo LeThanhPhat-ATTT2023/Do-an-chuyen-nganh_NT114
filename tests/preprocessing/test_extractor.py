@@ -9,12 +9,12 @@ from pathlib import Path
 
 import pandas as pd
 
-from graphslm_ids.offline.preprocessing.v2.extractor import (
+from graphslm_ids.offline.preprocessing.extractor import (
     COLUMNS,
     extract_packets,
     extract_packets_dir,
 )
-from tests.v2._fixtures.build_tiny_pcap import build_demo_pcap
+from tests.preprocessing._fixtures.build_tiny_pcap import build_demo_pcap
 
 
 def test_extractor_keeps_every_packet_kind(tmp_path: Path) -> None:

@@ -22,10 +22,10 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from graphslm_ids.offline.preprocessing.v2.payload_features import (
+from graphslm_ids.offline.preprocessing.payload_features import (
     FEATURE_DIM as PAYLOAD_FEATURE_DIM,
 )
-from graphslm_ids.offline.preprocessing.v3.graph_builder import (
+from graphslm_ids.offline.preprocessing.graph_builder import (
     _build_has_subtechnique_edges,
     build_v3_graph_artifact,
     save_v3_artifact,
@@ -317,7 +317,7 @@ def test_build_v3_artifact_empty_packets_raises(gb_fixture: dict) -> None:
 
 
 def test_build_packet_x_stores_float16_within_tolerance():
-    from graphslm_ids.offline.preprocessing.v3.graph_builder import (
+    from graphslm_ids.offline.preprocessing.graph_builder import (
         _build_packet_x,
         PAYLOAD_FEATURE_DIM,
     )
