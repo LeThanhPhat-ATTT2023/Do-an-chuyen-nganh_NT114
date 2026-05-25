@@ -141,6 +141,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "memmap": False,
         "memmap_bin": "",
     },
+    "gpu_sampling": {"enabled": False},
 }
 
 
@@ -638,6 +639,39 @@ def build_packet_store(config, backend, sampler, train_flow_ids, device):
         source=source, device=device, freq_order=freq_order,
         capacity=capacity, cache_dtype=fs.get("cache_dtype"),
     )
+
+
+def maybe_build_gpu_sampling(config, in_memory_backend, device):
+    """Build (GpuNeighborBackend, TorchHeteroNeighborSampler) when enabled, else None.
+
+    Requires ``feature_store.enabled=True`` because the torch sampler always
+    defers packet features and only the store can gather them.
+    """
+    if not config.get("gpu_sampling", {}).get("enabled", False):
+        return None
+    if not config.get("feature_store", {}).get("enabled", False):
+        raise ValueError(
+            "gpu_sampling.enabled=True requires feature_store.enabled=True"
+        )
+    from graphslm_ids.offline.training.gpu_sampling import (
+        GpuNeighborBackend, TorchHeteroNeighborSampler,
+    )
+    sampler_cfg = config.get("sampler", {}) or {}
+    hops = sampler_cfg.get("hops")
+    if hops is None:
+        hops = int(config.get("model", {}).get("num_layers", 2))
+    gpu_backend = GpuNeighborBackend(in_memory_backend, device=device)
+    sampler = TorchHeteroNeighborSampler(
+        backend=gpu_backend,
+        hops=int(hops),
+        fanouts=sampler_cfg.get("fanouts"),
+        reverse_fanouts=sampler_cfg.get("reverse_fanouts"),
+        always_include_all_tactics=bool(sampler_cfg.get("always_include_all_tactics", True)),
+        always_include_all_techniques=bool(sampler_cfg.get("always_include_all_techniques", True)),
+        standardize_flow_features=bool(config.get("data", {}).get("standardize_flow_features", True)),
+        seed=int(config.get("train", {}).get("seed", 42)),
+    )
+    return gpu_backend, sampler
 
 
 def _load_v3_splits_json(
@@ -1741,18 +1775,31 @@ def train_neighbor_sampling(
     # Per-rank RNG seed so ranks don't all pick identical neighbour subsamples
     # (each rank already sees a different flow shard via DistributedSampler, but
     # diverging samplers help hide any residual correlation in random keys).
-    sampler = HeteroNeighborSampler(
-        backend,
-        hops=int(sampler_hops),
-        fanouts=dict(sampler_cfg.get("fanouts") or {}),
-        reverse_fanouts=dict(sampler_cfg.get("reverse_fanouts") or {}),
-        always_include_all_tactics=bool(sampler_cfg.get("always_include_all_tactics", True)),
-        always_include_all_techniques=bool(sampler_cfg.get("always_include_all_techniques", True)),
-        flow_feature_stats=flow_feature_stats,
-        standardize_flow_features=bool(config["data"]["standardize_flow_features"]),
-        seed=seed + rank,
-        defer_packet_features=bool(config.get("feature_store", {}).get("enabled", False)),
-    )
+    gpu_sampling = maybe_build_gpu_sampling(config, backend, device)
+    if gpu_sampling is not None:
+        # GPU-side sampler holds CSR on device and returns torch tensors. CUDA
+        # contexts cannot fork into DataLoader workers, and pin_memory() would
+        # mishandle the returned torch tensors — force single-process / unpinned
+        # loaders. feature_store.enabled is required (validated in the helper)
+        # because the torch sampler always defers packet features.
+        _gpu_backend, sampler = gpu_sampling
+        dl_cfg = config.setdefault("dataloader", {})
+        dl_cfg["num_workers"] = 0
+        dl_cfg["pin_memory"] = False
+        dl_cfg["persistent_workers"] = False
+    else:
+        sampler = HeteroNeighborSampler(
+            backend,
+            hops=int(sampler_hops),
+            fanouts=dict(sampler_cfg.get("fanouts") or {}),
+            reverse_fanouts=dict(sampler_cfg.get("reverse_fanouts") or {}),
+            always_include_all_tactics=bool(sampler_cfg.get("always_include_all_tactics", True)),
+            always_include_all_techniques=bool(sampler_cfg.get("always_include_all_techniques", True)),
+            flow_feature_stats=flow_feature_stats,
+            standardize_flow_features=bool(config["data"]["standardize_flow_features"]),
+            seed=seed + rank,
+            defer_packet_features=bool(config.get("feature_store", {}).get("enabled", False)),
+        )
     packet_store = build_packet_store(config, backend, sampler, train_idx_np, device)
     train_labels_np = labels_np[train_idx_np]
     train_loader, train_dist_sampler = make_neighbor_loader(

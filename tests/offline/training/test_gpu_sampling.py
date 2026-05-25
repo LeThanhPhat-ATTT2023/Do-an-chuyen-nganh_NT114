@@ -171,3 +171,35 @@ def test_torch_sampler_matches_numpy_sampler_fanout_none(tiny_backend):
         t_batch.local_to_global["flow"].cpu().numpy(),
         np_batch.local_to_global["flow"],
     )
+
+
+def test_gpu_sampling_path_produces_batch_with_packet_store(tiny_backend):
+    from graphslm_ids.offline.training.gpu_sampling import (
+        GpuNeighborBackend, TorchHeteroNeighborSampler,
+    )
+    from graphslm_ids.offline.training.feature_store import (
+        ArrayPacketSource, TieredFeatureStore,
+    )
+    from graphslm_ids.offline.training.train_hgt_flow_classifier import to_torch_batch
+
+    dev = torch.device("cpu")
+    gpu_backend = GpuNeighborBackend(tiny_backend, device=dev)
+    sampler = TorchHeteroNeighborSampler(
+        backend=gpu_backend, hops=2, fanouts={"contains": 4, "next_packet": 2},
+        always_include_all_techniques=False, always_include_all_tactics=False,
+    )
+    batch = sampler.sample([0, 1])
+
+    packet_x = tiny_backend.artifact.node_features["packet"].astype(np.float16)
+    store = TieredFeatureStore(
+        source=ArrayPacketSource(packet_x), device=dev,
+        freq_order=np.arange(6, dtype=np.int64), capacity=6, cache_dtype="float32",
+    )
+    edge_types = list(batch.edge_index.keys())
+    node_tensors, *_ = to_torch_batch(
+        batch, edge_types, dev,
+        use_semantic_edge_weights=False, packet_store=store,
+    )
+    pkt_ids = batch.local_to_global["packet"]
+    assert node_tensors["packet"].shape[0] == int(pkt_ids.numel())
+    assert node_tensors["packet"].dtype == torch.float32
