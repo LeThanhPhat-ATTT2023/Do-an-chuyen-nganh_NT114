@@ -104,3 +104,43 @@ def test_compute_cache_capacity_partial():
         cache_fraction=0.5,
     )
     assert K == 1000
+
+
+def _make_store(num_rows, dim, K, device="cpu"):
+    from graphslm_ids.offline.training.feature_store import (
+        ArrayPacketSource,
+        TieredFeatureStore,
+    )
+
+    data = (np.arange(num_rows * dim).reshape(num_rows, dim) % 97).astype(np.float16)
+    source = ArrayPacketSource(data)
+    freq_order = np.arange(num_rows, dtype=np.int64)[::-1].copy()  # row N-1 hottest
+    store = TieredFeatureStore(
+        source=source,
+        device=torch.device(device),
+        freq_order=freq_order,
+        capacity=K,
+        cache_dtype="float32",  # cpu path
+    )
+    return data, store
+
+
+def test_tiered_store_full_cache_all_hits():
+    data, store = _make_store(num_rows=8, dim=3, K=8)
+    out = store.gather(np.array([7, 0, 3], dtype=np.int64))
+    assert out.device.type == "cpu"
+    np.testing.assert_allclose(out.cpu().numpy(), data[[7, 0, 3]].astype(np.float32))
+
+
+def test_tiered_store_zero_cache_all_misses():
+    data, store = _make_store(num_rows=8, dim=3, K=0)
+    out = store.gather(np.array([2, 5], dtype=np.int64))
+    np.testing.assert_allclose(out.cpu().numpy(), data[[2, 5]].astype(np.float32))
+
+
+def test_tiered_store_partial_cache_mixed():
+    # K=4 -> the 4 hottest (freq_order[:4] = rows 7,6,5,4) are cached, rest miss.
+    data, store = _make_store(num_rows=8, dim=3, K=4)
+    ids = np.array([7, 0, 6, 1], dtype=np.int64)  # hit, miss, hit, miss
+    out = store.gather(ids)
+    np.testing.assert_allclose(out.cpu().numpy(), data[ids].astype(np.float32))
