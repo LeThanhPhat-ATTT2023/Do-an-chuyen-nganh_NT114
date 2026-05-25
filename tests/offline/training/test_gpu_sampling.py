@@ -76,3 +76,41 @@ def test_gather_csr_torch_empty_inputs():
     li, nb, w = gather_csr_neighbors_torch(indptr, indices, attr, src, fanout=None)
     assert nb.numel() == 0 and w.numel() == 0
     assert li.shape == (11,)
+
+
+def test_torch_local_map_matches_numpy_localmap():
+    from graphslm_ids.offline.training.neighbor_sampling import _LocalMap
+    from graphslm_ids.offline.training.gpu_sampling import TorchLocalMap
+
+    dev = torch.device("cpu")
+    batches = [
+        np.array([5, 1, 5, 9], dtype=np.int64),
+        np.array([1, 2, 9, 7], dtype=np.int64),
+        np.array([7, 7, 3], dtype=np.int64),
+    ]
+    np_map = _LocalMap()
+    t_map = TorchLocalMap(device=dev)
+    for b in batches:
+        np_new = np_map.add(b)
+        t_new = t_map.add(torch.from_numpy(b).to(dev))
+        assert np.array_equal(t_new.cpu().numpy(), np_new), f"add mismatch on batch {b.tolist()}"
+
+    assert np.array_equal(t_map.globals_array().cpu().numpy(), np_map.globals_array())
+    q = np.array([9, 100, 3, 5], dtype=np.int64)
+    assert np.array_equal(
+        t_map.lookup(torch.from_numpy(q).to(dev)).cpu().numpy(),
+        np_map.lookup(q),
+    )
+
+
+def test_torch_local_map_empty_calls():
+    from graphslm_ids.offline.training.gpu_sampling import TorchLocalMap
+
+    dev = torch.device("cpu")
+    m = TorchLocalMap(device=dev)
+    out = m.add(torch.empty(0, dtype=torch.int64, device=dev))
+    assert out.numel() == 0
+    assert m.count == 0
+    look = m.lookup(torch.tensor([1, 2], dtype=torch.int64, device=dev))
+    assert look.tolist() == [-1, -1]
+    assert m.globals_array().numel() == 0

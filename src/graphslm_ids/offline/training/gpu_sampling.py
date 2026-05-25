@@ -73,3 +73,92 @@ def gather_csr_neighbors_torch(
     nbrs = indices[selected].to(torch.int64)
     weights = attr[selected].to(torch.float32)
     return local_indptr, nbrs, weights
+
+
+class TorchLocalMap:
+    """Torch port of neighbor_sampling._LocalMap.
+
+    Assigns dense local ids to global ids in first-occurrence order, with a
+    sorted view for O(log n) bulk lookup. Mirrors the numpy version's ordering
+    exactly so subgraphs are identical across backends.
+    """
+
+    def __init__(self, device: torch.device) -> None:
+        self.device = device
+        self._chunks: list[torch.Tensor] = []
+        self._count = 0
+        self._sorted = torch.empty(0, dtype=torch.int64, device=device)
+        self._local_of_sorted = torch.empty(0, dtype=torch.int64, device=device)
+
+    @property
+    def count(self) -> int:
+        return self._count
+
+    def add(self, candidates: torch.Tensor) -> torch.Tensor:
+        arr = candidates.reshape(-1).to(torch.int64)
+        if arr.numel() == 0:
+            return torch.empty(0, dtype=torch.int64, device=self.device)
+        uniq_sorted, inverse = torch.unique(arr, sorted=True, return_inverse=True)
+        order = torch.arange(arr.numel(), device=self.device, dtype=torch.int64)
+        # first_idx[u] = min(order[i] for i where arr[i] == uniq_sorted[u])
+        first_idx = torch.full(
+            (uniq_sorted.numel(),), arr.numel(), dtype=torch.int64, device=self.device
+        )
+        first_idx = first_idx.scatter_reduce(0, inverse, order, reduce="amin", include_self=True)
+
+        if self._sorted.numel():
+            pos = torch.searchsorted(self._sorted, uniq_sorted)
+            pos_clamped = pos.clamp(max=self._sorted.numel() - 1)
+            present = (pos < self._sorted.numel()) & (self._sorted[pos_clamped] == uniq_sorted)
+            new_mask = ~present
+        else:
+            new_mask = torch.ones(uniq_sorted.numel(), dtype=torch.bool, device=self.device)
+
+        if not bool(new_mask.any()):
+            return torch.empty(0, dtype=torch.int64, device=self.device)
+
+        new_sorted = uniq_sorted[new_mask]
+        new_first = first_idx[new_mask]
+        ins_order = torch.argsort(new_first, stable=True)
+        new_in_insert = new_sorted[ins_order]
+        n_new = int(new_in_insert.numel())
+        new_locals_insert = torch.arange(
+            self._count, self._count + n_new, dtype=torch.int64, device=self.device
+        )
+        self._count += n_new
+        self._chunks.append(new_in_insert)
+
+        new_locals_for_sorted = torch.empty(n_new, dtype=torch.int64, device=self.device)
+        new_locals_for_sorted[ins_order] = new_locals_insert
+
+        if self._sorted.numel():
+            merged_vals = torch.cat([self._sorted, new_sorted])
+            merged_locs = torch.cat([self._local_of_sorted, new_locals_for_sorted])
+            sort_idx = torch.argsort(merged_vals, stable=True)
+            self._sorted = merged_vals[sort_idx]
+            self._local_of_sorted = merged_locs[sort_idx]
+        else:
+            self._sorted = new_sorted
+            self._local_of_sorted = new_locals_for_sorted
+        return new_in_insert
+
+    def lookup(self, query: torch.Tensor) -> torch.Tensor:
+        arr = query.reshape(-1).to(torch.int64)
+        out = torch.full(arr.shape, -1, dtype=torch.int64, device=self.device)
+        if arr.numel() == 0 or self._sorted.numel() == 0:
+            return out
+        pos = torch.searchsorted(self._sorted, arr)
+        in_bounds = pos < self._sorted.numel()
+        pos_clamped = pos.clamp(max=self._sorted.numel() - 1)
+        match = in_bounds & (self._sorted[pos_clamped] == arr)
+        out[match] = self._local_of_sorted[pos[match]]
+        return out
+
+    def globals_array(self) -> torch.Tensor:
+        if self._count == 0:
+            return torch.empty(0, dtype=torch.int64, device=self.device)
+        if len(self._chunks) == 1:
+            return self._chunks[0]
+        out = torch.cat(self._chunks)
+        self._chunks = [out]
+        return out
