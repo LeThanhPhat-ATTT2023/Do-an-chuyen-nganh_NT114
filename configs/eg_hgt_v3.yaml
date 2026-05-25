@@ -1,0 +1,176 @@
+# EG-HGT v3 — Smart-BOTH Hybrid (PMI Ensemble + Typed Heterogeneous Schema).
+#
+# Trains the HGT on the v3 graph artifact built by
+#   `python -m graphslm_ids.offline.preprocessing.v3.cli`
+#
+# Two runs share this config; only `data.split_protocol` differs:
+#   python -m graphslm_ids.offline.training.train_hgt_flow_classifier \
+#       --config configs/eg_hgt_v3.yaml --split-protocol random   -> checkpoint_random.pt
+#   python -m graphslm_ids.offline.training.train_hgt_flow_classifier \
+#       --config configs/eg_hgt_v3.yaml --split-protocol temporal -> checkpoint_temporal.pt
+#
+# Config rationale (derived from cross-paper analysis of 6 IDS/GNN baselines):
+#
+#   Architecture (hidden_dim=128, num_layers=4, num_heads=8):
+#     - hidden_dim=128: consensus across RelGT/AHGT-DFD/DLG-IDS; 256+ OOM on 22 edge types.
+#     - num_layers=4: +1 vs paper baselines (all use 3) to support deeper hierarchy in v3
+#       schema (flow→packet→technique→tactic = 3 hops min, 4 covers burst_neighbor context).
+#     - num_heads=8: RelGT backbone recommendation; head_size = 128/8 = 16 (standard).
+#
+#   Training fixes applied from paper-variant audit:
+#     [FIX-1] class_weight_cap: 10.0 — prevents loss spikes from uncapped balanced weights
+#             on imbalanced 13-class dataset (all 6 paper variants required this fix).
+#     [FIX-2] amp_dtype: auto — all paper variants use 'auto' (bf16 if GPU supports it,
+#             safe FP32 fallback); hardcoded bfloat16 crashes on non-Ampere cards.
+#     [FIX-3] activation_checkpointing: true — v3 has 22 edge types vs ~5 in paper variants;
+#             memory footprint roughly 4x larger; checkpointing is mandatory not optional.
+#     [FIX-4] batch_seed_flows: 384→256 + grad_accum_steps: 1→2 — effective batch stays
+#             ~512 (256×2) vs previous 384, but per-step VRAM halves. Prevents OOM with
+#             22-edge-type subgraphs on L40S 48GB.
+#     [FIX-5] patience: 30→40 — temporal split converges slower than random split (no
+#             data leakage shortcut); GATransformer/AHGT-DFD both use patience=40.
+#     [FIX-6] Removed sam_enabled key — SAM optimizer removed from trainer (always AdamW).
+#
+# See:
+#   docs/superpowers/plans/2026-05-24-v3-smart-both-hybrid.md
+#   docs/superpowers/specs/2026-05-24-v3-smart-both-design.md
+#   docs/training/hgt_train_config_recommendation_vi.md
+
+experiment:
+  source_name: "EG-HGT v3 Smart-BOTH Hybrid"
+  rationale: >
+    PMI Ensemble (PMI candidates + L1-LR refinement + MITRE procedure
+    matcher + flow-signature consensus) emits packet->technique evidence
+    edges across 5 typed families. Reports BOTH random-stratified F1 and
+    temporal F1; the gap is the v3 contribution vs prior work.
+
+data:
+  artifact_version: v3
+  graph_npz: outputs/v3/graph.npz
+  graph_meta_json: outputs/v3/graph.meta.json
+  # Path to splits.json produced by v3/cli.py (random + temporal keys).
+  # When set + artifact_version=v3, the trainer uses these split IDs instead
+  # of falling back to random stratified split.
+  splits_json: outputs/v3/splits.json
+  split_protocol: temporal      # overridden by --split-protocol CLI flag
+  add_reverse_edges: true
+  standardize_flow_features: true
+  use_semantic_edge_weights: true
+  use_temporal_edge_weights: true
+  tew_epsilon: 1.0e-3
+
+model:
+  hidden_dim: 128         # consensus across RelGT / AHGT-DFD / DLG-IDS
+  num_layers: 4           # +1 vs baselines: supports flow→pkt→tech→tactic 4-hop hierarchy
+  num_heads: 8            # RelGT recommendation; head_size = 128/8 = 16
+  dropout: 0.2            # AHGT-DFD / DLG-IDS consensus
+  ffn_multiplier: 2
+
+train:
+  output_dir: outputs/v3/hgt
+  epochs: 150
+  patience: 40            # [FIX-5] temporal split needs more patience; GATransformer/AHGT=40
+  batch_seed_flows: 256   # [FIX-4] reduced from 384; compensated by grad_accum_steps=2
+  grad_accum_steps: 2     # [FIX-4] effective batch = 256×2 = 512; per-step VRAM halved
+  monitor: val_macro_f1
+  log_every: 1
+  lr: 1.0e-3
+  weight_decay: 5.0e-5
+  amp: true
+  amp_dtype: auto         # [FIX-2] bf16 on Ampere+, safe FP32 fallback on older GPUs
+  device: cuda
+  activation_checkpointing: true  # [FIX-3] mandatory for 22 edge types; recompute instead of OOM
+  compile: false          # keep false: torch.compile + multi-GPU froze training in all variants
+  tf32: true
+  scheduler: cosine_annealing
+  scheduler_pct_start: 0.05   # 5% warmup (~7 epochs) stabilises GCL loss early
+  scheduler_eta_min: 1.0e-5
+  grad_clip_norm: 1.0
+  adamw_eps: 1.0e-6
+  adamw_betas: [0.9, 0.95]
+  loss_type: focal
+  focal_gamma: 2.0
+  label_smoothing: 0.05
+  class_weight: balanced
+  class_weight_cap: 10.0  # [FIX-1] all 6 paper variants required this; prevents loss spikes
+  drw_start_pct: 0.0
+  drop_edge_prob: 0.10
+  ema_enabled: true
+  ema_decay: 0.999
+  skip_val_first_epoch: false
+  eval_every: 1
+  val_ratio: 0.1
+  test_ratio: 0.1
+  seed: 42
+  stratified_batch_sampling: true
+
+  # NOTE: split_protocol lives under data: (above). The trainer's
+  # apply_cli_overrides sets config['data']['split_protocol'] when
+  # --split-protocol is passed, so the data: block is the canonical location.
+
+  # GCL auxiliary loss (NEW in v3) — uses class_technique_map positive pairs
+  # to pull packet embeddings toward their class's MITRE technique embedding
+  # and push them away from random unmapped techniques.
+  gcl_enabled: true
+  gcl_weight: 0.2
+  gcl_temperature: 0.1
+  gcl_positive_source: class_technique_map
+  gcl_n_negatives: 16
+
+  # HGAA — Adaptive heterogeneous-graph augmentation (Zhao et al. Symmetry 2025).
+  # 4 operators: edge_addition, node_feature_swap, edge_direction_swap, edge_perturbation.
+  # Tail classes auto-detected at training startup from class distribution.
+  hgaa:
+    enabled: true
+    aug_prob: 0.5
+    bias_factor_T: 0.5
+    tail_class_k: 3
+
+sampler:
+  # hops=4: supports full hierarchy flow(0)→packet(1)→technique(2)→tactic(3) plus
+  # 1 extra hop for burst_neighbor/host context.
+  # With activation_checkpointing=true, 4 hops at 22 edge types fits L40S 48GB.
+  hops: 4
+  fanouts:
+    # Flow-packet backbone (highest priority — direct classification signal)
+    flow__contains__packet: 20
+    packet__next_packet__packet: 4
+    # 5 typed evidence edge families (v3 NEW — PMI+procedure+consensus ensemble)
+    packet__evidence_injection__technique: 4
+    packet__evidence_command_exec__technique: 4
+    packet__evidence_file_upload__technique: 3
+    packet__evidence_recon__technique: 3
+    packet__evidence_c2_beacon__technique: 3
+    # Host-level context
+    flow__from_host__host: 1
+    flow__to_host__host: 1
+    # Temporal burst neighbors (DLG-IDS: burst patterns are key ICS IDS signal)
+    flow__burst_neighbor__flow: 6
+    # MITRE hierarchy
+    flow__matches_technique__technique: 3
+    technique__has_subtechnique__technique: 2
+    technique__belongs_to_tactic__tactic: 1
+  reverse_fanouts:
+    # [FIX from all paper variants] non-zero reverse fanouts critical for gradient
+    # propagation from technique/tactic nodes back to packet/flow embeddings.
+    rev_contains: 3
+    rev_next_packet: 2
+    rev_evidence_injection: 2
+    rev_evidence_command_exec: 2
+    rev_evidence_file_upload: 2
+    rev_evidence_recon: 2
+    rev_evidence_c2_beacon: 2
+    rev_from_host: 3
+    rev_to_host: 3
+    rev_burst_neighbor: 3
+    rev_matches_technique: 2
+    rev_has_subtechnique: 2
+    rev_belongs_to_tactic: 1
+  always_include_all_techniques: true
+  always_include_all_tactics: true
+
+dataloader:
+  num_workers: 4          # L40S has enough CPU cores; more workers → better GPU utilisation
+  prefetch_factor: 4      # GATransformer/AHGT-DFD use 4; reduces GPU idle between batches
+  pin_memory: true
+  persistent_workers: true

@@ -1,0 +1,90 @@
+# EG-HGT v2 — Evidence-Grounded Heterogeneous Threat-Knowledge Graph.
+#
+# Use this config to train the HGT on the v2 graph artifact built by
+# `python -m graphslm_ids.offline.preprocessing.v2.cli`.
+#
+# Smoke version: tiny model, CPU, 2 epochs -- just verifies the trainer
+# can load the v2 artifact, build the sampler, and complete an epoch.
+# For full training swap epochs/batch/device for your GPU box.
+
+experiment:
+  source_name: "EG-HGT v2 smoke (local CPU)"
+  rationale: >
+    Smoke run to verify v2 artifact loads end-to-end through the HGT trainer.
+    Full GPU training uses a config of the same shape but with hidden_dim=384,
+    num_layers=4, num_heads=12, epochs=80, device=cuda.
+
+data:
+  artifact_version: v2
+  graph_npz: outputs/v2/graph_smoke.npz
+  graph_meta_json: outputs/v2/graph_smoke.meta.json
+  add_reverse_edges: true
+  standardize_flow_features: true
+  use_semantic_edge_weights: true
+  use_temporal_edge_weights: false
+
+model:
+  hidden_dim: 64
+  num_layers: 2
+  num_heads: 2
+  dropout: 0.1
+  ffn_multiplier: 2
+
+train:
+  output_dir: outputs/v2/smoke_hgt
+  epochs: 2
+  lr: 1.0e-3
+  weight_decay: 0.0
+  patience: 999
+  batch_seed_flows: 64
+  grad_accum_steps: 1
+  monitor: val_macro_f1
+  log_every: 1
+  amp: false
+  amp_dtype: float32
+  device: cpu
+  activation_checkpointing: false
+  compile: false
+  tf32: false
+  scheduler: none
+  scheduler_pct_start: 0.05
+  scheduler_eta_min: 1.0e-5
+  grad_clip_norm: 1.0
+  adamw_eps: 1.0e-6
+  adamw_betas: [0.9, 0.95]
+  loss_type: ce
+  label_smoothing: 0.0
+  focal_gamma: 2.0
+  class_weight: none
+  drw_start_pct: 0.0
+  drop_edge_prob: 0.0
+  ema_enabled: false
+  sam_enabled: false
+  skip_val_first_epoch: false
+  eval_every: 1
+  val_ratio: 0.2
+  test_ratio: 0.2
+  seed: 42
+  stratified_batch_sampling: false
+
+sampler:
+  hops: 2
+  fanouts:
+    flow__contains__packet: 4
+    packet__next_packet__packet: 2
+    packet__matches_technique__technique: 2
+    flow__matches_technique__technique: 2
+    technique__belongs_to_tactic__tactic: 1
+  reverse_fanouts:
+    rev_contains: 1
+    rev_next_packet: 1
+    rev_matches_technique: 1
+    rev_belongs_to_tactic: 0
+  always_include_all_tactics: true
+  always_include_all_techniques: true
+
+dataloader:
+  num_workers: 0
+  prefetch_factor: 2
+  pin_memory: false
+  persistent_workers: false

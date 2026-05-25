@@ -8,7 +8,6 @@ from graphslm_ids.runtime.fast_path.hot_graph_buffer import HotGraphBuffer
 from graphslm_ids.runtime.fast_path.mitre_index import MitreIndex
 from graphslm_ids.runtime.fast_path.payload_extractor_online import ExtractedPayload, PayloadExtractor
 from graphslm_ids.runtime.fast_path.policy_engine import PolicyDecision, PolicyEngine
-from graphslm_ids.runtime.fast_path.student_runtime import StudentRuntime
 from graphslm_ids.runtime.fast_path.subgraph_builder import Subgraph, SubgraphBuilder
 
 __all__ = [
@@ -26,7 +25,6 @@ __all__ = [
     "PolicyEngine",
     "SigcEdgeFilter",
     "SigcEdgeFilterConfig",
-    "StudentRuntime",
     "Subgraph",
     "SubgraphBuilder",
 ]
