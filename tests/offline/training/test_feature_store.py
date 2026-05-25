@@ -169,3 +169,60 @@ def test_compute_access_frequency_deterministic_and_counts():
     assert f1.shape == (10,)
     np.testing.assert_array_equal(f1, f2)
     assert int(f1.sum()) > 0
+
+
+@pytest.fixture
+def tiny_backend():
+    from graphslm_ids.offline.training.hetero_graph_artifact import HeteroGraphArtifact
+    from graphslm_ids.offline.training.neighbor_sampling import InMemoryNeighborBackend
+
+    nf = {
+        "flow": np.random.RandomState(0).rand(4, 5).astype(np.float32),
+        "packet": (np.arange(6 * 2323).reshape(6, 2323) % 50).astype(np.float32),
+        "technique": np.random.RandomState(1).rand(3, 8).astype(np.float32),
+        "tactic": np.zeros((2, 1), dtype=np.float32),
+        "host": np.zeros((2, 4), dtype=np.float32),
+    }
+    ei = {
+        ("flow", "contains", "packet"): np.array([[0, 0, 1, 2, 3], [0, 1, 2, 3, 4]], dtype=np.int64),
+        ("packet", "next_packet", "packet"): np.array([[0, 1], [1, 2]], dtype=np.int64),
+        ("technique", "belongs_to_tactic", "tactic"): np.array([[0, 1], [0, 1]], dtype=np.int64),
+    }
+    ea = {k: np.ones((v.shape[1],), dtype=np.float32) for k, v in ei.items()}
+    art = HeteroGraphArtifact(
+        node_features=nf, edge_index=ei, edge_attr=ea,
+        flow_y=np.array([0, 1, 0, 1], dtype=np.int64), metadata={},
+    )
+    return InMemoryNeighborBackend(art)
+
+
+def test_to_torch_batch_gathers_packet_from_store(tiny_backend):
+    from graphslm_ids.offline.training.neighbor_sampling import HeteroNeighborSampler
+    from graphslm_ids.offline.training.feature_store import (
+        ArrayPacketSource, TieredFeatureStore,
+    )
+    from graphslm_ids.offline.training.train_hgt_flow_classifier import to_torch_batch
+
+    sampler = HeteroNeighborSampler(
+        backend=tiny_backend, hops=2, fanouts={"contains": 4, "next_packet": 2},
+        always_include_all_techniques=False, always_include_all_tactics=False,
+        defer_packet_features=True,
+    )
+    batch = sampler.sample([0, 1])
+
+    packet_x = tiny_backend.artifact.node_features["packet"].astype(np.float16)
+    store = TieredFeatureStore(
+        source=ArrayPacketSource(packet_x), device=torch.device("cpu"),
+        freq_order=np.arange(6, dtype=np.int64), capacity=6, cache_dtype="float32",
+    )
+    edge_types = list(batch.edge_index.keys())
+    node_tensors, *_ = to_torch_batch(
+        batch, edge_types, torch.device("cpu"),
+        use_semantic_edge_weights=False, packet_store=store,
+    )
+    pkt_ids = batch.local_to_global["packet"]
+    assert node_tensors["packet"].shape[0] == pkt_ids.shape[0]
+    np.testing.assert_allclose(
+        node_tensors["packet"].cpu().numpy(),
+        packet_x[pkt_ids].astype(np.float32), rtol=1e-2, atol=1e-2,
+    )
