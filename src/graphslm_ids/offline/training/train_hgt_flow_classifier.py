@@ -623,7 +623,7 @@ def build_packet_store(config, backend, sampler, train_flow_ids, device):
     freq = compute_access_frequency(
         sampler=sampler, seed_flow_ids=train_flow_ids,
         num_packets=source.num_rows,
-        batch_size=int(config["dataloader"]["batch_size"]),
+        batch_size=int(config["train"].get("batch_seed_flows", 256)),
         n_warmup_batches=int(fs.get("n_warmup_batches", 200)),
         seed=int(config.get("seed", 42)),
     )
