@@ -361,6 +361,7 @@ def load_v3_artifact(
     graph_npz: Path,
     graph_meta_json: Path | None = None,
     add_reverse_edges: bool = True,
+    packet_dtype: str = "float32",
 ) -> HeteroGraphArtifact:
     """Load a v3 Smart-BOTH Hybrid graph artifact (``artifact_version='v3'``).
 
@@ -405,7 +406,12 @@ def load_v3_artifact(
 
     flow_x = np.asarray(_require_array(arrays, "flow_x"), dtype=np.float32)
     flow_y = np.asarray(_require_array(arrays, "flow_y"), dtype=np.int64)
-    packet_x = np.asarray(_require_array(arrays, "packet_x"), dtype=np.float32)
+    if packet_dtype == "preserve":
+        packet_x = np.asarray(_require_array(arrays, "packet_x"))
+    else:
+        packet_x = np.asarray(
+            _require_array(arrays, "packet_x"), dtype=np.dtype(packet_dtype)
+        )
     host_x = np.asarray(_require_array(arrays, "host_x"), dtype=np.float32)
     technique_x = np.asarray(_require_array(arrays, "technique_x"), dtype=np.float32)
 
