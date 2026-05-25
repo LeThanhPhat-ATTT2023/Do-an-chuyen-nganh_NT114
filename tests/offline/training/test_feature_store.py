@@ -10,7 +10,7 @@ pytest.importorskip("torch")
 
 
 def _load_downcast():
-    script = Path(__file__).resolve().parents[2] / "scripts" / "tools" / "downcast_packet_x.py"
+    script = Path(__file__).resolve().parents[3] / "scripts" / "tools" / "downcast_packet_x.py"
     spec = importlib.util.spec_from_file_location("downcast_packet_x_tool", script)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
