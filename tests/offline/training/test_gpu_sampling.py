@@ -114,3 +114,60 @@ def test_torch_local_map_empty_calls():
     look = m.lookup(torch.tensor([1, 2], dtype=torch.int64, device=dev))
     assert look.tolist() == [-1, -1]
     assert m.globals_array().numel() == 0
+
+
+@pytest.fixture
+def tiny_backend():
+    from graphslm_ids.offline.training.hetero_graph_artifact import HeteroGraphArtifact
+    from graphslm_ids.offline.training.neighbor_sampling import InMemoryNeighborBackend
+
+    nf = {
+        "flow": np.random.RandomState(0).rand(4, 5).astype(np.float32),
+        "packet": (np.arange(6 * 2323).reshape(6, 2323) % 50).astype(np.float32),
+        "technique": np.random.RandomState(1).rand(3, 8).astype(np.float32),
+        "tactic": np.zeros((2, 1), dtype=np.float32),
+        "host": np.zeros((2, 4), dtype=np.float32),
+    }
+    ei = {
+        ("flow", "contains", "packet"): np.array([[0, 0, 1, 2, 3], [0, 1, 2, 3, 4]], dtype=np.int64),
+        ("packet", "next_packet", "packet"): np.array([[0, 1], [1, 2]], dtype=np.int64),
+        ("technique", "belongs_to_tactic", "tactic"): np.array([[0, 1], [0, 1]], dtype=np.int64),
+    }
+    ea = {k: np.ones((v.shape[1],), dtype=np.float32) for k, v in ei.items()}
+    art = HeteroGraphArtifact(
+        node_features=nf, edge_index=ei, edge_attr=ea,
+        flow_y=np.array([0, 1, 0, 1], dtype=np.int64), metadata={},
+    )
+    return InMemoryNeighborBackend(art)
+
+
+def test_torch_sampler_matches_numpy_sampler_fanout_none(tiny_backend):
+    from graphslm_ids.offline.training.neighbor_sampling import HeteroNeighborSampler
+    from graphslm_ids.offline.training.gpu_sampling import (
+        GpuNeighborBackend, TorchHeteroNeighborSampler,
+    )
+
+    np_sampler = HeteroNeighborSampler(
+        backend=tiny_backend, hops=2, fanouts=None,
+        always_include_all_techniques=False, always_include_all_tactics=False,
+        standardize_flow_features=False,
+    )
+    np_batch = np_sampler.sample([0, 1])
+
+    gpu_backend = GpuNeighborBackend(tiny_backend, device=torch.device("cpu"))
+    t_sampler = TorchHeteroNeighborSampler(
+        backend=gpu_backend, hops=2, fanouts=None,
+        always_include_all_techniques=False, always_include_all_tactics=False,
+        standardize_flow_features=False,
+    )
+    t_batch = t_sampler.sample([0, 1])
+
+    # Same packet/flow node sets (first-occurrence order, deterministic with fanout=None).
+    assert np.array_equal(
+        t_batch.local_to_global["packet"].cpu().numpy(),
+        np_batch.local_to_global["packet"],
+    )
+    assert np.array_equal(
+        t_batch.local_to_global["flow"].cpu().numpy(),
+        np_batch.local_to_global["flow"],
+    )
