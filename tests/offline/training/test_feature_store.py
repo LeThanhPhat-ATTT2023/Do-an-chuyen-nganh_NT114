@@ -36,3 +36,27 @@ def test_downcast_packet_x_rewrites_npz_to_float16(tmp_path):
         assert loaded["packet_x"].dtype == np.float16
         assert loaded["flow_x"].dtype == np.float32
         assert loaded["flow_y"].tolist() == [0, 1]
+
+
+def test_array_packet_source_gather(tmp_path):
+    from graphslm_ids.offline.training.feature_store import ArrayPacketSource
+
+    data = np.arange(5 * 3).reshape(5, 3).astype(np.float16)
+    src = ArrayPacketSource(data)
+    assert src.num_rows == 5
+    assert src.dim == 3
+    got = src.gather(np.array([4, 0, 2], dtype=np.int64))
+    np.testing.assert_array_equal(got, data[[4, 0, 2]])
+
+
+def test_memmap_packet_source_gather(tmp_path):
+    from graphslm_ids.offline.training.feature_store import MemmapPacketSource
+
+    data = np.arange(6 * 4).reshape(6, 4).astype(np.float16)
+    bin_path = tmp_path / "packet_x.f16.bin"
+    data.tofile(bin_path)
+
+    src = MemmapPacketSource(bin_path, num_rows=6, dim=4, dtype="float16")
+    assert src.num_rows == 6
+    got = src.gather(np.array([5, 1], dtype=np.int64))
+    np.testing.assert_array_equal(got, data[[5, 1]])
