@@ -252,6 +252,7 @@ class TorchHeteroNeighborSampler:
         always_include_all_tactics: bool = True,
         always_include_all_techniques: bool = True,
         standardize_flow_features: bool = False,
+        flow_feature_stats: dict | None = None,
         seed: int = 42,
     ) -> None:
         self.backend = backend
@@ -262,6 +263,21 @@ class TorchHeteroNeighborSampler:
         self.always_include_all_techniques = bool(always_include_all_techniques)
         self.standardize_flow_features = bool(standardize_flow_features)
         self.generator = torch.Generator(device=backend.device).manual_seed(seed)
+        # Parity with numpy HeteroNeighborSampler: when enabled AND stats are
+        # provided, cache mean/std on device as 1xD row vectors so sample() can
+        # standardize flow_x in-line (broadcast subtract / divide).
+        self._mean: torch.Tensor | None = None
+        self._std: torch.Tensor | None = None
+        if self.standardize_flow_features and flow_feature_stats is not None:
+            mean = flow_feature_stats.get("mean")
+            std = flow_feature_stats.get("std")
+            if mean is not None and std is not None:
+                self._mean = torch.from_numpy(
+                    np.asarray(mean, dtype=np.float32)
+                ).reshape(1, -1).to(backend.device)
+                self._std = torch.from_numpy(
+                    np.maximum(np.asarray(std, dtype=np.float32), 1e-6)
+                ).reshape(1, -1).to(backend.device)
 
     def _fanout(self, edge_type):
         name = edge_key_to_name(edge_type)
@@ -347,8 +363,15 @@ class TorchHeteroNeighborSampler:
         if bool(valid_seed.any()):
             seed_mask[seed_local[valid_seed]] = True
 
+        flow_x = self.backend.get_flow_features(flow_ids)
+        if (
+            self._mean is not None
+            and self._std is not None
+            and flow_x.shape[1] == self._mean.shape[1]
+        ):
+            flow_x = (flow_x - self._mean) / self._std
         node_features = {
-            "flow": self.backend.get_flow_features(flow_ids),
+            "flow": flow_x,
             "packet": torch.empty((0, self.backend.feature_dims["packet"]), device=dev),
             "technique": torch.empty((0, self.backend.feature_dims["technique"]), device=dev),
             "tactic": tactic_ids.reshape(-1, 1).to(torch.int64),

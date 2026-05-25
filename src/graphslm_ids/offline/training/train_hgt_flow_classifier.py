@@ -4,6 +4,7 @@ import argparse
 from contextlib import nullcontext as _nullcontext
 from copy import deepcopy
 from datetime import datetime, timezone
+import logging
 import math
 import os
 from pathlib import Path
@@ -12,6 +13,8 @@ import threading
 import time
 import warnings
 from typing import Any, TYPE_CHECKING
+
+_LOG = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from graphslm_ids.offline.training.feature_store import TieredFeatureStore
@@ -641,11 +644,15 @@ def build_packet_store(config, backend, sampler, train_flow_ids, device):
     )
 
 
-def maybe_build_gpu_sampling(config, in_memory_backend, device):
+def maybe_build_gpu_sampling(config, in_memory_backend, device, flow_feature_stats=None):
     """Build (GpuNeighborBackend, TorchHeteroNeighborSampler) when enabled, else None.
 
     Requires ``feature_store.enabled=True`` because the torch sampler always
     defers packet features and only the store can gather them.
+
+    ``flow_feature_stats`` (``{"mean":..., "std":...}``) is forwarded so the
+    torch sampler standardizes flow_x in-line with the same cached stats as the
+    numpy sampler (parity).
     """
     if not config.get("gpu_sampling", {}).get("enabled", False):
         return None
@@ -669,6 +676,7 @@ def maybe_build_gpu_sampling(config, in_memory_backend, device):
         always_include_all_tactics=bool(sampler_cfg.get("always_include_all_tactics", True)),
         always_include_all_techniques=bool(sampler_cfg.get("always_include_all_techniques", True)),
         standardize_flow_features=bool(config.get("data", {}).get("standardize_flow_features", True)),
+        flow_feature_stats=flow_feature_stats,
         seed=int(config.get("train", {}).get("seed", 42)),
     )
     return gpu_backend, sampler
@@ -1775,7 +1783,9 @@ def train_neighbor_sampling(
     # Per-rank RNG seed so ranks don't all pick identical neighbour subsamples
     # (each rank already sees a different flow shard via DistributedSampler, but
     # diverging samplers help hide any residual correlation in random keys).
-    gpu_sampling = maybe_build_gpu_sampling(config, backend, device)
+    gpu_sampling = maybe_build_gpu_sampling(
+        config, backend, device, flow_feature_stats=flow_feature_stats
+    )
     if gpu_sampling is not None:
         # GPU-side sampler holds CSR on device and returns torch tensors. CUDA
         # contexts cannot fork into DataLoader workers, and pin_memory() would
@@ -1784,9 +1794,16 @@ def train_neighbor_sampling(
         # because the torch sampler always defers packet features.
         _gpu_backend, sampler = gpu_sampling
         dl_cfg = config.setdefault("dataloader", {})
-        dl_cfg["num_workers"] = 0
-        dl_cfg["pin_memory"] = False
-        dl_cfg["persistent_workers"] = False
+        forced = {"num_workers": 0, "pin_memory": False, "persistent_workers": False}
+        overrides = {
+            k: (dl_cfg.get(k), v) for k, v in forced.items() if dl_cfg.get(k) != v
+        }
+        if overrides:
+            _LOG.warning(
+                "gpu_sampling.enabled=True: overriding dataloader settings %s",
+                {k: f"{orig!r} -> {new!r}" for k, (orig, new) in overrides.items()},
+            )
+        dl_cfg.update(forced)
     else:
         sampler = HeteroNeighborSampler(
             backend,

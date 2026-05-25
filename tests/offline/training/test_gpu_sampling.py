@@ -203,3 +203,32 @@ def test_gpu_sampling_path_produces_batch_with_packet_store(tiny_backend):
     pkt_ids = batch.local_to_global["packet"]
     assert node_tensors["packet"].shape[0] == int(pkt_ids.numel())
     assert node_tensors["packet"].dtype == torch.float32
+
+
+def test_torch_sampler_honors_standardize_flow_features(tiny_backend):
+    from graphslm_ids.offline.training.gpu_sampling import (
+        GpuNeighborBackend, TorchHeteroNeighborSampler,
+    )
+    stats = {
+        "mean": np.zeros(5, dtype=np.float32),
+        "std": np.ones(5, dtype=np.float32),
+    }
+    gpu_backend = GpuNeighborBackend(tiny_backend, device=torch.device("cpu"))
+    s_on = TorchHeteroNeighborSampler(
+        backend=gpu_backend, hops=1,
+        fanouts={"contains": 2, "next_packet": 1},
+        always_include_all_techniques=False, always_include_all_tactics=False,
+        standardize_flow_features=True, flow_feature_stats=stats,
+    )
+    s_off = TorchHeteroNeighborSampler(
+        backend=gpu_backend, hops=1,
+        fanouts={"contains": 2, "next_packet": 1},
+        always_include_all_techniques=False, always_include_all_tactics=False,
+        standardize_flow_features=False,
+    )
+    b_on = s_on.sample([0, 1]); b_off = s_off.sample([0, 1])
+    # With mean=0/std=1 standardization is a no-op -> outputs equal.
+    np.testing.assert_allclose(
+        b_on.node_features["flow"].cpu().numpy(),
+        b_off.node_features["flow"].cpu().numpy(),
+    )
