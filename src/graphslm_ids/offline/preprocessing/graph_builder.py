@@ -471,6 +471,7 @@ def build_v3_graph_artifact(
     payload_length: int = 256,
     tau_edge: float = 0.4,
     tmp_dir: Path | None = None,
+    n_workers: int | None = None,
 ) -> dict[str, Any]:
     """End-to-end v3 graph build. See module docstring for schema.
 
@@ -569,6 +570,7 @@ def build_v3_graph_artifact(
         payload_lens,
         payload_length=payload_length,
         mmap_path=packet_x_mmap_path,
+        n_workers=n_workers,
     )
     _LOG.info("packet_x: shape=%s dtype=%s mmap=%s (%.1fs)",
               packet_x.shape, packet_x.dtype, packet_x_mmap_path, time.time() - t0)
@@ -666,7 +668,11 @@ def build_v3_graph_artifact(
     # Build batches for parallel processing: each batch = list of
     # (pidx, payload_bytes, flow_hits_dict).  Batch size ~2 K keeps IPC
     # round-trips and per-batch pickle overhead balanced.
-    n_workers_ev = os.cpu_count() or 1
+    from graphslm_ids.offline.preprocessing._resource import auto_compute_workers
+    # Evidence pool: pure CPU-compute, not RAM-limited per worker.
+    # n_workers override comes from --n-compute-workers; None → os.cpu_count().
+    _n_ev_tasks = max(1, n_packets // 500)   # rough batch-count ceiling for cap
+    n_workers_ev = auto_compute_workers(_n_ev_tasks, override=n_workers)
     batch_size = max(500, n_packets // (n_workers_ev * 8))
     batches: list[list[tuple]] = []
     for b_start in range(0, n_packets, batch_size):
