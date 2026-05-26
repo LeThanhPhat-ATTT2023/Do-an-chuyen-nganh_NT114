@@ -70,8 +70,8 @@ train:
   output_dir: outputs/v3/hgt
   epochs: 150
   patience: 40            # [FIX-5] temporal split needs more patience; GATransformer/AHGT=40
-  batch_seed_flows: 128   # halved again — 22-edge-type subgraph activations need headroom
-  grad_accum_steps: 4     # effective batch stays 128×4 = 512; per-step VRAM halved
+  batch_seed_flows: 64    # halved again — 4-hop + rev_fanouts pull >900k flows into subgraph
+  grad_accum_steps: 8     # effective batch stays 64×8 = 512
   monitor: val_macro_f1
   log_every: 1
   lr: 1.0e-3
@@ -127,44 +127,45 @@ train:
     tail_class_k: 3
 
 sampler:
-  # hops=4: supports full hierarchy flow(0)→packet(1)→technique(2)→tactic(3) plus
-  # 1 extra hop for burst_neighbor/host context.
-  # With activation_checkpointing=true, 4 hops at 22 edge types fits L40S 48GB.
-  hops: 4
+  # hops=3: cover flow→packet→technique→tactic. The previous hops=4 + heavy
+  # rev_* fanouts caused full-graph expansion (>900k flows per batch) → OOM.
+  # 3 hops still covers the full hierarchy; the 4th hop was extra context only.
+  hops: 3
   fanouts:
-    # Flow-packet backbone (highest priority — direct classification signal)
-    flow__contains__packet: 20
-    packet__next_packet__packet: 4
+    # Flow-packet backbone — reduced from 20 to 10 to cap subgraph size.
+    flow__contains__packet: 10
+    packet__next_packet__packet: 3
     # 5 typed evidence edge families (v3 NEW — PMI+procedure+consensus ensemble)
-    packet__evidence_injection__technique: 4
-    packet__evidence_command_exec__technique: 4
-    packet__evidence_file_upload__technique: 3
-    packet__evidence_recon__technique: 3
-    packet__evidence_c2_beacon__technique: 3
+    packet__evidence_injection__technique: 3
+    packet__evidence_command_exec__technique: 3
+    packet__evidence_file_upload__technique: 2
+    packet__evidence_recon__technique: 2
+    packet__evidence_c2_beacon__technique: 2
     # Host-level context
     flow__from_host__host: 1
     flow__to_host__host: 1
-    # Temporal burst neighbors (DLG-IDS: burst patterns are key ICS IDS signal)
-    flow__burst_neighbor__flow: 6
+    # Temporal burst neighbors — reduced 6→3 to cap flow expansion.
+    flow__burst_neighbor__flow: 3
     # MITRE hierarchy
-    flow__matches_technique__technique: 3
+    flow__matches_technique__technique: 2
     technique__has_subtechnique__technique: 2
     technique__belongs_to_tactic__tactic: 1
   reverse_fanouts:
-    # [FIX from all paper variants] non-zero reverse fanouts critical for gradient
-    # propagation from technique/tactic nodes back to packet/flow embeddings.
-    rev_contains: 3
-    rev_next_packet: 2
-    rev_evidence_injection: 2
-    rev_evidence_command_exec: 2
-    rev_evidence_file_upload: 2
-    rev_evidence_recon: 2
-    rev_evidence_c2_beacon: 2
-    rev_from_host: 3
-    rev_to_host: 3
-    rev_burst_neighbor: 3
-    rev_matches_technique: 2
-    rev_has_subtechnique: 2
+    # Reverse fanouts kept but trimmed — large rev_* values combined with
+    # always_include_all_techniques cause exponential subgraph blow-up.
+    # Gradients still flow back; just at lower amplification.
+    rev_contains: 1
+    rev_next_packet: 1
+    rev_evidence_injection: 1
+    rev_evidence_command_exec: 1
+    rev_evidence_file_upload: 1
+    rev_evidence_recon: 1
+    rev_evidence_c2_beacon: 1
+    rev_from_host: 1
+    rev_to_host: 1
+    rev_burst_neighbor: 1
+    rev_matches_technique: 1
+    rev_has_subtechnique: 1
     rev_belongs_to_tactic: 1
   always_include_all_techniques: true
   always_include_all_tactics: true
@@ -183,8 +184,8 @@ dataloader:
 # thời gian train ước tính từ ~20h xuống còn ~5-8h.
 feature_store:
   enabled: true
-  cache_fraction: 0.5      # 50% VRAM còn lại dành cho packet_x hot cache (giảm để chừa chỗ activations)
-  model_reserve_gb: 14.0   # 4GB model+optim + ~10GB activations (hops=4 × 22 edge types cần nhiều)
+  cache_fraction: 0.2      # 20% — shrink cache aggressively to leave VRAM for sampling+activations
+  model_reserve_gb: 24.0   # reserve 24GB for model+optim+topology+activations
   n_warmup_batches: 200    # warm up cache 200 batch đầu trước khi đánh giá hit rate
 
 gpu_sampling:
