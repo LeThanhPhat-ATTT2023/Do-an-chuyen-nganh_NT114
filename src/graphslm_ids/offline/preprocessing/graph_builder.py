@@ -246,28 +246,36 @@ def _build_host_tier(
     return host_x, host_to_idx, from_host_eidx, to_host_eidx, fwd_bytes, bwd_bytes
 
 
-_BURST_NEIGHBOR_MAX_FLOWS = 500_000  # above this, query_ball_tree OOMs on 1.1M+ flow graphs
-
-
 def _build_burst_neighbor_edges(
     feats_df: pd.DataFrame,
+    tmp_dir: Path,
     radius_sec: float = 1.0,
     max_neighbors: int = 5,
+    writer_cap: int = 2_000_000,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """KDTree over flow start timestamps -> share_src/share_dst homophily edges.
+    """Time-windowed homophily edges via sorted-ts sweep, streamed to disk.
 
-    For each flow we query a 1-D KDTree at radius ``radius_sec`` and keep at
-    most ``max_neighbors`` candidates. Edge is emitted iff src or dst IP is
-    shared. Bidirectional (we emit ``(i, j)`` AND ``(j, i)`` whenever ``i < j``
-    and the predicate fires) so downstream HGT does not need to know which
-    side of the pair the seed was.
+    Emits, for each flow i, up to ``max_neighbors`` forward neighbors j with
+    ``|ts[j] - ts[i]| <= radius_sec`` AND (``src_ips[i]==src_ips[j]`` OR
+    ``dst_ips[i]==dst_ips[j]``). Edges are emitted bidirectionally so HGT
+    does not need to know which side of the pair the seed was.
 
-    Attr is ``[share_src_ip, share_dst_ip]`` as int8 packed into float32 (the
-    edge writer is float32; the values are 0.0 / 1.0 so int8 packing isn't
-    necessary at storage).
+    Why not ``cKDTree.query_ball_tree``: it materializes an n-element Python
+    list-of-lists of neighbor indices BEFORE any filtering. On 1.1M flows
+    with bursty attack traffic (1000+ flows/sec) each list holds hundreds of
+    indices → tens of GB of Python int objects → OOM.
+
+    This implementation:
+      1. Sort flows by ``ts`` once (O(n log n), ~50 MB).
+      2. Per-anchor ``np.searchsorted`` finds the forward time-window end.
+      3. Vectorized comparison of int32-encoded src/dst IDs inside that
+         window — only one window slice in flight at a time.
+      4. Edges stream through :class:`MemmapEdgeWriter` (cap=2 M rows ≈
+         260 MB RAM, then spills ``.bin`` chunks to ``tmp_dir`` and
+         reloads at finalize). RAM stays bounded regardless of n_flows.
+
+    Attr is ``[share_src_ip, share_dst_ip]`` ∈ {0.0, 1.0} float32.
     """
-    from scipy.spatial import cKDTree
-
     if "flow_start_ts" in feats_df.columns:
         ts = feats_df["flow_start_ts"].to_numpy(dtype=np.float64)
     elif "ts_min" in feats_df.columns:
@@ -276,60 +284,93 @@ def _build_burst_neighbor_edges(
         # No timestamp column -> can't build temporal homophily. Return empty.
         return np.empty((2, 0), dtype=np.int64), np.empty((0, 2), dtype=np.float32)
 
-    if len(ts) == 0:
+    n = len(ts)
+    if n == 0:
         return np.empty((2, 0), dtype=np.int64), np.empty((0, 2), dtype=np.float32)
 
-    # query_ball_tree on large graphs produces O(n * avg_neighbors) Python list
-    # objects that easily exhaust RAM (1.1M flows × hundreds of neighbors/flow).
-    # burst_neighbor is an auxiliary homophily edge — skip for large graphs.
-    if len(ts) > _BURST_NEIGHBOR_MAX_FLOWS:
-        _LOG.warning(
-            "burst_neighbor: skipping — n_flows=%d > limit=%d (OOM guard). "
-            "Set _BURST_NEIGHBOR_MAX_FLOWS higher if you have sufficient RAM.",
-            len(ts), _BURST_NEIGHBOR_MAX_FLOWS,
-        )
-        return np.empty((2, 0), dtype=np.int64), np.empty((0, 2), dtype=np.float32)
+    # Encode IP strings as int32 IDs — comparison on int32 is SIMD-vectorized
+    # and ~100x faster than numpy object-array string comparison, and the
+    # int32 columns weigh 4 bytes/row vs ~80 bytes/row for Python strings.
+    src_ips_str = feats_df["src_ip"].astype(str).to_numpy()
+    dst_ips_str = feats_df["dst_ip"].astype(str).to_numpy()
+    unique_ips, inverse_src = np.unique(src_ips_str, return_inverse=True)
+    ip_to_id: dict[str, int] = {ip: i for i, ip in enumerate(unique_ips)}
+    src_ids = inverse_src.astype(np.int32, copy=False)
+    # dst_ips may contain IPs not seen in src_ips; extend the table.
+    dst_ids = np.empty(n, dtype=np.int32)
+    next_id = len(unique_ips)
+    for k in range(n):
+        ip = dst_ips_str[k]
+        if ip in ip_to_id:
+            dst_ids[k] = ip_to_id[ip]
+        else:
+            ip_to_id[ip] = next_id
+            dst_ids[k] = next_id
+            next_id += 1
+    del src_ips_str, dst_ips_str, inverse_src
 
-    src_ips = feats_df["src_ip"].astype(str).to_numpy()
-    dst_ips = feats_df["dst_ip"].astype(str).to_numpy()
+    # Sort by timestamp. ``order`` maps sorted-position -> original row index.
+    order = np.argsort(ts, kind="stable")
+    ts_sorted = ts[order]
+    src_sorted = src_ids[order]
+    dst_sorted = dst_ids[order]
+    del src_ids, dst_ids, ts
 
-    tree = cKDTree(ts.reshape(-1, 1))
-    # query_ball_tree(self, ...) returns lists of indices per row; for our
-    # workload (~177K flows, radius 1s) the per-row list is normally small.
-    neighbor_lists = tree.query_ball_tree(tree, r=radius_sec)
+    # window_ends[i] = first j in sorted order where ts_sorted[j] > ts_sorted[i] + radius.
+    # Vectorized O(n log n); ~9 MB int64.
+    window_ends = np.searchsorted(
+        ts_sorted, ts_sorted + radius_sec, side="right"
+    ).astype(np.int64, copy=False)
 
-    src_buf: list[int] = []
-    dst_buf: list[int] = []
-    attr_buf: list[list[float]] = []
-    for i, neigh in enumerate(neighbor_lists):
-        # Filter to forward pairs (i < j) so we don't double-count, then we
-        # emit both (i, j) AND (j, i) for HGT bidirectionality.
-        candidates = [j for j in neigh if j > i]
-        if not candidates:
-            continue
-        # Truncate to max_neighbors deterministically (sorted ascending).
-        for j in candidates[:max_neighbors]:
-            share_src = float(src_ips[i] == src_ips[j])
-            share_dst = float(dst_ips[i] == dst_ips[j])
-            if share_src == 0.0 and share_dst == 0.0:
-                continue
-            attr = [share_src, share_dst]
-            src_buf.append(int(i))
-            dst_buf.append(int(j))
-            attr_buf.append(attr)
-            src_buf.append(int(j))
-            dst_buf.append(int(i))
-            attr_buf.append(attr)
-
-    if not src_buf:
-        return np.empty((2, 0), dtype=np.int64), np.empty((0, 2), dtype=np.float32)
-    edge_index = np.vstack(
-        [
-            np.asarray(src_buf, dtype=np.int64),
-            np.asarray(dst_buf, dtype=np.int64),
-        ]
+    writer = MemmapEdgeWriter(
+        tmp_dir,
+        ("flow", "burst_neighbor", "flow"),
+        attr_dim=2,
+        initial_cap=writer_cap,
     )
-    edge_attr = np.asarray(attr_buf, dtype=np.float32)
+
+    n_pairs = 0
+    log_every = max(1, n // 20)
+    for i in range(n):
+        end = int(window_ends[i])
+        first = i + 1
+        if end <= first:
+            if (i + 1) % log_every == 0:
+                _LOG.debug("burst_neighbor: anchor %d/%d", i + 1, n)
+            continue
+        win_src = src_sorted[first:end]
+        win_dst = dst_sorted[first:end]
+        match_src = win_src == src_sorted[i]
+        match_dst = win_dst == dst_sorted[i]
+        match = match_src | match_dst
+        if not match.any():
+            continue
+        # First ``max_neighbors`` matching offsets within the window.
+        match_local = np.flatnonzero(match)[:max_neighbors]
+        # Build small numpy arrays for a bulk extend (two .tolist() round-trips).
+        j_sorted = first + match_local
+        orig_i = np.full(match_local.size, order[i], dtype=np.int64)
+        orig_j = order[j_sorted].astype(np.int64, copy=False)
+        attr = np.column_stack(
+            [match_src[match_local].astype(np.float32),
+             match_dst[match_local].astype(np.float32)]
+        )
+        # Bidirectional emission: (i,j) AND (j,i) with the same attr row.
+        writer.extend(orig_i, orig_j, attr)
+        writer.extend(orig_j, orig_i, attr)
+        n_pairs += int(match_local.size)
+        if (i + 1) % log_every == 0:
+            _LOG.info(
+                "burst_neighbor: anchor %d/%d, %d pairs so far",
+                i + 1, n, n_pairs,
+            )
+
+    _LOG.info(
+        "burst_neighbor: %d directed pairs (=%d bidirectional) ready to finalize",
+        2 * n_pairs, n_pairs,
+    )
+    edge_index, edge_attr = writer.finalize()
+    writer.close()
     return edge_index, edge_attr
 
 
@@ -640,7 +681,7 @@ def build_v3_graph_artifact(
 
     # ─── 7. burst_neighbor (flow -> flow homophily) ─────────────────────────
     t0 = time.time()
-    burst_eidx, burst_attr = _build_burst_neighbor_edges(feats_df_local)
+    burst_eidx, burst_attr = _build_burst_neighbor_edges(feats_df_local, tmp_dir)
     _LOG.info(
         "burst_neighbor edges: n=%d (%.1fs)",
         burst_eidx.shape[1],
