@@ -176,9 +176,20 @@ dataloader:
   persistent_workers: true
 
 # ── Feature store + GPU sampling (L40S 44 GB) ────────────────────────────────
-# packet_x float16 ≈ 2.8 GB + model ≈ 2 GB + overhead → tổng ~8 GB, còn 40 GB dư.
-# Toàn bộ graph topology + features nằm trên GPU → zero CPU↔GPU transfer mỗi batch.
-# Topology indices stored as int32 (zero quality impact, ~half memory vs int64).
+# DECISION (May 26): gpu_sampling=false. GpuNeighborBackend loads the ENTIRE
+# CSR topology (13 fwd + 13 rev edge types) onto the GPU at startup. Even with
+# int32 indices that static footprint leaves no room for forward activations on
+# the L40S 44 GB — OOM-retry bisected a batch all the way to 7 seeds and still
+# OOMed, proving the blocker is the resident graph, not batch size.
+#
+# CPU sampling keeps topology in host RAM (the g6e VM has plenty); only the
+# small sampled subgraph crosses to the GPU per batch. feature_store stays ON
+# so packet_x is cached on GPU (~3 GB) and the CPU sampler defers packet
+# features to it (defer_packet_features wired automatically). DataLoader's 8
+# workers parallelise the CPU K-hop sampling.
+#
+# (gpu_sampling.py keeps the int32-index optimization for any future big-GPU run
+#  that can afford resident topology — it just is not enabled here.)
 feature_store:
   enabled: true
   cache_fraction: 0.6      # 60% VRAM còn lại dành cho packet_x hot cache
@@ -186,4 +197,4 @@ feature_store:
   n_warmup_batches: 200    # warm up cache 200 batch đầu trước khi đánh giá hit rate
 
 gpu_sampling:
-  enabled: true            # neighbor sampling chạy trên GPU, không qua CPU workers
+  enabled: false           # topology stays in CPU RAM; only subgraphs go to GPU
