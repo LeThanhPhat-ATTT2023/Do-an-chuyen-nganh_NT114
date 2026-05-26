@@ -1287,7 +1287,11 @@ def to_torch_batch(
     if packet_store is not None:
         pkt_ids = batch.local_to_global.get("packet")
         if pkt_ids is not None:
-            node_tensors["packet"] = packet_store.gather(np.asarray(pkt_ids))
+            if isinstance(pkt_ids, torch.Tensor):
+                pkt_ids_np = pkt_ids.detach().cpu().numpy().astype(np.int64, copy=False)
+            else:
+                pkt_ids_np = np.asarray(pkt_ids, dtype=np.int64)
+            node_tensors["packet"] = packet_store.gather(pkt_ids_np)
     edge_tensors: dict[tuple[str, str, str], torch.Tensor] = {}
     for edge_type in edge_types:
         value = batch.edge_index.get(edge_type)
