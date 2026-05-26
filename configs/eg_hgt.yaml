@@ -176,13 +176,9 @@ dataloader:
   persistent_workers: true
 
 # ── Feature store + GPU sampling (L40S 44 GB) ────────────────────────────────
-# Empirical finding (May 26): GpuNeighborBackend moves ALL CSR topology (13 fwd
-# + 13 rev edge types over ~600k flows / ~600k packets) onto the GPU at startup,
-# consuming ~30+ GB. Combined with cache + model + activations this exceeds the
-# L40S's 44 GB → OOM at sampling/forward regardless of batch_seed_flows or fanout
-# tuning. Architectural fix: keep topology on CPU (InMemoryNeighborBackend has
-# plenty of RAM), only move sampled subgraphs to GPU per batch. packet_x hot
-# cache stays on GPU (small, ~3 GB). DataLoader workers parallelise CPU sampling.
+# packet_x float16 ≈ 2.8 GB + model ≈ 2 GB + overhead → tổng ~8 GB, còn 40 GB dư.
+# Toàn bộ graph topology + features nằm trên GPU → zero CPU↔GPU transfer mỗi batch.
+# Topology indices stored as int32 (zero quality impact, ~half memory vs int64).
 feature_store:
   enabled: true
   cache_fraction: 0.6      # 60% VRAM còn lại dành cho packet_x hot cache
@@ -190,4 +186,4 @@ feature_store:
   n_warmup_batches: 200    # warm up cache 200 batch đầu trước khi đánh giá hit rate
 
 gpu_sampling:
-  enabled: false           # topology stays on CPU; 30+ GB static GPU cost dropped
+  enabled: true            # neighbor sampling chạy trên GPU, không qua CPU workers
