@@ -213,13 +213,37 @@ class GpuNeighborBackend:
             self._technique_x = torch.from_numpy(
                 np.asarray(art.node_features["technique"], dtype=np.float32)
             ).to(device)
+        # Store CSR indptr/indices as int32 on device — halves topology footprint
+        # vs int64. Node counts (~600k) fit easily under int32 max (~2.1B), and
+        # gather_csr_neighbors_torch casts intermediate arithmetic back to int64
+        # explicitly, so output dtype is unchanged and there is no quality impact
+        # on downstream sampling/model. attr stays float32 (already 4 bytes).
+        # Guard against overflow: error loudly if any single edge type exceeds
+        # int32 range so future scale-ups don't silently corrupt indices.
+        INT32_MAX = (1 << 31) - 1
         self._csr: dict = {}
+        topology_bytes = 0
         for ek, (indptr, indices, attr) in in_memory_backend._edge_csr.items():
-            self._csr[ek] = (
-                torch.from_numpy(indptr).to(device),
-                torch.from_numpy(indices).to(device),
-                torch.from_numpy(attr).to(device),
+            n_edges = int(indices.shape[0])
+            n_src_plus_one = int(indptr.shape[0])
+            max_node_id = int(indices.max()) if n_edges else 0
+            max_offset = int(indptr.max()) if n_src_plus_one else 0
+            if max(max_node_id, max_offset) > INT32_MAX:
+                # Fall back to int64 for this edge type rather than corrupt
+                # indices; preserves the optimization for the common case.
+                indptr_t = torch.from_numpy(indptr.astype(np.int64, copy=False)).to(device)
+                indices_t = torch.from_numpy(indices.astype(np.int64, copy=False)).to(device)
+            else:
+                indptr_t = torch.from_numpy(indptr.astype(np.int32, copy=False)).to(device)
+                indices_t = torch.from_numpy(indices.astype(np.int32, copy=False)).to(device)
+            attr_t = torch.from_numpy(np.asarray(attr, dtype=np.float32)).to(device)
+            self._csr[ek] = (indptr_t, indices_t, attr_t)
+            topology_bytes += (
+                indptr_t.element_size() * indptr_t.numel()
+                + indices_t.element_size() * indices_t.numel()
+                + attr_t.element_size() * attr_t.numel()
             )
+        self._topology_bytes = topology_bytes
 
     @property
     def num_flows(self):
