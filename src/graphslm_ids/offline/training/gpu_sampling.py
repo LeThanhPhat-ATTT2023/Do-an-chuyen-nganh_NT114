@@ -205,6 +205,14 @@ class GpuNeighborBackend:
             self._host_x = torch.from_numpy(
                 np.asarray(art.node_features["host"], dtype=np.float32)
             ).to(device)
+        # Technique features are tiny (~hundreds of rows) — keep them on device
+        # and gather per-batch so node_features["technique"] is never empty.
+        # (Packet stays deferred to packet_store because it's large.)
+        self._technique_x: torch.Tensor | None = None
+        if "technique" in art.node_features:
+            self._technique_x = torch.from_numpy(
+                np.asarray(art.node_features["technique"], dtype=np.float32)
+            ).to(device)
         self._csr: dict = {}
         for ek, (indptr, indices, attr) in in_memory_backend._edge_csr.items():
             self._csr[ek] = (
@@ -240,6 +248,15 @@ class GpuNeighborBackend:
                 device=self.device,
             )
         return self._host_x[host_ids]
+
+    def get_technique_features(self, technique_ids):
+        if self._technique_x is None:
+            return torch.empty(
+                (0, int(self.feature_dims.get("technique", 0))),
+                dtype=torch.float32,
+                device=self.device,
+            )
+        return self._technique_x[technique_ids]
 
     def get_flow_labels(self, flow_ids):
         return self._flow_y[flow_ids]
@@ -397,8 +414,18 @@ class TorchHeteroNeighborSampler:
             flow_x = (flow_x - self._mean) / self._std
         node_features = {
             "flow": flow_x,
+            # packet stays deferred — to_torch_batch fills via packet_store (big tensor).
             "packet": torch.empty((0, self.backend.feature_dims["packet"]), device=dev),
-            "technique": torch.empty((0, self.backend.feature_dims["technique"]), device=dev),
+            # technique is small — gather on device so encode() can project it.
+            "technique": (
+                self.backend.get_technique_features(technique_ids)
+                if technique_ids.numel()
+                else torch.empty(
+                    (0, int(self.backend.feature_dims["technique"])),
+                    dtype=torch.float32,
+                    device=dev,
+                )
+            ),
             "tactic": tactic_ids.reshape(-1, 1).to(torch.int64),
         }
         if has_host:
