@@ -192,6 +192,7 @@ class GpuNeighborBackend:
         self._num_flows = in_memory_backend.num_flows
         self._num_techniques = in_memory_backend.num_techniques
         self._num_tactics = in_memory_backend.num_tactics
+        self._num_hosts = getattr(in_memory_backend, "num_hosts", 0)
         art = in_memory_backend.artifact
         self._flow_x = torch.from_numpy(
             np.asarray(art.node_features["flow"], dtype=np.float32)
@@ -199,6 +200,11 @@ class GpuNeighborBackend:
         self._flow_y = torch.from_numpy(
             np.asarray(art.flow_y, dtype=np.int64)
         ).to(device)
+        self._host_x: torch.Tensor | None = None
+        if "host" in self.feature_dims and "host" in art.node_features:
+            self._host_x = torch.from_numpy(
+                np.asarray(art.node_features["host"], dtype=np.float32)
+            ).to(device)
         self._csr: dict = {}
         for ek, (indptr, indices, attr) in in_memory_backend._edge_csr.items():
             self._csr[ek] = (
@@ -219,8 +225,21 @@ class GpuNeighborBackend:
     def num_tactics(self):
         return self._num_tactics
 
+    @property
+    def num_hosts(self):
+        return self._num_hosts
+
     def get_flow_features(self, flow_ids):
         return self._flow_x[flow_ids]
+
+    def get_host_features(self, host_ids):
+        if self._host_x is None:
+            return torch.empty(
+                (0, int(self.feature_dims.get("host", 0))),
+                dtype=torch.float32,
+                device=self.device,
+            )
+        return self._host_x[host_ids]
 
     def get_flow_labels(self, flow_ids):
         return self._flow_y[flow_ids]
@@ -356,6 +375,12 @@ class TorchHeteroNeighborSampler:
         packet_ids = maps["packet"].globals_array()
         technique_ids = maps["technique"].globals_array()
         tactic_ids = maps["tactic"].globals_array()
+        has_host = "host" in self.backend.feature_dims
+        host_ids = (
+            maps["host"].globals_array()
+            if has_host
+            else torch.empty(0, dtype=torch.int64, device=dev)
+        )
 
         seed_local = maps["flow"].lookup(seeds)
         seed_mask = torch.zeros(flow_ids.numel(), dtype=torch.bool, device=dev)
@@ -376,6 +401,24 @@ class TorchHeteroNeighborSampler:
             "technique": torch.empty((0, self.backend.feature_dims["technique"]), device=dev),
             "tactic": tactic_ids.reshape(-1, 1).to(torch.int64),
         }
+        if has_host:
+            node_features["host"] = (
+                self.backend.get_host_features(host_ids)
+                if host_ids.numel()
+                else torch.empty(
+                    (0, int(self.backend.feature_dims["host"])),
+                    dtype=torch.float32,
+                    device=dev,
+                )
+            )
+        local_to_global = {
+            "flow": flow_ids,
+            "packet": packet_ids,
+            "technique": technique_ids,
+            "tactic": tactic_ids,
+        }
+        if has_host:
+            local_to_global["host"] = host_ids
         return MiniBatchSubgraph(
             node_features=node_features,
             edge_index=edge_index,
@@ -383,10 +426,5 @@ class TorchHeteroNeighborSampler:
             seed_mask=seed_mask,
             seed_labels=self.backend.get_flow_labels(seeds),
             seed_flow_ids=seeds,
-            local_to_global={
-                "flow": flow_ids,
-                "packet": packet_ids,
-                "technique": technique_ids,
-                "tactic": tactic_ids,
-            },
+            local_to_global=local_to_global,
         )
