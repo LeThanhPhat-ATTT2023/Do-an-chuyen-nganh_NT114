@@ -251,6 +251,18 @@ class InMemoryNeighborBackend:
     def num_techniques(self) -> int:
         return int(self.artifact.node_features["technique"].shape[0])
 
+    @property
+    def num_hosts(self) -> int:
+        if "host" not in self.artifact.node_features:
+            return 0
+        return int(self.artifact.node_features["host"].shape[0])
+
+    def get_host_features(self, host_ids: np.ndarray) -> np.ndarray:
+        return np.asarray(
+            self.artifact.node_features["host"][np.asarray(host_ids, dtype=np.int64)],
+            dtype=np.float32,
+        )
+
     def get_flow_features(self, flow_ids: np.ndarray) -> np.ndarray:
         return np.asarray(
             self.artifact.node_features["flow"][np.asarray(flow_ids, dtype=np.int64)],
@@ -336,12 +348,15 @@ class HeteroNeighborSampler:
 
     def sample(self, seed_flow_ids: list[int] | np.ndarray) -> MiniBatchSubgraph:
         seeds = _unique_preserve_order(np.asarray(seed_flow_ids, dtype=np.int64).reshape(-1))
+        has_host = "host" in self.backend.feature_dims
         local_maps: dict[str, _LocalMap] = {
             "flow": _LocalMap(),
             "packet": _LocalMap(),
             "technique": _LocalMap(),
             "tactic": _LocalMap(),
         }
+        if has_host:
+            local_maps["host"] = _LocalMap()
         local_maps["flow"].add(seeds)
 
         # Per edge_type we accumulate three flat numpy arrays (src_global, dst_global, weight).
@@ -430,6 +445,7 @@ class HeteroNeighborSampler:
         packet_ids = local_maps["packet"].globals_array()
         technique_ids = local_maps["technique"].globals_array()
         tactic_ids = local_maps["tactic"].globals_array()
+        host_ids = local_maps["host"].globals_array() if has_host else np.empty(0, dtype=np.int64)
 
         flow_x = self.backend.get_flow_features(flow_ids)
         if self.standardize_flow_features:
@@ -456,6 +472,20 @@ class HeteroNeighborSampler:
             if tactic_ids.size
             else np.empty((0, 1), dtype=np.int64),
         }
+        if has_host:
+            node_features["host"] = (
+                self.backend.get_host_features(host_ids).astype(np.float32, copy=False)
+                if host_ids.size
+                else np.empty((0, self.backend.feature_dims["host"]), dtype=np.float32)
+            )
+        local_to_global = {
+            "flow": flow_ids,
+            "packet": packet_ids,
+            "technique": technique_ids,
+            "tactic": tactic_ids,
+        }
+        if has_host:
+            local_to_global["host"] = host_ids
         return MiniBatchSubgraph(
             node_features=node_features,
             edge_index=edge_index,
@@ -463,12 +493,7 @@ class HeteroNeighborSampler:
             seed_mask=seed_mask,
             seed_labels=self.backend.get_flow_labels(seeds),
             seed_flow_ids=seeds,
-            local_to_global={
-                "flow": flow_ids,
-                "packet": packet_ids,
-                "technique": technique_ids,
-                "tactic": tactic_ids,
-            },
+            local_to_global=local_to_global,
             stats={
                 "nodes": {key: int(value.shape[0]) for key, value in node_features.items()},
                 "edges": {edge_key_to_name(key): int(value.shape[1]) for key, value in edge_index.items()},
