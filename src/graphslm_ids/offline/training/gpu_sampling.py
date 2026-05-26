@@ -293,7 +293,7 @@ class TorchHeteroNeighborSampler:
     def sample(self, seed_flow_ids):
         dev = self.backend.device
         seeds = _unique_preserve_order_torch(seed_flow_ids, dev)
-        maps = {t: TorchLocalMap(dev) for t in ("flow", "packet", "technique", "tactic")}
+        maps = {t: TorchLocalMap(dev) for t in ("flow", "packet", "technique", "tactic", "host")}
         maps["flow"].add(seeds)
         edge_chunks = {ek: [] for ek in self.backend.edge_types}
         frontier = {"flow": seeds.clone()}
