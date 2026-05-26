@@ -2329,86 +2329,93 @@ def train_neighbor_sampling(
                 sampled_edge_sum[edge_name] = sampled_edge_sum.get(edge_name, 0) + c
                 sampled_edge_cnt[edge_name] = sampled_edge_cnt.get(edge_name, 0) + 1
 
+        def _try_microbatch(batch, divisor: int) -> bool:
+            """Run one micro-step. Return True iff it OOMed.
+
+            CRITICAL: the try/except is isolated in this tiny function so that
+            when it RETURNS, the exception (and its traceback, which pins the
+            failed forward's GPU tensors via this frame's locals) is fully
+            released. Recursing/empty_cache()-ing from inside an ``except``
+            block instead keeps those activations alive — the leak that made
+            earlier OOM-retries useless.
+            """
+            try:
+                _run_microbatch(batch, divisor)
+                return False
+            except torch.cuda.OutOfMemoryError:
+                return True
+
+        def _reclaim() -> None:
+            gc.collect()
+            torch.cuda.empty_cache()
+
         def _process_seed_chunk(seed_list: list[int], divisor: int) -> None:
             nonlocal auto_oom_chunk
-            try:
-                sub_batch = sampler.sample(seed_list)
-                _run_microbatch(sub_batch, divisor)
-                del sub_batch
+            batch = sampler.sample(seed_list)
+            oomed = _try_microbatch(batch, divisor)
+            batch = None  # drop the subgraph ref before any reclaim/recursion
+            if not oomed:
                 return
-            except torch.cuda.OutOfMemoryError:
-                gc.collect()
-                torch.cuda.empty_cache()
-                n = len(seed_list)
-                if n <= OOM_MIN_CHUNK:
-                    if rank == 0:
-                        print(
-                            f"[oom-retry] chunk={n} <= min={OOM_MIN_CHUNK}; cannot split — aborting",
-                            flush=True,
-                        )
-                    raise
-                new_safe = max(OOM_MIN_CHUNK, n // 2)
-                auto_oom_chunk = new_safe if auto_oom_chunk is None else min(auto_oom_chunk, new_safe)
-                if rank == 0:
-                    print(
-                        f"[oom-retry] resample chunk={n} OOM → splitting into 2×{n // 2} "
-                        f"(auto_chunk={auto_oom_chunk})",
-                        flush=True,
-                    )
-                mid = n // 2
-                _process_seed_chunk(seed_list[:mid], divisor * 2)
-                torch.cuda.empty_cache()
-                _process_seed_chunk(seed_list[mid:], divisor * 2)
-                torch.cuda.empty_cache()
-
-        def _run_oom_safe(raw_batch, divisor: int) -> None:
-            nonlocal auto_oom_chunk
-            seed_list = _to_seed_list(raw_batch.seed_flow_ids)
+            _reclaim()
             n = len(seed_list)
-            # Pre-emptive split when we already know full-batch size will OOM.
-            if auto_oom_chunk is not None and n > auto_oom_chunk:
-                del raw_batch
-                gc.collect()
-                torch.cuda.empty_cache()
-                n_chunks = (n + auto_oom_chunk - 1) // auto_oom_chunk
-                eff_divisor = divisor * n_chunks
-                for i in range(0, n, auto_oom_chunk):
-                    _process_seed_chunk(seed_list[i:i + auto_oom_chunk], eff_divisor)
-                return
-            try:
-                _run_microbatch(raw_batch, divisor)
-                return
-            except torch.cuda.OutOfMemoryError:
-                del raw_batch
-                gc.collect()
-                torch.cuda.empty_cache()
-                if n <= OOM_MIN_CHUNK:
-                    if rank == 0:
-                        print(
-                            f"[oom-retry] full-batch={n} <= min={OOM_MIN_CHUNK}; aborting",
-                            flush=True,
-                        )
-                    raise
-                new_safe = max(OOM_MIN_CHUNK, n // 2)
-                auto_oom_chunk = new_safe if auto_oom_chunk is None else min(auto_oom_chunk, new_safe)
-                if rank == 0:
-                    print(
-                        f"[oom-retry] full-batch={n} OOM → splitting into 2×{n // 2} "
-                        f"(auto_chunk={auto_oom_chunk})",
-                        flush=True,
-                    )
-                mid = n // 2
-                _process_seed_chunk(seed_list[:mid], divisor * 2)
-                torch.cuda.empty_cache()
-                _process_seed_chunk(seed_list[mid:], divisor * 2)
-                torch.cuda.empty_cache()
+            if n <= OOM_MIN_CHUNK:
+                raise RuntimeError(
+                    f"[oom-retry] OOM persists at chunk={n} <= min={OOM_MIN_CHUNK}. "
+                    f"Free other GPU processes (nvidia-smi) or lower feature_store.cache_fraction."
+                )
+            new_safe = max(OOM_MIN_CHUNK, n // 2)
+            auto_oom_chunk = new_safe if auto_oom_chunk is None else min(auto_oom_chunk, new_safe)
+            if rank == 0:
+                print(
+                    f"[oom-retry] resample chunk={n} OOM → 2×{n // 2} (auto_chunk={auto_oom_chunk})",
+                    flush=True,
+                )
+            mid = n // 2
+            _process_seed_chunk(seed_list[:mid], divisor * 2)
+            _reclaim()
+            _process_seed_chunk(seed_list[mid:], divisor * 2)
+            _reclaim()
 
         while True:
             try:
                 raw_batch = next(train_iter)
             except StopIteration:
                 break
-            _run_oom_safe(raw_batch, grad_accum_steps)
+            seed_list = _to_seed_list(raw_batch.seed_flow_ids)
+            n_seeds = len(seed_list)
+
+            # Pre-emptive split: we already learned this size OOMs. Discard the
+            # pre-sampled batch and re-sample in known-safe chunks.
+            if auto_oom_chunk is not None and n_seeds > auto_oom_chunk:
+                raw_batch = None
+                _reclaim()
+                n_chunks = (n_seeds + auto_oom_chunk - 1) // auto_oom_chunk
+                eff_divisor = grad_accum_steps * n_chunks
+                for i in range(0, n_seeds, auto_oom_chunk):
+                    _process_seed_chunk(seed_list[i:i + auto_oom_chunk], eff_divisor)
+            else:
+                oomed = _try_microbatch(raw_batch, grad_accum_steps)
+                raw_batch = None  # drop ref before reclaim/recursion
+                if oomed:
+                    _reclaim()
+                    if n_seeds <= OOM_MIN_CHUNK:
+                        raise RuntimeError(
+                            f"[oom-retry] OOM persists at full-batch={n_seeds} <= "
+                            f"min={OOM_MIN_CHUNK}. Free GPU or lower cache_fraction."
+                        )
+                    new_safe = max(OOM_MIN_CHUNK, n_seeds // 2)
+                    auto_oom_chunk = new_safe if auto_oom_chunk is None else min(auto_oom_chunk, new_safe)
+                    if rank == 0:
+                        print(
+                            f"[oom-retry] full-batch={n_seeds} OOM → 2×{n_seeds // 2} "
+                            f"(auto_chunk={auto_oom_chunk})",
+                            flush=True,
+                        )
+                    mid = n_seeds // 2
+                    _process_seed_chunk(seed_list[:mid], grad_accum_steps * 2)
+                    _reclaim()
+                    _process_seed_chunk(seed_list[mid:], grad_accum_steps * 2)
+                    _reclaim()
 
             pending_step = True
             if (step + 1) % grad_accum_steps == 0:
