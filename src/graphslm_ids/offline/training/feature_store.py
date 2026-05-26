@@ -223,7 +223,11 @@ def compute_access_frequency(
         if chunk.size == 0:
             break
         batch = sampler.sample(chunk.tolist())
-        pkt = np.asarray(batch.local_to_global["packet"], dtype=np.int64)
+        pkt_raw = batch.local_to_global["packet"]
+        if isinstance(pkt_raw, torch.Tensor):
+            pkt = pkt_raw.detach().cpu().numpy().astype(np.int64, copy=False)
+        else:
+            pkt = np.asarray(pkt_raw, dtype=np.int64)
         if pkt.size:
             np.add.at(freq, pkt, 1)
     return freq
