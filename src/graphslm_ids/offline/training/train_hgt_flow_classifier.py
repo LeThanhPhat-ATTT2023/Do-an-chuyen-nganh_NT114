@@ -4,6 +4,7 @@ import argparse
 from contextlib import nullcontext as _nullcontext
 from copy import deepcopy
 from datetime import datetime, timezone
+import gc
 import logging
 import math
 import os
@@ -2186,23 +2187,28 @@ def train_neighbor_sampling(
         batches_seen = 0
         last_logged_batches = 0
         epoch_start = time.time()
-        while True:
-            try:
-                raw_batch = next(train_iter)
-            except StopIteration:
-                break
-            # HGAA hook — no-op when hgaa_pipeline is None (disabled in config).
-            if hgaa_pipeline is not None:
-                raw_batch = hgaa_pipeline.maybe_augment(raw_batch)
-            batch = raw_batch
 
+        # Auto-scale on CUDA OOM: when forward+backward blows VRAM, halve the
+        # seed list and re-sample two sub-batches with doubled loss divisor so
+        # the accumulated gradient matches the un-split batch. The largest
+        # known-safe chunk persists across batches to avoid re-discovering the
+        # limit every step.
+        auto_oom_chunk: int | None = None
+        OOM_MIN_CHUNK = 8
+
+        def _to_seed_list(seed_ids) -> list[int]:
+            if isinstance(seed_ids, torch.Tensor):
+                return seed_ids.detach().cpu().tolist()
+            return np.asarray(seed_ids, dtype=np.int64).reshape(-1).tolist()
+
+        def _run_microbatch(batch, divisor: int) -> None:
+            nonlocal nonfinite_loss_count
+            if hgaa_pipeline is not None:
+                batch = hgaa_pipeline.maybe_augment(batch)
             nf, ei, ew, sm, sl = to_torch_batch(
                 batch, edge_types, device, use_semantic_edge_weights,
                 packet_store=packet_store,
             )
-            # In DDP, suppress the all-reduce on mid-accumulation backwards.
-            # The trailing backward (or the only backward when accum=1) still
-            # syncs gradients, so the optimizer step sees correct averages.
             sync_ctx = (
                 model.no_sync()
                 if is_ddp and (step + 1) % grad_accum_steps != 0
@@ -2212,13 +2218,6 @@ def train_neighbor_sampling(
                 ei, ew = _drop_edges(ei, ew, drop_edge_prob)
             with sync_ctx, torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
                 if gcl_enabled:
-                    # Two-step path: call encode() to capture per-node-type
-                    # embeddings, then run the classifier head manually. This is
-                    # functionally identical to model(nf, ei, ...) but gives us
-                    # the packet embeddings needed for the InfoNCE aux loss.
-                    # raw_model is the un-wrapped HeteroGraphTransformer; under
-                    # DDP/compile the wrappers still share parameter storage so
-                    # gradients flow correctly.
                     _encode_module = raw_model
                     x_dict = _encode_module.encode(nf, ei, edge_weight_dict=ew)
                     logits = _encode_module.classifier(x_dict["flow"])
@@ -2234,27 +2233,15 @@ def train_neighbor_sampling(
                 )
                 aux_loss_val_for_log = 0.0
                 if gcl_enabled and x_dict is not None and class_to_technique_idx:
-                    # Map each packet in the subgraph to its parent flow's class.
-                    # The flow->contains->packet edge_index gives this directly:
-                    # edge_index[0] = local flow id, edge_index[1] = local pkt id.
-                    # Then look up the flow's seed-side label by indexing into
-                    # the per-flow label tensor. Flows that are not seeds (sampled
-                    # only as neighbours) have no ground-truth label here, so we
-                    # restrict GCL to packets whose parent flow is in the seed
-                    # mask — matches the spec (anchor = seed packets).
                     contains_key = ("flow", "contains", "packet")
                     contains_ei = ei.get(contains_key)
                     if contains_ei is not None and contains_ei.numel() > 0:
                         flow_local = contains_ei[0]
                         pkt_local = contains_ei[1]
-                        # Keep only edges whose flow is in seed_mask (sm).
                         keep = sm[flow_local]
                         if bool(keep.any().item()):
                             kept_flow_local = flow_local[keep]
                             kept_pkt_local = pkt_local[keep]
-                            # sl is per-seed (compact, indexed by the sm bool's
-                            # cumsum). Build a flow_local -> seed_label tensor by
-                            # scattering sl into a dense vector of length num_flow.
                             num_flow_local = int(nf["flow"].shape[0])
                             seed_flow_local = torch.nonzero(sm, as_tuple=False).reshape(-1)
                             flow_label_dense = torch.full(
@@ -2268,14 +2255,15 @@ def train_neighbor_sampling(
                                 anchor_pkt = kept_pkt_local[valid_pkt]
                                 anchor_cls = pkt_class[valid_pkt]
                                 num_tech_local = int(x_dict["technique"].shape[0])
-                                # Global technique idx (from CSV) -> local idx
-                                # in this subgraph. always_include_all_techniques
-                                # guarantees a complete set is present but the
-                                # local ordering is sampler-defined.
                                 tech_g2l: dict[int, int] = {}
                                 _tech_lg = batch.local_to_global.get("technique")
                                 if _tech_lg is not None:
-                                    for _li, _gi in enumerate(_tech_lg.tolist()):
+                                    _tech_iter = (
+                                        _tech_lg.detach().cpu().tolist()
+                                        if isinstance(_tech_lg, torch.Tensor)
+                                        else _tech_lg.tolist()
+                                    )
+                                    for _li, _gi in enumerate(_tech_iter):
                                         tech_g2l[int(_gi)] = int(_li)
                                 local_ctm: dict[int, list[tuple[int, float]]] = {}
                                 for _cls_idx, _pairs in class_to_technique_idx.items():
@@ -2315,7 +2303,7 @@ def train_neighbor_sampling(
             batch_count = int(sl.numel())
             _loss_ok = bool(torch.isfinite(loss).item())
             if _loss_ok:
-                scaler.scale(loss / grad_accum_steps).backward()
+                scaler.scale(loss / divisor).backward()
             else:
                 nonfinite_loss_count += 1
             loss_val = float(loss.detach().item()) if _loss_ok else float("nan")
@@ -2328,8 +2316,8 @@ def train_neighbor_sampling(
                     flush=True,
                 )
             if _loss_ok:
-                train_loss_sum_t += loss_val * batch_count
-                train_examples_t += batch_count
+                train_loss_sum_t.add_(loss_val * batch_count)
+                train_examples_t.add_(batch_count)
                 pred = seed_logits.detach().float().argmax(dim=1)
                 train_counts.add_(_per_class_counts_tensor(pred, sl, num_classes))
             for node_type, count in batch.stats.get("nodes", {}).items():
@@ -2340,6 +2328,87 @@ def train_neighbor_sampling(
                 c = int(count)
                 sampled_edge_sum[edge_name] = sampled_edge_sum.get(edge_name, 0) + c
                 sampled_edge_cnt[edge_name] = sampled_edge_cnt.get(edge_name, 0) + 1
+
+        def _process_seed_chunk(seed_list: list[int], divisor: int) -> None:
+            nonlocal auto_oom_chunk
+            try:
+                sub_batch = sampler.sample(seed_list)
+                _run_microbatch(sub_batch, divisor)
+                del sub_batch
+                return
+            except torch.cuda.OutOfMemoryError:
+                gc.collect()
+                torch.cuda.empty_cache()
+                n = len(seed_list)
+                if n <= OOM_MIN_CHUNK:
+                    if rank == 0:
+                        print(
+                            f"[oom-retry] chunk={n} <= min={OOM_MIN_CHUNK}; cannot split — aborting",
+                            flush=True,
+                        )
+                    raise
+                new_safe = max(OOM_MIN_CHUNK, n // 2)
+                auto_oom_chunk = new_safe if auto_oom_chunk is None else min(auto_oom_chunk, new_safe)
+                if rank == 0:
+                    print(
+                        f"[oom-retry] resample chunk={n} OOM → splitting into 2×{n // 2} "
+                        f"(auto_chunk={auto_oom_chunk})",
+                        flush=True,
+                    )
+                mid = n // 2
+                _process_seed_chunk(seed_list[:mid], divisor * 2)
+                torch.cuda.empty_cache()
+                _process_seed_chunk(seed_list[mid:], divisor * 2)
+                torch.cuda.empty_cache()
+
+        def _run_oom_safe(raw_batch, divisor: int) -> None:
+            nonlocal auto_oom_chunk
+            seed_list = _to_seed_list(raw_batch.seed_flow_ids)
+            n = len(seed_list)
+            # Pre-emptive split when we already know full-batch size will OOM.
+            if auto_oom_chunk is not None and n > auto_oom_chunk:
+                del raw_batch
+                gc.collect()
+                torch.cuda.empty_cache()
+                n_chunks = (n + auto_oom_chunk - 1) // auto_oom_chunk
+                eff_divisor = divisor * n_chunks
+                for i in range(0, n, auto_oom_chunk):
+                    _process_seed_chunk(seed_list[i:i + auto_oom_chunk], eff_divisor)
+                return
+            try:
+                _run_microbatch(raw_batch, divisor)
+                return
+            except torch.cuda.OutOfMemoryError:
+                del raw_batch
+                gc.collect()
+                torch.cuda.empty_cache()
+                if n <= OOM_MIN_CHUNK:
+                    if rank == 0:
+                        print(
+                            f"[oom-retry] full-batch={n} <= min={OOM_MIN_CHUNK}; aborting",
+                            flush=True,
+                        )
+                    raise
+                new_safe = max(OOM_MIN_CHUNK, n // 2)
+                auto_oom_chunk = new_safe if auto_oom_chunk is None else min(auto_oom_chunk, new_safe)
+                if rank == 0:
+                    print(
+                        f"[oom-retry] full-batch={n} OOM → splitting into 2×{n // 2} "
+                        f"(auto_chunk={auto_oom_chunk})",
+                        flush=True,
+                    )
+                mid = n // 2
+                _process_seed_chunk(seed_list[:mid], divisor * 2)
+                torch.cuda.empty_cache()
+                _process_seed_chunk(seed_list[mid:], divisor * 2)
+                torch.cuda.empty_cache()
+
+        while True:
+            try:
+                raw_batch = next(train_iter)
+            except StopIteration:
+                break
+            _run_oom_safe(raw_batch, grad_accum_steps)
 
             pending_step = True
             if (step + 1) % grad_accum_steps == 0:
