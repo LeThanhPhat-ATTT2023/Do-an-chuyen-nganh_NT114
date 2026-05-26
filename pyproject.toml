@@ -13,7 +13,8 @@ dependencies = [
   "pandas>=2.1",
   "scapy>=2.5.0",
   "tqdm>=4.66",
-  "pyyaml>=6.0"
+  "pyyaml>=6.0",
+  "pyahocorasick>=2.0"
 ]
 
 [project.scripts]
