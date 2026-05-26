@@ -246,6 +246,9 @@ def _build_host_tier(
     return host_x, host_to_idx, from_host_eidx, to_host_eidx, fwd_bytes, bwd_bytes
 
 
+_BURST_NEIGHBOR_MAX_FLOWS = 500_000  # above this, query_ball_tree OOMs on 1.1M+ flow graphs
+
+
 def _build_burst_neighbor_edges(
     feats_df: pd.DataFrame,
     radius_sec: float = 1.0,
@@ -274,6 +277,17 @@ def _build_burst_neighbor_edges(
         return np.empty((2, 0), dtype=np.int64), np.empty((0, 2), dtype=np.float32)
 
     if len(ts) == 0:
+        return np.empty((2, 0), dtype=np.int64), np.empty((0, 2), dtype=np.float32)
+
+    # query_ball_tree on large graphs produces O(n * avg_neighbors) Python list
+    # objects that easily exhaust RAM (1.1M flows × hundreds of neighbors/flow).
+    # burst_neighbor is an auxiliary homophily edge — skip for large graphs.
+    if len(ts) > _BURST_NEIGHBOR_MAX_FLOWS:
+        _LOG.warning(
+            "burst_neighbor: skipping — n_flows=%d > limit=%d (OOM guard). "
+            "Set _BURST_NEIGHBOR_MAX_FLOWS higher if you have sufficient RAM.",
+            len(ts), _BURST_NEIGHBOR_MAX_FLOWS,
+        )
         return np.empty((2, 0), dtype=np.int64), np.empty((0, 2), dtype=np.float32)
 
     src_ips = feats_df["src_ip"].astype(str).to_numpy()
