@@ -70,8 +70,8 @@ train:
   output_dir: outputs/v3/hgt
   epochs: 150
   patience: 40            # [FIX-5] temporal split needs more patience; GATransformer/AHGT=40
-  batch_seed_flows: 256   # [FIX-4] reduced from 384; compensated by grad_accum_steps=2
-  grad_accum_steps: 2     # [FIX-4] effective batch = 256×2 = 512; per-step VRAM halved
+  batch_seed_flows: 128   # halved again — 22-edge-type subgraph activations need headroom
+  grad_accum_steps: 4     # effective batch stays 128×4 = 512; per-step VRAM halved
   monitor: val_macro_f1
   log_every: 1
   lr: 1.0e-3
@@ -183,8 +183,8 @@ dataloader:
 # thời gian train ước tính từ ~20h xuống còn ~5-8h.
 feature_store:
   enabled: true
-  cache_fraction: 0.6      # 60% VRAM còn lại dành cho packet_x hot cache
-  model_reserve_gb: 4.0    # giữ 4 GB cho model weights + activations + optimizer
+  cache_fraction: 0.5      # 50% VRAM còn lại dành cho packet_x hot cache (giảm để chừa chỗ activations)
+  model_reserve_gb: 14.0   # 4GB model+optim + ~10GB activations (hops=4 × 22 edge types cần nhiều)
   n_warmup_batches: 200    # warm up cache 200 batch đầu trước khi đánh giá hit rate
 
 gpu_sampling:
