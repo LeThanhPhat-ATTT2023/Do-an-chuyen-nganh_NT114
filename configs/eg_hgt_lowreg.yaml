@@ -1,0 +1,147 @@
+# EG-HGT v3 — LOW-REGULARIZATION experiment (plateau probe).
+#
+# Derived from configs/eg_hgt.yaml. PURPOSE: the base run plateaus at
+# val_macro_f1 ≈ 0.65 with train_acc ≈ val_acc (≈0.84 vs ≈0.83) — i.e. NOT
+# overfitting, so the model is regularization/signal-bound, not optimization-
+# bound. This variant relaxes ONLY the explicit regularizers to test whether the
+# model can fit harder (and lift tail-class F1). Everything else — model,
+# sampler, feature_store, gpu_sampling, GCL, LR schedule, epochs, patience — is
+# IDENTICAL to eg_hgt.yaml so the A/B comparison isolates regularization.
+#
+# Changed vs eg_hgt.yaml (search "EXPERIMENT"):
+#   - train.output_dir:     outputs/v3/hgt -> outputs/v3/hgt_lowreg  (don't clobber base run)
+#   - train.label_smoothing: 0.05 -> 0.0    (sharper targets; let the model commit)
+#   - train.drop_edge_prob:  0.10 -> 0.05   (keep more graph structure each step)
+#   - train.hgaa.aug_prob:   0.5  -> 0.25   (less synthetic perturbation of tail classes)
+#
+# If macro-F1 still plateaus with these relaxed, the ceiling is the deterministic
+# feature signal (not regularization), and the contribution shifts to the
+# random-vs-temporal GAP per the project thesis.
+#
+# Run:
+#   python -m graphslm_ids.offline.training.train_hgt_flow_classifier \
+#       --config configs/eg_hgt_lowreg.yaml --split-protocol temporal
+
+experiment:
+  source_name: "EG-HGT v3 Smart-BOTH Hybrid (LOW-REG experiment)"
+  rationale: >
+    Plateau probe: relaxes label_smoothing / drop_edge_prob / hgaa.aug_prob only,
+    to test whether the base run's macro-F1 ceiling is regularization-bound or
+    signal-bound. All other settings mirror eg_hgt.yaml.
+
+data:
+  artifact_version: v3
+  graph_npz: outputs/v3/graph.npz
+  graph_meta_json: outputs/v3/graph.meta.json
+  splits_json: outputs/v3/splits.json
+  split_protocol: temporal      # overridden by --split-protocol CLI flag
+  add_reverse_edges: true
+  standardize_flow_features: true
+  use_semantic_edge_weights: true
+  use_temporal_edge_weights: true
+  tew_epsilon: 1.0e-3
+
+model:
+  hidden_dim: 128
+  num_layers: 4
+  num_heads: 8
+  dropout: 0.2            # unchanged: standard dropout kept (not the suspected ceiling)
+  ffn_multiplier: 2
+
+train:
+  output_dir: outputs/v3/hgt_lowreg   # EXPERIMENT: separate dir, preserves base run artifacts
+  epochs: 150
+  patience: 40
+  batch_seed_flows: 256
+  grad_accum_steps: 2
+  monitor: val_macro_f1
+  log_every: 1
+  lr: 1.0e-3
+  weight_decay: 5.0e-5
+  amp: true
+  amp_dtype: auto
+  device: cuda
+  activation_checkpointing: true
+  compile: false
+  tf32: true
+  scheduler: cosine_annealing
+  scheduler_pct_start: 0.05
+  scheduler_eta_min: 1.0e-5
+  grad_clip_norm: 1.0
+  adamw_eps: 1.0e-6
+  adamw_betas: [0.9, 0.95]
+  loss_type: focal
+  focal_gamma: 2.0
+  label_smoothing: 0.0    # EXPERIMENT: was 0.05 — sharper targets
+  class_weight: balanced
+  class_weight_cap: 10.0
+  drw_start_pct: 0.0
+  drop_edge_prob: 0.05    # EXPERIMENT: was 0.10 — keep more graph structure
+  ema_enabled: true
+  ema_decay: 0.999
+  skip_val_first_epoch: false
+  eval_every: 1
+  val_ratio: 0.1
+  test_ratio: 0.1
+  seed: 42
+  stratified_batch_sampling: true
+
+  gcl_enabled: true
+  gcl_weight: 0.2
+  gcl_temperature: 0.1
+  gcl_positive_source: class_technique_map
+  gcl_n_negatives: 16
+
+  hgaa:
+    enabled: true
+    aug_prob: 0.25        # EXPERIMENT: was 0.5 — less synthetic perturbation
+    bias_factor_T: 0.5
+    tail_class_k: 3
+
+sampler:
+  hops: 4
+  fanouts:
+    flow__contains__packet: 20
+    packet__next_packet__packet: 4
+    packet__evidence_injection__technique: 4
+    packet__evidence_command_exec__technique: 4
+    packet__evidence_file_upload__technique: 3
+    packet__evidence_recon__technique: 3
+    packet__evidence_c2_beacon__technique: 3
+    flow__from_host__host: 1
+    flow__to_host__host: 1
+    flow__burst_neighbor__flow: 6
+    flow__matches_technique__technique: 3
+    technique__has_subtechnique__technique: 2
+    technique__belongs_to_tactic__tactic: 1
+  reverse_fanouts:
+    rev_contains: 3
+    rev_next_packet: 2
+    rev_evidence_injection: 2
+    rev_evidence_command_exec: 2
+    rev_evidence_file_upload: 2
+    rev_evidence_recon: 2
+    rev_evidence_c2_beacon: 2
+    rev_from_host: 3
+    rev_to_host: 3
+    rev_burst_neighbor: 3
+    rev_matches_technique: 2
+    rev_has_subtechnique: 2
+    rev_belongs_to_tactic: 1
+  always_include_all_techniques: true
+  always_include_all_tactics: true
+
+dataloader:
+  num_workers: 8
+  prefetch_factor: 4
+  pin_memory: true
+  persistent_workers: true
+
+feature_store:
+  enabled: true
+  cache_fraction: 0.6
+  model_reserve_gb: 4.0
+  n_warmup_batches: 200
+
+gpu_sampling:
+  enabled: false

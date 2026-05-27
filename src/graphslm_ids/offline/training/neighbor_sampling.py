@@ -495,7 +495,13 @@ class HeteroNeighborSampler:
             seed_flow_ids=seeds,
             local_to_global=local_to_global,
             stats={
-                "nodes": {key: int(value.shape[0]) for key, value in node_features.items()},
+                # Count nodes from local_to_global (the authoritative sampled-id
+                # arrays), NOT node_features: when defer_packet_features=True the
+                # packet feature array is forced empty (features come from the
+                # feature store), so node_features['packet'].shape[0] would be 0
+                # even though packets were sampled. local_to_global always holds
+                # the real ids. Regression: avg_packet_nodes=0.0 in training logs.
+                "nodes": {key: int(np.asarray(value).shape[0]) for key, value in local_to_global.items()},
                 "edges": {edge_key_to_name(key): int(value.shape[1]) for key, value in edge_index.items()},
             },
         )
