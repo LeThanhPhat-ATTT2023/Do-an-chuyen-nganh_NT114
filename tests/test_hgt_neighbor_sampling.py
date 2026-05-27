@@ -75,3 +75,35 @@ def test_neighbor_sampler_keeps_seed_labels_and_global_tactics() -> None:
     assert ("flow", "contains", "packet") in batch.edge_index
     assert batch.edge_index[("flow", "contains", "packet")].shape[1] == 2
     assert batch.edge_index[("technique", "belongs_to_tactic", "tactic")].shape[1] == 2
+
+
+def test_node_stats_count_deferred_packets() -> None:
+    """When packet features are deferred to the feature store, node_features['packet']
+    is an empty (0, dim) array. The reported node-count stat must still reflect the
+    real number of sampled packets (from local_to_global), not the empty feature array.
+    Regression test for avg_packet_nodes=0.0 in training logs.
+    """
+    backend = InMemoryNeighborBackend(_tiny_artifact())
+    sampler = HeteroNeighborSampler(
+        backend,
+        hops=2,
+        fanouts={
+            "flow__contains__packet": 10,
+            "packet__matches_technique__technique": 10,
+            "technique__belongs_to_tactic__tactic": 1,
+        },
+        reverse_fanouts={"rev_contains": 0},
+        always_include_all_tactics=True,
+        always_include_all_techniques=True,
+        standardize_flow_features=False,
+        defer_packet_features=True,
+    )
+
+    batch = sampler.sample([0])
+
+    # Features are deferred, so the feature array is empty...
+    assert batch.node_features["packet"].shape[0] == 0
+    # ...but two packets (0, 1) were genuinely sampled.
+    assert batch.local_to_global["packet"].tolist() == [0, 1]
+    # The stat must report the real sampled count, not the deferred-empty array.
+    assert batch.stats["nodes"]["packet"] == 2

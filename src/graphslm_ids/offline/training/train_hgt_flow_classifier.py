@@ -874,6 +874,25 @@ def class_weights_from_backend(
     return torch.from_numpy(weights)
 
 
+def _format_per_class_f1(per_class: dict, top_k: int | None = None) -> str:
+    """Compact one-line per-class F1 summary, sorted worst-first.
+
+    Classes with zero support are omitted (they don't contribute to macro-F1 and
+    only add noise). Used to surface which classes cap macro-F1 during a training
+    plateau. ``top_k`` keeps only the worst ``k`` classes; ``None`` shows all.
+    Format per class: ``name=<f1>(n=<support>)``.
+    """
+    scored = [
+        (name, float(m.get("f1", 0.0)), int(m.get("support", 0)))
+        for name, m in per_class.items()
+        if int(m.get("support", 0)) > 0
+    ]
+    scored.sort(key=lambda t: t[1])
+    if top_k is not None:
+        scored = scored[:top_k]
+    return " ".join(f"{name}={f1:.3f}(n={sup})" for name, f1, sup in scored)
+
+
 def _compute_monitor_score(monitor: str, val_metrics: dict) -> float:
     """Map a monitor name → a scalar to MAXIMIZE (higher = better).
 
@@ -2628,7 +2647,9 @@ def train_neighbor_sampling(
         entry = {
             "epoch": epoch,
             "train": {key: value for key, value in train_metrics.items() if key != "per_class"},
-            "val": {key: value for key, value in val_metrics.items() if key != "per_class"},
+            # Keep val per_class so post-hoc analysis can see which classes cap
+            # macro-F1 across epochs (small: ~num_classes×4 floats per epoch).
+            "val": dict(val_metrics),
             "sampler": {
                 "avg_subgraph_nodes": avg_nodes,
                 "avg_subgraph_edges": avg_edges,
@@ -2721,6 +2742,14 @@ def train_neighbor_sampling(
                 f"avg_flow_nodes={avg_nodes.get('flow', 0.0):.1f} "
                 f"avg_packet_nodes={avg_nodes.get('packet', 0.0):.1f}"
             )
+            # Surface which classes cap macro-F1 (worst-first) — the tail classes
+            # are usually what stalls a plateau. Persisted to history['val'] below.
+            _pc = val_metrics.get("per_class") if isinstance(val_metrics, dict) else None
+            if _pc:
+                print(
+                    f"           per-class F1 (worst->best): {_format_per_class_f1(_pc)}",
+                    flush=True,
+                )
 
         # Broadcast the early-stop decision from rank 0 so all ranks exit together.
         stop = epochs_without_improvement >= int(config["train"]["patience"])
