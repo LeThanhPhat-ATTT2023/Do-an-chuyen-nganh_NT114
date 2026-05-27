@@ -68,8 +68,8 @@ model:
 
 train:
   output_dir: outputs/v3/hgt
-  epochs: 150
-  patience: 40            # [FIX-5] temporal split needs more patience; GATransformer/AHGT=40
+  epochs: 50
+  patience: 25
   batch_seed_flows: 256   # [FIX-4] reduced from 384; compensated by grad_accum_steps=2
   grad_accum_steps: 2     # [FIX-4] effective batch = 256×2 = 512; per-step VRAM halved
   monitor: val_macro_f1
@@ -170,7 +170,7 @@ sampler:
   always_include_all_tactics: true
 
 dataloader:
-  num_workers: 8          # g6e.2xlarge có 8 CPU → tăng từ 4 lên 8 để GPU ít idle hơn
+  num_workers: 6          # g6e.2xlarge 8 vCPU: để 2 core cho main process + GPU feed; 6 worker tối ưu
   prefetch_factor: 4      # GATransformer/AHGT-DFD use 4; reduces GPU idle between batches
   pin_memory: true
   persistent_workers: true
