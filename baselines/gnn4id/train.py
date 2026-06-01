@@ -97,7 +97,7 @@ def main() -> None:
 
     # ── Load ───────────────────────────────────────────────────────────────
     _LOG.info("Loading graphs from %s ...", args.graphs)
-    saved = torch.load(args.graphs, map_location="cpu")
+    saved = torch.load(args.graphs, map_location="cpu", weights_only=False)
     graphs: list = saved["graphs"]
     label_mapping: dict[str, int] = saved["label_mapping"]
     num_classes = len(label_mapping)
@@ -156,7 +156,7 @@ def main() -> None:
                 break
 
     # ── Evaluate on test set ───────────────────────────────────────────────
-    model.load_state_dict(torch.load(best_ckpt, map_location=device))
+    model.load_state_dict(torch.load(best_ckpt, map_location=device, weights_only=True))
     test_macro_f1, test_pred, test_true = _eval(model, test_loader, device)
     idx_to_label = {v: k for k, v in label_mapping.items()}
     report = classification_report(
