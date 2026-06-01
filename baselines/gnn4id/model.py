@@ -24,6 +24,11 @@ class HeteroGNN_Edge(nn.Module):
     ):
         super().__init__()
         node_types, edge_types = metadata
+        self._node_types = list(node_types)
+
+        # Determine which node types are destinations (updated by conv)
+        dst_types = {et[2] for et in edge_types}
+        src_only_types = [nt for nt in node_types if nt not in dst_types]
 
         self.conv1 = HeteroConv(
             {et: GATConv((-1, -1), hidden_channels, edge_dim=-1, add_self_loops=False)
@@ -38,6 +43,11 @@ class HeteroGNN_Edge(nn.Module):
 
         self.bn1 = nn.ModuleDict({nt: nn.BatchNorm1d(hidden_channels) for nt in node_types})
         self.bn2 = nn.ModuleDict({nt: nn.BatchNorm1d(hidden_channels) for nt in node_types})
+
+        # Lazy projections for source-only node types so their pooled dim = hidden_channels
+        self.src_proj = nn.ModuleDict({
+            nt: nn.LazyLinear(hidden_channels) for nt in src_only_types
+        })
 
         n_node_types = len(node_types)
         self.classifier = nn.Sequential(
@@ -57,16 +67,24 @@ class HeteroGNN_Edge(nn.Module):
         edge_attr_dict: dict,
         batch_dict: dict,
     ) -> torch.Tensor:
-        x_dict = self.conv1(x_dict, edge_index_dict, edge_attr_dict)
-        x_dict = {
-            nt: F.leaky_relu(self.bn1[nt](x)) for nt, x in x_dict.items()
-        }
-        x_dict = self.conv2(x_dict, edge_index_dict, edge_attr_dict)
-        x_dict = {
-            nt: F.leaky_relu(self.bn2[nt](x)) for nt, x in x_dict.items()
-        }
-        pooled = [
-            global_mean_pool(x_dict[nt], batch_dict[nt])
-            for nt in sorted(x_dict)
-        ]
+        x0 = dict(x_dict)  # preserve original features for source-only node types
+        out1 = self.conv1(x0, edge_index_dict, edge_attr_dict)
+        # Merge back node types not updated by conv1 (source-only, e.g. 'flow')
+        x1 = {**x0, **out1}
+        x1 = {nt: F.leaky_relu(self.bn1[nt](x)) if nt in out1 else x
+              for nt, x in x1.items()}
+
+        out2 = self.conv2(x1, edge_index_dict, edge_attr_dict)
+        # Merge back again for pool step
+        x2 = {**x1, **out2}
+        x2 = {nt: F.leaky_relu(self.bn2[nt](x)) if nt in out2 else x
+              for nt, x in x2.items()}
+
+        pooled = []
+        for nt in sorted(x2):
+            h = x2[nt]
+            # Project source-only types to hidden_channels before pooling
+            if nt in self.src_proj:
+                h = F.leaky_relu(self.src_proj[nt](h))
+            pooled.append(global_mean_pool(h, batch_dict[nt]))
         return self.classifier(torch.cat(pooled, dim=1))
