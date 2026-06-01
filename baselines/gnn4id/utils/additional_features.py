@@ -35,6 +35,10 @@ def additional_features(
         print("CSV does not contain bidirectional_first_seen_ms for initial sorting")
         return ""
 
+    # If already processed by a previous run, skip (idempotent)
+    if "Rolling_ACK_Packets_SourceDestination" in data.columns:
+        return file_name
+
     # Defragment after many-column nfstream output
     data = data.copy()
 
@@ -150,16 +154,18 @@ def additional_features(
         .reset_index(level=0, drop=True)
     )
 
-    data["expiration_id"] = pd.Categorical(data["expiration_id"], categories=exp_id)
-    dummy_cols = ["expiration_id"]
-    dummy_prefixes = ["Exp"]
+    dummy_cols: list[str] = []
+    dummy_prefixes: list[str] = []
+    if "expiration_id" in data.columns:
+        data["expiration_id"] = pd.Categorical(data["expiration_id"], categories=exp_id)
+        dummy_cols.append("expiration_id")
+        dummy_prefixes.append("Exp")
     if proto_col is not None and proto_col in data.columns:
         data[proto_col] = pd.Categorical(data[proto_col], categories=proto_list)
         dummy_cols.append(proto_col)
         dummy_prefixes.append("proto")
-    data = pd.get_dummies(
-        data, prefix=dummy_prefixes, columns=dummy_cols, dtype=int
-    )
+    if dummy_cols:
+        data = pd.get_dummies(data, prefix=dummy_prefixes, columns=dummy_cols, dtype=int)
     data.drop(
         ["src_dst_ip", "src_dst_encoded", "dst_ip_encoded",
          "is_udp_request", "is_tcp_request", "is_icmp_request", "is_vulnerable_port"],

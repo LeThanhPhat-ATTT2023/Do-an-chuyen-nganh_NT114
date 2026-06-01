@@ -8,15 +8,31 @@ import pandas as pd
 import torch
 from torch_geometric.data import Dataset, HeteroData
 
-# Columns that carry packet-level list strings or metadata — excluded from flow features.
+# Columns excluded from flow features (metadata / packet-level list strings).
+# nfstream may write custom plugin fields as "pkt_hex" or "udps.pkt_hex" depending on version.
 _EXCLUDE = frozenset([
-    "label", "src_ip", "dst_ip", "src_mac", "dst_mac", "id",
+    "label", "src_ip", "dst_ip", "src_mac", "dst_mac", "src_oui", "dst_oui", "id",
+    "application_name", "application_category_name", "requested_server_name",
+    "client_fingerprint", "server_fingerprint", "user_agent", "content_type",
+    # bare names (older nfstream)
     "pkt_hex", "pkt_delta", "pkt_dir",
     "pkt_ip_size", "pkt_transport_size", "pkt_payload_size",
     "syn", "cwr", "ece", "urg", "ack", "psh", "rst", "fin",
+    # src_dst helpers added by additional_features (should be dropped, but guard here)
+    "src_dst_ip", "src_dst_encoded", "dst_ip_encoded",
 ])
 
 _PACKET_BYTES = 1500  # GNN4ID default payload width
+
+
+def _row_get(row: pd.Series, name: str, default="[]") -> object:
+    """Return row[name], trying 'udps.<name>' prefix as fallback (nfstream >=6.4 style)."""
+    if name in row.index:
+        return row[name]
+    udps_name = f"udps.{name}"
+    if udps_name in row.index:
+        return row[udps_name]
+    return default
 
 
 def _safe_parse_list(val) -> list | None:
@@ -97,7 +113,8 @@ class NIDSDataset(Dataset):
     def _flow_features(self, row: pd.Series) -> list[float]:
         feats = []
         for col in row.index:
-            if col in _EXCLUDE:
+            # Skip metadata, packet-level list strings, and all udps.* columns
+            if col in _EXCLUDE or col.startswith("udps."):
                 continue
             try:
                 feats.append(float(row[col]))
@@ -106,8 +123,8 @@ class NIDSDataset(Dataset):
         return feats
 
     def _packet_features(self, row: pd.Series) -> tuple[list[list[float]] | None, list[float] | None]:
-        hexes = _safe_parse_list(row.get("pkt_hex", "[]"))
-        deltas = _safe_parse_list(row.get("pkt_delta", "[]"))
+        hexes = _safe_parse_list(_row_get(row, "pkt_hex"))
+        deltas = _safe_parse_list(_row_get(row, "pkt_delta"))
         if hexes is None or deltas is None:
             return None, None
         feats = []
@@ -122,10 +139,10 @@ class NIDSDataset(Dataset):
         return feats, deltas_f
 
     def _contain_edge_attr(self, row: pd.Series, n_pkts: int) -> list[list[float]]:
-        dirs = _safe_parse_list(row.get("pkt_dir", "[]")) or []
-        ips = _safe_parse_list(row.get("pkt_ip_size", "[]")) or []
-        trs = _safe_parse_list(row.get("pkt_transport_size", "[]")) or []
-        pls = _safe_parse_list(row.get("pkt_payload_size", "[]")) or []
+        dirs = _safe_parse_list(_row_get(row, "pkt_dir")) or []
+        ips  = _safe_parse_list(_row_get(row, "pkt_ip_size")) or []
+        trs  = _safe_parse_list(_row_get(row, "pkt_transport_size")) or []
+        pls  = _safe_parse_list(_row_get(row, "pkt_payload_size")) or []
         attrs = []
         for i in range(n_pkts):
             attrs.append([
