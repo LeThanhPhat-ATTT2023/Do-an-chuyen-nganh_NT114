@@ -39,7 +39,6 @@ class NIDSDataset(Dataset):
         super().__init__()
         self.label_mapping = label_mapping
         self._graphs: list[HeteroData] = []
-        self._flow_feature_dim: int | None = None
 
         for csv_path, label in csv_files:
             df = pd.read_csv(csv_path)
