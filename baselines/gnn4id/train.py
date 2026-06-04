@@ -25,6 +25,7 @@ from tqdm import tqdm
 _HERE = Path(__file__).parent
 sys.path.insert(0, str(_HERE))
 from model import HeteroGNN_Edge
+from utils.functions import load_graphs
 
 _LOG = logging.getLogger("gnn4id.train")
 
@@ -75,7 +76,8 @@ def _eval(model, loader, device) -> tuple[float, np.ndarray, np.ndarray]:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--graphs", default="baselines/gnn4id/outputs/graphs.pt")
+    ap.add_argument("--graphs", default="baselines/gnn4id/outputs/graphs.manifest.json",
+                    help="Shard manifest (*.manifest.json) or a legacy graphs.pt.")
     ap.add_argument("--out-dir", default="baselines/gnn4id/outputs")
     ap.add_argument("--epochs", type=int, default=50)
     ap.add_argument("--patience", type=int, default=10)
@@ -97,9 +99,7 @@ def main() -> None:
 
     # ── Load ───────────────────────────────────────────────────────────────
     _LOG.info("Loading graphs from %s ...", args.graphs)
-    saved = torch.load(args.graphs, map_location="cpu", weights_only=False)
-    graphs: list = saved["graphs"]
-    label_mapping: dict[str, int] = saved["label_mapping"]
+    graphs, label_mapping = load_graphs(args.graphs)
     num_classes = len(label_mapping)
     _LOG.info("  %d graphs, %d classes", len(graphs), num_classes)
 

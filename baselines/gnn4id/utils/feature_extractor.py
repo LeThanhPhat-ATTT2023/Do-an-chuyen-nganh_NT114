@@ -50,6 +50,7 @@ def extract_pcap_to_csv(
     out_csv: str,
     label: str,
     max_pkts: int = 20,
+    n_meters: int = 1,
 ) -> None:
     """Run nfstream on one PCAP and write a labelled CSV.
 
@@ -58,11 +59,17 @@ def extract_pcap_to_csv(
         out_csv:   Destination CSV path.
         label:     Class name to store in the ``label`` column.
         max_pkts:  Maximum bidirectional packets captured per flow (default 20).
+        n_meters:  nfstream metering processes per PCAP. Default 1 — cross-PCAP
+            parallelism is handled by the outer scheduler, so bounding nfstream's
+            *internal* fan-out here keeps peak process count / RAM predictable.
+            nfstream treats ``n_meters<=0`` as "auto" (≈ all cores), which is what
+            multiplied RAM under parallel workers; keep this at 1 unless tuning.
     """
     streamer = NFStreamer(
         source=pcap_path,
         udps=_PacketCapture(limit=max_pkts),
         statistical_analysis=True,
+        n_meters=n_meters,
     )
     streamer.to_csv(path=out_csv, flows_per_file=0, columns_to_anonymize=[])
     df = pd.read_csv(out_csv)

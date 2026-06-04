@@ -1,12 +1,25 @@
-"""PyG NIDSDataset: builds HeteroData graphs from nfstream CSVs (dynamic label_mapping)."""
+"""PyG NIDSDataset: builds HeteroData graphs from nfstream CSVs (dynamic label_mapping).
+
+Two build paths share one set of (static) graph builders:
+  * ``NIDSDataset``         — legacy in-RAM path: builds every graph into a list.
+  * ``stream_graphs_from_csv`` / ``write_graph_shards`` — streaming path that
+    builds graphs per-CSV and flushes them to disk shards, so peak RAM is bounded
+    by one shard instead of the whole dataset (avoids the build-step OOM).
+"""
 from __future__ import annotations
 import ast
+import json
+import logging
 from pathlib import Path
+from typing import Iterator
 
 import numpy as np
 import pandas as pd
 import torch
 from torch_geometric.data import Dataset, HeteroData
+
+_LOG = logging.getLogger("gnn4id.functions")
+MANIFEST_FORMAT = "gnn4id-shards-v1"
 
 # Columns excluded from flow features (metadata / packet-level list strings).
 # nfstream may write custom plugin fields as "pkt_hex" or "udps.pkt_hex" depending on version.
@@ -57,12 +70,8 @@ class NIDSDataset(Dataset):
         self._graphs: list[HeteroData] = []
 
         for csv_path, label in csv_files:
-            df = pd.read_csv(csv_path)
             label_idx = label_mapping[label]
-            for _, row in df.iterrows():
-                g = self._build_graph(row, label_idx)
-                if g is not None:
-                    self._graphs.append(g)
+            self._graphs.extend(stream_graphs_from_csv(csv_path, label_idx))
 
     # ── PyG Dataset interface ──────────────────────────────────────────────────
 
@@ -72,11 +81,12 @@ class NIDSDataset(Dataset):
     def get(self, idx: int) -> HeteroData:
         return self._graphs[idx]
 
-    # ── Internal builders ──────────────────────────────────────────────────────
+    # ── Internal builders (static: shared by the streaming path) ────────────────
 
-    def _build_graph(self, row: pd.Series, label_idx: int) -> HeteroData | None:
-        flow_feat = self._flow_features(row)
-        pkt_feat, pkt_delta = self._packet_features(row)
+    @staticmethod
+    def _build_graph(row: pd.Series, label_idx: int) -> HeteroData | None:
+        flow_feat = NIDSDataset._flow_features(row)
+        pkt_feat, pkt_delta = NIDSDataset._packet_features(row)
         if pkt_feat is None or len(pkt_feat) == 0:
             return None
         n_pkts = len(pkt_feat)
@@ -92,7 +102,7 @@ class NIDSDataset(Dataset):
             torch.arange(n_pkts, dtype=torch.long),
         ])
         g["flow", "contains", "packet"].edge_attr = torch.tensor(
-            self._contain_edge_attr(row, n_pkts), dtype=torch.float
+            NIDSDataset._contain_edge_attr(row, n_pkts), dtype=torch.float
         )  # (P, 4)
 
         # link: packet_i → packet_{i+1}
@@ -110,7 +120,8 @@ class NIDSDataset(Dataset):
 
         return g
 
-    def _flow_features(self, row: pd.Series) -> list[float]:
+    @staticmethod
+    def _flow_features(row: pd.Series) -> list[float]:
         feats = []
         for col in row.index:
             # Skip metadata, packet-level list strings, and all udps.* columns
@@ -122,7 +133,8 @@ class NIDSDataset(Dataset):
                 feats.append(0.0)
         return feats
 
-    def _packet_features(self, row: pd.Series) -> tuple[list[list[float]] | None, list[float] | None]:
+    @staticmethod
+    def _packet_features(row: pd.Series) -> tuple[list[list[float]] | None, list[float] | None]:
         hexes = _safe_parse_list(_row_get(row, "pkt_hex"))
         deltas = _safe_parse_list(_row_get(row, "pkt_delta"))
         if hexes is None or deltas is None:
@@ -138,7 +150,8 @@ class NIDSDataset(Dataset):
         deltas_f = [float(d) for d in deltas]
         return feats, deltas_f
 
-    def _contain_edge_attr(self, row: pd.Series, n_pkts: int) -> list[list[float]]:
+    @staticmethod
+    def _contain_edge_attr(row: pd.Series, n_pkts: int) -> list[list[float]]:
         dirs = _safe_parse_list(_row_get(row, "pkt_dir")) or []
         ips  = _safe_parse_list(_row_get(row, "pkt_ip_size")) or []
         trs  = _safe_parse_list(_row_get(row, "pkt_transport_size")) or []
@@ -152,3 +165,121 @@ class NIDSDataset(Dataset):
                 float(pls[i])  if i < len(pls)  else 0.0,
             ])
         return attrs
+
+
+# ── Streaming build + on-disk shards (bounded build-step RAM) ────────────────
+
+
+def stream_graphs_from_csv(csv_path: str, label_idx: int) -> Iterator[HeteroData]:
+    """Yield one HeteroData per valid flow row in ``csv_path`` without buffering.
+
+    This is the streaming counterpart to ``NIDSDataset.__init__``: it never holds
+    more than a single row's graph at a time, so the caller controls peak memory.
+    """
+    df = pd.read_csv(csv_path)
+    for _, row in df.iterrows():
+        g = NIDSDataset._build_graph(row, label_idx)
+        if g is not None:
+            yield g
+
+
+def write_graph_shards(
+    csv_files: list[tuple[str, str]],
+    label_mapping: dict[str, int],
+    manifest_path: str,
+    shard_dir: str | None = None,
+    max_graphs_per_shard: int = 50_000,
+) -> dict:
+    """Stream every CSV's graphs to disk shards and write a manifest JSON.
+
+    Peak RAM is bounded by ``max_graphs_per_shard`` (plus one CSV's DataFrame),
+    not by the whole dataset. Returns the manifest dict (also written to disk).
+
+    Layout::
+
+        <manifest_path>                         # JSON manifest
+        <shard_dir>/<label>__<csv_stem>.NNN.pt   # torch.save(list[HeteroData])
+    """
+    manifest_p = Path(manifest_path)
+    if shard_dir is None:
+        shard_dir_p = manifest_p.parent / (manifest_p.stem + "_shards")
+    else:
+        shard_dir_p = Path(shard_dir)
+    shard_dir_p.mkdir(parents=True, exist_ok=True)
+
+    shards: list[str] = []
+    total = 0
+
+    def _flush(buf: list[HeteroData], stem: str, seq: int) -> None:
+        nonlocal total
+        if not buf:
+            return
+        shard_path = shard_dir_p / f"{stem}.{seq:03d}.pt"
+        torch.save(buf, str(shard_path))
+        # store path relative to the manifest so the artifact is relocatable
+        try:
+            rel = shard_path.relative_to(manifest_p.parent)
+        except ValueError:
+            rel = shard_path
+        shards.append(str(rel).replace("\\", "/"))
+        total += len(buf)
+        _LOG.info("  shard %s (%d graphs, running total %d)", shard_path.name, len(buf), total)
+
+    for csv_path, label in csv_files:
+        if label not in label_mapping:
+            _LOG.warning("  label %r not in label_mapping, skipping %s", label, csv_path)
+            continue
+        label_idx = label_mapping[label]
+        stem = f"{label}__{Path(csv_path).stem}"
+        buf: list[HeteroData] = []
+        seq = 0
+        for g in stream_graphs_from_csv(csv_path, label_idx):
+            buf.append(g)
+            if len(buf) >= max_graphs_per_shard:
+                _flush(buf, stem, seq)
+                seq += 1
+                buf = []          # release references so GC can reclaim the shard
+        _flush(buf, stem, seq)
+
+    manifest = {
+        "format": MANIFEST_FORMAT,
+        "label_mapping": label_mapping,
+        "num_graphs": total,
+        "shards": shards,
+    }
+    manifest_p.parent.mkdir(parents=True, exist_ok=True)
+    manifest_p.write_text(json.dumps(manifest, indent=2))
+    return manifest
+
+
+def load_graphs(path: str) -> tuple[list[HeteroData], dict[str, int]]:
+    """Load graphs + label_mapping from either a shard manifest or a legacy .pt.
+
+    Accepts:
+      * a ``*.manifest.json`` (or a directory containing one) → reads & concatenates shards;
+      * a legacy single ``graphs.pt`` (``{"graphs": [...], "label_mapping": {...}}``).
+
+    The streaming build keeps the BUILD step's RAM bounded; this loader still
+    concatenates shards into one list for training (training-time RAM unchanged).
+    """
+    p = Path(path)
+    if p.is_dir():
+        manifests = sorted(p.glob("*.manifest.json"))
+        if not manifests:
+            raise FileNotFoundError(f"No *.manifest.json found in directory {p}")
+        p = manifests[0]
+
+    if p.suffix == ".json":
+        manifest = json.loads(p.read_text())
+        if manifest.get("format") != MANIFEST_FORMAT:
+            raise ValueError(f"Unrecognized manifest format: {manifest.get('format')!r}")
+        label_mapping = manifest["label_mapping"]
+        graphs: list[HeteroData] = []
+        for rel in manifest["shards"]:
+            shard_path = (p.parent / rel)
+            graphs.extend(torch.load(str(shard_path), map_location="cpu", weights_only=False))
+        return graphs, label_mapping
+
+    # Legacy single-file artifact
+    saved = torch.load(str(p), map_location="cpu", weights_only=False)
+    return saved["graphs"], saved["label_mapping"]
