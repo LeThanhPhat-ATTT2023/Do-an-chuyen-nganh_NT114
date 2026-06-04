@@ -18,6 +18,7 @@ import preprocess
 from preprocess import _can_admit
 from utils.functions import (
     NIDSDataset,
+    ShardWriter,
     stream_graphs_from_csv,
     write_graph_shards,
     load_graphs,
@@ -163,3 +164,87 @@ def test_load_graphs_legacy_pt():
         loaded, lm_loaded = load_graphs(legacy_pt)
     assert lm_loaded == lm
     assert len(loaded) == 2
+
+
+# ── uint8 packet features + model compatibility ──────────────────────────────
+
+def test_packet_x_is_uint8():
+    with tempfile.TemporaryDirectory() as d:
+        csv = os.path.join(d, "ddos.csv")
+        _make_synthetic_csv(csv, "DDoS", n_rows=2)
+        g = next(stream_graphs_from_csv(csv, 0))
+    assert g["packet"].x.dtype == torch.uint8
+    assert g["packet"].x.shape[1] == 1500
+
+
+def test_model_forward_accepts_uint8():
+    """End-to-end: uint8 packet.x must flow through the model (cast → float)."""
+    from torch_geometric.loader import DataLoader
+    from model import HeteroGNN_Edge
+
+    with tempfile.TemporaryDirectory() as d:
+        csv = os.path.join(d, "ddos.csv")
+        _make_synthetic_csv(csv, "DDoS", n_rows=4)
+        graphs = list(stream_graphs_from_csv(csv, 0))
+    assert graphs[0]["packet"].x.dtype == torch.uint8
+    batch = next(iter(DataLoader(graphs, batch_size=2)))
+    model = HeteroGNN_Edge(graphs[0].metadata(), hidden_channels=16, num_classes=2)
+    model.eval()
+    out = model(batch.x_dict, batch.edge_index_dict, batch.edge_attr_dict, batch.batch_dict)
+    assert out.shape == (2, 2)
+    assert not torch.isnan(out).any()
+
+
+# ── subsampling + ShardWriter resume / per-class cap ─────────────────────────
+
+def test_subsample_caps_and_is_deterministic():
+    with tempfile.TemporaryDirectory() as d:
+        csv = os.path.join(d, "ddos.csv")
+        _make_synthetic_csv(csv, "DDoS", n_rows=50)
+        full = list(stream_graphs_from_csv(csv, 0))
+        sub_a = list(stream_graphs_from_csv(csv, 0, max_flows=10, seed=42))
+        sub_b = list(stream_graphs_from_csv(csv, 0, max_flows=10, seed=42))
+    assert len(full) == 50
+    assert len(sub_a) == 10
+    # same seed → same selection (deterministic)
+    assert len(sub_b) == 10
+    # n_total <= max_flows → keep all
+    with tempfile.TemporaryDirectory() as d:
+        csv = os.path.join(d, "small.csv")
+        _make_synthetic_csv(csv, "DDoS", n_rows=3)
+        assert len(list(stream_graphs_from_csv(csv, 0, max_flows=10))) == 3
+
+
+def test_shardwriter_resume_skips_built():
+    lm = {"DDoS": 0}
+    with tempfile.TemporaryDirectory() as d:
+        csv = os.path.join(d, "ddos.csv")
+        _make_synthetic_csv(csv, "DDoS", n_rows=4)
+        manifest = os.path.join(d, "g.manifest.json")
+        w1 = ShardWriter(manifest, lm)
+        added1 = w1.add_csv(csv, "DDoS")
+        w1.finalize()
+        # fresh writer reloads the manifest and must skip the already-built csv
+        w2 = ShardWriter(manifest, lm)
+        assert w2.already_built(csv, "DDoS")
+        added2 = w2.add_csv(csv, "DDoS")
+    assert added1 == 4
+    assert added2 == 0
+
+
+def test_shardwriter_per_class_cap_across_csvs():
+    lm = {"DDoS": 0}
+    with tempfile.TemporaryDirectory() as d:
+        c1 = os.path.join(d, "ddos1.csv")
+        c2 = os.path.join(d, "ddos2.csv")
+        _make_synthetic_csv(c1, "DDoS", n_rows=8)
+        _make_synthetic_csv(c2, "DDoS", n_rows=8)
+        manifest = os.path.join(d, "g.manifest.json")
+        w = ShardWriter(manifest, lm, max_flows_per_class=10, seed=42)
+        a1 = w.add_csv(c1, "DDoS")
+        a2 = w.add_csv(c2, "DDoS")
+        m = w.finalize()
+    assert a1 == 8          # first csv fits under the cap of 10
+    assert a2 == 2          # second csv contributes only the remaining 2
+    assert m["per_class"]["DDoS"] == 10
+    assert m["num_graphs"] == 10

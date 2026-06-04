@@ -24,6 +24,17 @@ def additional_features(
     proto_list=[1, 2, 6, 17, 58],
 ):
     """Compute rolling-window features on a nfstream CSV and overwrite it in-place."""
+    # Fast idempotency: peek the header only. A CSV already carrying the rolling
+    # columns was processed by a prior run — return without loading the full
+    # (possibly multi-GB) file into RAM.
+    try:
+        header_cols = pd.read_csv(file_name, nrows=0).columns
+    except Exception:
+        print(f"file reading error: {file_name}")
+        return ""
+    if "Rolling_ACK_Packets_SourceDestination" in header_cols:
+        return file_name
+
     try:
         data = pd.read_csv(file_name)
     except Exception:

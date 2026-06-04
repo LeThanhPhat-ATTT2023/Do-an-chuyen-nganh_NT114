@@ -67,6 +67,10 @@ class HeteroGNN_Edge(nn.Module):
         edge_attr_dict: dict,
         batch_dict: dict,
     ) -> torch.Tensor:
+        # packet.x is stored as uint8 (raw bytes 0-255) to save disk/RAM; conv
+        # layers need floats, so upcast any integer feature tensor here.
+        x_dict = {k: (v if torch.is_floating_point(v) else v.float())
+                  for k, v in x_dict.items()}
         x0 = dict(x_dict)  # preserve original features for source-only node types
         out1 = self.conv1(x0, edge_index_dict, edge_attr_dict)
         # Merge back node types not updated by conv1 (source-only, e.g. 'flow')

@@ -20,6 +20,7 @@ from torch_geometric.data import Dataset, HeteroData
 
 _LOG = logging.getLogger("gnn4id.functions")
 MANIFEST_FORMAT = "gnn4id-shards-v1"
+_READ_CHUNK_ROWS = 20_000  # CSV read chunk for row-counting + subsampled streaming
 
 # Columns excluded from flow features (metadata / packet-level list strings).
 # nfstream may write custom plugin fields as "pkt_hex" or "udps.pkt_hex" depending on version.
@@ -94,7 +95,9 @@ class NIDSDataset(Dataset):
         g = HeteroData()
         g["flow"].x = torch.tensor([flow_feat], dtype=torch.float)  # (1, F)
         g["flow"].y = torch.tensor([label_idx], dtype=torch.long)
-        g["packet"].x = torch.tensor(np.array(pkt_feat, dtype=np.float32))  # (P, 1500)
+        # Store raw packet bytes as uint8 (values are 0-255) — 4x smaller on disk
+        # and in RAM than float32. The model casts uint8 → float at forward time.
+        g["packet"].x = torch.from_numpy(np.asarray(pkt_feat, dtype=np.uint8))  # (P, 1500) uint8
 
         # contains: flow(0) → each packet
         g["flow", "contains", "packet"].edge_index = torch.stack([
@@ -142,11 +145,11 @@ class NIDSDataset(Dataset):
         feats = []
         for h in hexes:
             raw = bytes.fromhex(h) if isinstance(h, str) and h else b""
-            arr = np.zeros(_PACKET_BYTES, dtype=np.float32)
+            arr = np.zeros(_PACKET_BYTES, dtype=np.uint8)
             n = min(len(raw), _PACKET_BYTES)
             if n:
                 arr[:n] = np.frombuffer(raw[:n], dtype=np.uint8)
-            feats.append(arr.tolist())
+            feats.append(arr)
         deltas_f = [float(d) for d in deltas]
         return feats, deltas_f
 
@@ -170,17 +173,178 @@ class NIDSDataset(Dataset):
 # ── Streaming build + on-disk shards (bounded build-step RAM) ────────────────
 
 
-def stream_graphs_from_csv(csv_path: str, label_idx: int) -> Iterator[HeteroData]:
-    """Yield one HeteroData per valid flow row in ``csv_path`` without buffering.
+def _count_csv_rows(csv_path: str) -> int:
+    """Count data rows (excluding header) without loading the whole file into RAM."""
+    n = 0
+    for chunk in pd.read_csv(csv_path, usecols=[0], chunksize=_READ_CHUNK_ROWS):
+        n += len(chunk)
+    return n
 
-    This is the streaming counterpart to ``NIDSDataset.__init__``: it never holds
-    more than a single row's graph at a time, so the caller controls peak memory.
+
+def stream_graphs_from_csv(
+    csv_path: str,
+    label_idx: int,
+    max_flows: int | None = None,
+    seed: int = 42,
+) -> Iterator[HeteroData]:
+    """Yield one HeteroData per (optionally subsampled) flow row in ``csv_path``.
+
+    * ``max_flows is None`` → build every row (legacy behaviour; loads the CSV).
+    * ``max_flows`` set → build a uniform random subset of that many rows, read in
+      chunks (two-pass) so peak RAM stays bounded by one chunk + the kept graphs,
+      never the whole multi-GB CSV.
     """
-    df = pd.read_csv(csv_path)
-    for _, row in df.iterrows():
-        g = NIDSDataset._build_graph(row, label_idx)
-        if g is not None:
-            yield g
+    if max_flows is None:
+        df = pd.read_csv(csv_path)
+        for _, row in df.iterrows():
+            g = NIDSDataset._build_graph(row, label_idx)
+            if g is not None:
+                yield g
+        return
+
+    n_total = _count_csv_rows(csv_path)
+    if n_total <= max_flows:
+        df = pd.read_csv(csv_path)
+        for _, row in df.iterrows():
+            g = NIDSDataset._build_graph(row, label_idx)
+            if g is not None:
+                yield g
+        return
+
+    rng = np.random.default_rng(seed)
+    selected = {int(i) for i in rng.choice(n_total, size=max_flows, replace=False)}
+    offset = 0
+    for chunk in pd.read_csv(csv_path, chunksize=_READ_CHUNK_ROWS):
+        for i, (_, row) in enumerate(chunk.iterrows()):
+            if (offset + i) in selected:
+                g = NIDSDataset._build_graph(row, label_idx)
+                if g is not None:
+                    yield g
+        offset += len(chunk)
+
+
+class ShardWriter:
+    """Streams per-CSV graphs to disk shards, persisting an incremental manifest.
+
+    Designed for crash/disk-full safety: the manifest is rewritten atomically after
+    every CSV, so a re-run resumes cleanly — already-built CSV stems are skipped and
+    a per-class flow cap is honoured across the whole dataset (even multiple PCAPs
+    per class). Pair with delete-CSV-after-build to bound disk usage.
+    """
+
+    def __init__(
+        self,
+        manifest_path: str,
+        label_mapping: dict[str, int],
+        shard_dir: str | None = None,
+        max_graphs_per_shard: int = 50_000,
+        max_flows_per_class: int | None = None,
+        seed: int = 42,
+    ):
+        self.manifest_p = Path(manifest_path)
+        self.label_mapping = label_mapping
+        if shard_dir is None:
+            self.shard_dir_p = self.manifest_p.parent / (self.manifest_p.stem + "_shards")
+        else:
+            self.shard_dir_p = Path(shard_dir)
+        self.shard_dir_p.mkdir(parents=True, exist_ok=True)
+        self.max_graphs_per_shard = max_graphs_per_shard
+        self.max_flows_per_class = max_flows_per_class
+        self.seed = seed
+
+        self.shards: list[str] = []
+        self.total = 0
+        self.built_stems: set[str] = set()
+        self.per_class: dict[str, int] = {}
+        if self.manifest_p.exists():            # resume from a prior (possibly partial) run
+            try:
+                m = json.loads(self.manifest_p.read_text())
+            except Exception:
+                m = {}
+            if m.get("format") == MANIFEST_FORMAT:
+                self.shards = list(m.get("shards", []))
+                self.total = int(m.get("num_graphs", 0))
+                self.built_stems = set(m.get("built_stems", []))
+                self.per_class = dict(m.get("per_class", {}))
+
+    @staticmethod
+    def stem_for(csv_path: str, label: str) -> str:
+        return f"{label}__{Path(csv_path).stem}"
+
+    def already_built(self, csv_path: str, label: str) -> bool:
+        return self.stem_for(csv_path, label) in self.built_stems
+
+    def add_csv(self, csv_path: str, label: str) -> int:
+        """Build + flush shards for one CSV. Returns #graphs added (0 if skipped)."""
+        stem = self.stem_for(csv_path, label)
+        if stem in self.built_stems:
+            _LOG.info("  skip (already built): %s", stem)
+            return 0
+        if label not in self.label_mapping:
+            _LOG.warning("  label %r not in label_mapping, skipping %s", label, csv_path)
+            return 0
+        label_idx = self.label_mapping[label]
+
+        max_flows = None
+        if self.max_flows_per_class is not None:
+            remaining = self.max_flows_per_class - self.per_class.get(label, 0)
+            if remaining <= 0:
+                _LOG.info("  class %s at cap (%d) — skip %s",
+                          label, self.max_flows_per_class, stem)
+                self.built_stems.add(stem)
+                self._persist()
+                return 0
+            max_flows = remaining
+
+        buf: list[HeteroData] = []
+        seq = 0
+        added = 0
+        for g in stream_graphs_from_csv(csv_path, label_idx, max_flows=max_flows, seed=self.seed):
+            buf.append(g)
+            if len(buf) >= self.max_graphs_per_shard:
+                added += self._flush(buf, stem, seq)
+                seq += 1
+                buf = []          # release references so GC can reclaim the shard
+        added += self._flush(buf, stem, seq)
+
+        self.built_stems.add(stem)
+        self.per_class[label] = self.per_class.get(label, 0) + added
+        self._persist()
+        return added
+
+    def _flush(self, buf: list[HeteroData], stem: str, seq: int) -> int:
+        if not buf:
+            return 0
+        shard_path = self.shard_dir_p / f"{stem}.{seq:03d}.pt"
+        torch.save(buf, str(shard_path))
+        try:
+            rel = shard_path.relative_to(self.manifest_p.parent)
+        except ValueError:
+            rel = shard_path
+        self.shards.append(str(rel).replace("\\", "/"))
+        self.total += len(buf)
+        _LOG.info("  shard %s (%d graphs, total %d)", shard_path.name, len(buf), self.total)
+        return len(buf)
+
+    def _manifest_dict(self) -> dict:
+        return {
+            "format": MANIFEST_FORMAT,
+            "label_mapping": self.label_mapping,
+            "num_graphs": self.total,
+            "shards": self.shards,
+            "built_stems": sorted(self.built_stems),
+            "per_class": self.per_class,
+        }
+
+    def _persist(self) -> None:
+        self.manifest_p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.manifest_p.with_suffix(self.manifest_p.suffix + ".tmp")
+        tmp.write_text(json.dumps(self._manifest_dict(), indent=2))
+        tmp.replace(self.manifest_p)   # atomic — never leave a half-written manifest
+
+    def finalize(self) -> dict:
+        self._persist()
+        return self._manifest_dict()
 
 
 def write_graph_shards(
@@ -189,67 +353,23 @@ def write_graph_shards(
     manifest_path: str,
     shard_dir: str | None = None,
     max_graphs_per_shard: int = 50_000,
+    max_flows_per_class: int | None = None,
+    seed: int = 42,
 ) -> dict:
     """Stream every CSV's graphs to disk shards and write a manifest JSON.
 
-    Peak RAM is bounded by ``max_graphs_per_shard`` (plus one CSV's DataFrame),
-    not by the whole dataset. Returns the manifest dict (also written to disk).
+    Thin wrapper over :class:`ShardWriter` for the non-interleaved path and tests.
+    Peak RAM is bounded by ``max_graphs_per_shard`` (plus one read chunk); the
+    final artifact layout is::
 
-    Layout::
-
-        <manifest_path>                         # JSON manifest
-        <shard_dir>/<label>__<csv_stem>.NNN.pt   # torch.save(list[HeteroData])
+        <manifest_path>                          # JSON manifest (+ resume state)
+        <shard_dir>/<label>__<csv_stem>.NNN.pt    # torch.save(list[HeteroData])
     """
-    manifest_p = Path(manifest_path)
-    if shard_dir is None:
-        shard_dir_p = manifest_p.parent / (manifest_p.stem + "_shards")
-    else:
-        shard_dir_p = Path(shard_dir)
-    shard_dir_p.mkdir(parents=True, exist_ok=True)
-
-    shards: list[str] = []
-    total = 0
-
-    def _flush(buf: list[HeteroData], stem: str, seq: int) -> None:
-        nonlocal total
-        if not buf:
-            return
-        shard_path = shard_dir_p / f"{stem}.{seq:03d}.pt"
-        torch.save(buf, str(shard_path))
-        # store path relative to the manifest so the artifact is relocatable
-        try:
-            rel = shard_path.relative_to(manifest_p.parent)
-        except ValueError:
-            rel = shard_path
-        shards.append(str(rel).replace("\\", "/"))
-        total += len(buf)
-        _LOG.info("  shard %s (%d graphs, running total %d)", shard_path.name, len(buf), total)
-
+    w = ShardWriter(manifest_path, label_mapping, shard_dir,
+                    max_graphs_per_shard, max_flows_per_class, seed)
     for csv_path, label in csv_files:
-        if label not in label_mapping:
-            _LOG.warning("  label %r not in label_mapping, skipping %s", label, csv_path)
-            continue
-        label_idx = label_mapping[label]
-        stem = f"{label}__{Path(csv_path).stem}"
-        buf: list[HeteroData] = []
-        seq = 0
-        for g in stream_graphs_from_csv(csv_path, label_idx):
-            buf.append(g)
-            if len(buf) >= max_graphs_per_shard:
-                _flush(buf, stem, seq)
-                seq += 1
-                buf = []          # release references so GC can reclaim the shard
-        _flush(buf, stem, seq)
-
-    manifest = {
-        "format": MANIFEST_FORMAT,
-        "label_mapping": label_mapping,
-        "num_graphs": total,
-        "shards": shards,
-    }
-    manifest_p.parent.mkdir(parents=True, exist_ok=True)
-    manifest_p.write_text(json.dumps(manifest, indent=2))
-    return manifest
+        w.add_csv(csv_path, label)
+    return w.finalize()
 
 
 def load_graphs(path: str) -> tuple[list[HeteroData], dict[str, int]]:
