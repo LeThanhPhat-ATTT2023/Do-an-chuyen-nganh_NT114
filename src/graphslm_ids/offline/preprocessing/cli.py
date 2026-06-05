@@ -134,6 +134,18 @@ def main() -> None:
     ap.add_argument("--max-per-class", type=int, default=0, help="0 = no cap")
     ap.add_argument("--pmi-subsample-per-class", type=int, default=25_000)
     ap.add_argument("--pmi-max-total", type=int, default=200_000)
+    ap.add_argument(
+        "--pmi-family-tau",
+        type=float,
+        default=0.0,
+        help=(
+            "MSEE family-specificity threshold in [0,1]. A token's evidence edges "
+            "are kept only in families where its summed |weight| >= tau * its max "
+            "family weight, pruning cross-family-smeared generic byte n-grams. "
+            "0.0 (default) disables the filter (v1/v2 behaviour); 0.6 recommended "
+            "for the discriminative v3 rebuild."
+        ),
+    )
     ap.add_argument("--tau-edge", type=float, default=0.4)
     ap.add_argument("--temporal-train-frac", type=float, default=0.80)
     ap.add_argument("--temporal-val-frac", type=float, default=0.10)
@@ -244,6 +256,7 @@ def main() -> None:
         n_per_class=args.pmi_subsample_per_class,
         max_total=args.pmi_max_total,
         seed=args.seed,
+        family_specificity_tau=args.pmi_family_tau,
     )
     _LOG.info(
         "  -> pmi_table rows=%d unique_tokens=%d unique_techniques=%d (%.1fs)",
