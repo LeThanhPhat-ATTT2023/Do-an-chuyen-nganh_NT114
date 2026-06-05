@@ -122,9 +122,9 @@ train:
   # Tail classes auto-detected at training startup from class distribution.
   hgaa:
     enabled: true
-    aug_prob: 0.5
+    aug_ratio_in_batch: 0.5    # key read by hgaa_augmentation.py (was wrongly aug_prob)
     bias_factor_T: 0.5
-    tail_class_k: 3
+    bias_top_k_rarest: 3       # key read by hgaa_augmentation.py (was wrongly tail_class_k)
 
 sampler:
   # hops=4: supports full hierarchy flow(0)→packet(1)→technique(2)→tactic(3) plus
