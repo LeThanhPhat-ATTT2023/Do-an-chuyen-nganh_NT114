@@ -453,6 +453,64 @@ def project_to_techniques(
     return pd.DataFrame(rows, columns=["token", "technique", "family", "weight"])
 
 
+def apply_family_specificity_filter(
+    pmi_table: pd.DataFrame,
+    tau: float,
+) -> pd.DataFrame:
+    """Drop cross-family-smeared token rows from a PMI evidence table.
+
+    Generic byte n-grams (e.g. the 4-gram of "google" / "net" / "org:") pick up
+    nonzero logistic coefficients for several web-attack classes at once; since
+    each class routes to its own technique/family, such a token emits evidence
+    edges into many families and carries no class-discriminative signal. The
+    downstream HGT then sees identical evidence signatures for
+    CommandInjection / XSS / Uploading_Attack and cannot separate them.
+
+    For each token we sum ``|weight|`` within each family and keep only rows
+    whose family is *dominant* for that token::
+
+        keep (token, family) iff  fam_weight[token, family] >= tau * max_f fam_weight[token, f]
+
+    With ``tau`` near 1.0 a token survives only in its single strongest family;
+    ``tau == 0.0`` keeps every row (no-op — preserves v1/v2 behaviour).
+
+    Args:
+        pmi_table: columns ``token, technique, family, weight``.
+        tau: dominance threshold in [0, 1]. ``0.0`` disables the filter.
+
+    Returns:
+        When ``tau > 0`` and the table is non-empty: a filtered copy (kept rows,
+        index reset, input order preserved). When the filter is a no-op
+        (``tau <= 0`` / empty / None): the input object is returned unchanged.
+        Deterministic.
+    """
+    if tau <= 0.0 or pmi_table is None or pmi_table.empty:
+        return pmi_table
+    required = {"token", "technique", "family", "weight"}
+    missing = required - set(pmi_table.columns)
+    if missing:
+        raise ValueError(f"pmi_table missing columns: {sorted(missing)}")
+
+    df = pmi_table
+    fam = (
+        df.assign(_absw=df["weight"].abs())
+        .groupby(["token", "family"], sort=False)["_absw"]
+        .sum()
+        .rename("fw")
+        .reset_index()
+    )
+    fam["fmax"] = fam.groupby("token", sort=False)["fw"].transform("max")
+    keep_pairs = {
+        (r.token, r.family)
+        for r in fam[fam["fw"] >= tau * fam["fmax"]].itertuples(index=False)
+    }
+    mask = [
+        (t, f) in keep_pairs
+        for t, f in zip(df["token"].tolist(), df["family"].tolist())
+    ]
+    return df.loc[mask].reset_index(drop=True)
+
+
 def fit_and_save_pmi_table(
     train_packets_df: pd.DataFrame,
     class_technique_map_path: Path,
@@ -468,6 +526,7 @@ def fit_and_save_pmi_table(
     top_k_per_class: int = 2000,
     C: float = 0.1,
     coef_threshold: float = 0.01,
+    family_specificity_tau: float = 0.0,
 ) -> dict[str, Any]:
     """End-to-end fit. Writes ``pmi_table.parquet`` + ``meta.json``.
 
@@ -548,6 +607,17 @@ def fit_and_save_pmi_table(
         technique_family,
         coef_threshold=coef_threshold,
     )
+    # MSEE family-specificity filter: prune cross-family-smeared generic tokens
+    # so the evidence edges become class-discriminative (default tau=0.0 = no-op).
+    rows_before_filter = int(len(pmi_table))
+    if family_specificity_tau > 0.0:
+        pmi_table = apply_family_specificity_filter(pmi_table, family_specificity_tau)
+        _LOG.info(
+            "  -> family-specificity filter (tau=%.2f): %d -> %d rows",
+            family_specificity_tau,
+            rows_before_filter,
+            len(pmi_table),
+        )
     pmi_table.to_parquet(out_pmi_table, index=False)
     t_proj = time.time() - t0
     _LOG.info(
@@ -593,7 +663,9 @@ def fit_and_save_pmi_table(
             "C": float(C),
             "max_iter": 200,
             "coef_threshold": float(coef_threshold),
+            "family_specificity_tau": float(family_specificity_tau),
         },
+        "pmi_table_rows_before_family_filter": rows_before_filter,
     }
     with out_meta_json.open("w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
@@ -606,5 +678,6 @@ __all__ = [
     "filter_pmi_candidates",
     "fit_l1_logistic",
     "project_to_techniques",
+    "apply_family_specificity_filter",
     "fit_and_save_pmi_table",
 ]
