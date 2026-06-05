@@ -128,11 +128,14 @@ train:
   gcl_n_negatives: 16
 
   # HGAA augmentation
+  # NOTE: key names must match hgaa_augmentation.py's hgaa_cfg.get() calls:
+  #   aug_ratio_in_batch  (NOT aug_prob)
+  #   bias_top_k_rarest   (NOT tail_class_k)
   hgaa:
     enabled: true
-    aug_prob: 0.7              # [OPT-7] was 0.5
+    aug_ratio_in_batch: 0.7    # [OPT-7] was 0.5 (key: aug_ratio_in_batch)
     bias_factor_T: 0.5
-    tail_class_k: 6            # [OPT-6] was 3
+    bias_top_k_rarest: 6       # [OPT-6] was 3 (key: bias_top_k_rarest)
 
 sampler:
   hops: 4
