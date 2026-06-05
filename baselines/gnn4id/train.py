@@ -110,6 +110,24 @@ def main() -> None:
     test_graphs  = [graphs[i] for i in test_idx]
     _LOG.info("Split: train=%d val=%d test=%d", len(train_graphs), len(val_graphs), len(test_graphs))
 
+    # ── Normalize flow features (z-score from train set) ──────────────────
+    # nfstream includes Unix timestamps (~1.7e12 ms) and raw byte counts in
+    # flow.x — these un-normalized values explode gradients. Normalize using
+    # training-set statistics before any graph touches the model.
+    flow_feats = torch.cat([g["flow"].x for g in train_graphs], dim=0)
+    flow_mean  = flow_feats.mean(dim=0)
+    flow_std   = flow_feats.std(dim=0).clamp(min=1e-6)
+    torch.save({"mean": flow_mean, "std": flow_std}, out_dir / "flow_scaler.pt")
+    _LOG.info("Flow scaler saved (mean range [%.2g, %.2g])", flow_mean.min(), flow_mean.max())
+
+    def _norm_flow(gs):
+        for g in gs:
+            g["flow"].x = (g["flow"].x - flow_mean) / flow_std
+
+    _norm_flow(train_graphs)
+    _norm_flow(val_graphs)
+    _norm_flow(test_graphs)
+
     train_loader = DataLoader(train_graphs, batch_size=args.batch_size, shuffle=True)
     val_loader   = DataLoader(val_graphs,   batch_size=args.batch_size)
     test_loader  = DataLoader(test_graphs,  batch_size=args.batch_size)
@@ -118,6 +136,9 @@ def main() -> None:
     metadata = graphs[0].metadata()
     model = HeteroGNN_Edge(metadata, hidden_channels=64, num_classes=num_classes).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="max", factor=0.5, patience=5, threshold=0.01, min_lr=1e-5,
+    )
     class_w = _class_weights(train_graphs, num_classes).to(device)
     criterion = torch.nn.CrossEntropyLoss(weight=class_w)
 
@@ -142,8 +163,10 @@ def main() -> None:
             total_loss += loss.item()
 
         val_f1, _, _ = _eval(model, val_loader, device)
-        _LOG.info("Epoch %d | loss=%.4f | val_macro_f1=%.4f", epoch,
-                  total_loss / len(train_loader), val_f1)
+        scheduler.step(val_f1)
+        _LOG.info("Epoch %d | loss=%.4f | val_macro_f1=%.4f | lr=%.2e", epoch,
+                  total_loss / len(train_loader), val_f1,
+                  optimizer.param_groups[0]["lr"])
 
         if val_f1 > best_val_f1:
             best_val_f1 = val_f1

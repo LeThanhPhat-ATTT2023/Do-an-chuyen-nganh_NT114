@@ -28,6 +28,10 @@ _EXCLUDE = frozenset([
     "label", "src_ip", "dst_ip", "src_mac", "dst_mac", "src_oui", "dst_oui", "id",
     "application_name", "application_category_name", "requested_server_name",
     "client_fingerprint", "server_fingerprint", "user_agent", "content_type",
+    # Unix timestamps in milliseconds (~1.7e12) — catastrophic for un-normalized GNNs
+    "bidirectional_first_seen_ms", "bidirectional_last_seen_ms",
+    "src2dst_first_seen_ms", "src2dst_last_seen_ms",
+    "dst2src_first_seen_ms", "dst2src_last_seen_ms",
     # bare names (older nfstream)
     "pkt_hex", "pkt_delta", "pkt_dir",
     "pkt_ip_size", "pkt_transport_size", "pkt_payload_size",
