@@ -1,0 +1,183 @@
+# EG-HGT v3 — Optimized config (v2) targeting macro-F1 > GNN4ID baseline (0.8537)
+#
+# Diff vs eg_hgt.yaml (baseline macro-F1 = 0.7752 @ epoch 49):
+#
+#   [OPT-1] drw_start_pct: 0.0 → 0.3
+#           Deferred Re-Weighting (Cao et al. NeurIPS 2019): train 15 epochs with
+#           unweighted CE first so the model learns good representations, then
+#           activate class weights for the remaining 35 epochs to refine rare classes.
+#           Addresses XSS/CommandInjection which need good feature space before
+#           imbalance correction can help.
+#
+#   [OPT-2] focal_gamma: 2.0 → 3.0
+#           More aggressive focusing on hard examples. XSS (F1=0.161) and
+#           CommandInjection (F1=0.186) are persistently hard — higher gamma
+#           down-weights easy majority-class examples more strongly.
+#
+#   [OPT-3] class_weight_method: cb + cb_beta: 0.9999
+#           Class-Balanced loss (Cui et al. CVPR 2019): w_c = (1-β)/(1-β^n_c).
+#           Less aggressive than inverse frequency on extreme-tail classes
+#           (DDoS-ICMP_Flood n=46, Mirai-udpplain n=133) — prevents loss spikes
+#           while still upweighting rare classes.
+#
+#   [OPT-4] class_weight_cap: 10.0 → 15.0
+#           Slightly higher cap to allow more gradient for tail classes under
+#           the softer CB weighting.
+#
+#   [OPT-5] logit_adjustment: 1.0 (was 0.0 = disabled)
+#           Menon et al. ICLR 2021: subtract τ·log(prior) from eval logits to
+#           debias inference toward rare classes. τ=1.0 paper default.
+#           Applied at evaluation only — no effect on training stability.
+#
+#   [OPT-6] hgaa.tail_class_k: 3 → 6
+#           Extend HGAA augmentation pool from 3 to 6 tail classes:
+#           was: [DDoS-ICMP_Flood, Mirai-udpplain, DDoS-ICMP_Fragmentation]
+#           now adds: [Uploading_Attack, Recon-PingSweep, Backdoor_Malware]
+#           Uploading_Attack (F1=0.279) and Recon-PingSweep need more augmentation.
+#
+#   [OPT-7] hgaa.aug_prob: 0.5 → 0.7
+#           More aggressive augmentation for tail-class subgraphs.
+#
+#   [OPT-8] gcl_weight: 0.2 → 0.3
+#           Stronger contrastive supervision pulling packet embeddings toward
+#           their class MITRE technique. Helps XSS/CommandInjection which have
+#           clear MITRE technique mappings (T1059, T1190, T1505).
+
+experiment:
+  source_name: "EG-HGT v3 Smart-BOTH Hybrid v2 (optimized)"
+  rationale: >
+    Optimized training recipe targeting macro-F1 > GNN4ID (0.8537).
+    Key changes: DRW (drw_start_pct=0.3), focal_gamma=3.0, CB class weights,
+    logit_adjustment=1.0, HGAA tail_class_k=6. See config header for full rationale.
+
+data:
+  artifact_version: v3
+  graph_npz: outputs/v3/graph.npz
+  graph_meta_json: outputs/v3/graph.meta.json
+  splits_json: outputs/v3/splits.json
+  split_protocol: random
+  add_reverse_edges: true
+  standardize_flow_features: true
+  use_semantic_edge_weights: true
+  use_temporal_edge_weights: true
+  tew_epsilon: 1.0e-3
+
+model:
+  hidden_dim: 128
+  num_layers: 4
+  num_heads: 8
+  dropout: 0.2
+  ffn_multiplier: 2
+
+train:
+  output_dir: outputs/v3/hgt_v2
+  epochs: 50
+  patience: 25
+  batch_seed_flows: 256
+  grad_accum_steps: 2
+  monitor: val_macro_f1
+  log_every: 1
+  lr: 1.0e-3
+  weight_decay: 5.0e-5
+  amp: true
+  amp_dtype: auto
+  device: cuda
+  activation_checkpointing: true
+  compile: false
+  tf32: true
+  scheduler: cosine_annealing
+  scheduler_pct_start: 0.05
+  scheduler_eta_min: 1.0e-5
+  grad_clip_norm: 1.0
+  adamw_eps: 1.0e-6
+  adamw_betas: [0.9, 0.95]
+
+  # Loss
+  loss_type: focal
+  focal_gamma: 3.0             # [OPT-2] was 2.0
+  label_smoothing: 0.05
+
+  # Class weights
+  class_weight: balanced
+  class_weight_method: cb      # [OPT-3] was "inverse" (default)
+  cb_beta: 0.9999              # [OPT-3] was 0.999
+  class_weight_cap: 15.0       # [OPT-4] was 10.0
+
+  # DRW — defer class weights to epoch 15
+  drw_start_pct: 0.3           # [OPT-1] was 0.0
+
+  # Logit adjustment at inference (Menon et al. ICLR 2021)
+  logit_adjustment: 1.0        # [OPT-5] was 0.0
+
+  # Misc training
+  drop_edge_prob: 0.10
+  ema_enabled: true
+  ema_decay: 0.999
+  skip_val_first_epoch: false
+  eval_every: 1
+  val_ratio: 0.1
+  test_ratio: 0.1
+  seed: 42
+  stratified_batch_sampling: true
+
+  # GCL auxiliary loss
+  gcl_enabled: true
+  gcl_weight: 0.3              # [OPT-8] was 0.2
+  gcl_temperature: 0.1
+  gcl_positive_source: class_technique_map
+  gcl_n_negatives: 16
+
+  # HGAA augmentation
+  hgaa:
+    enabled: true
+    aug_prob: 0.7              # [OPT-7] was 0.5
+    bias_factor_T: 0.5
+    tail_class_k: 6            # [OPT-6] was 3
+
+sampler:
+  hops: 4
+  fanouts:
+    flow__contains__packet: 20
+    packet__next_packet__packet: 4
+    packet__evidence_injection__technique: 4
+    packet__evidence_command_exec__technique: 4
+    packet__evidence_file_upload__technique: 3
+    packet__evidence_recon__technique: 3
+    packet__evidence_c2_beacon__technique: 3
+    flow__from_host__host: 1
+    flow__to_host__host: 1
+    flow__burst_neighbor__flow: 6
+    flow__matches_technique__technique: 3
+    technique__has_subtechnique__technique: 2
+    technique__belongs_to_tactic__tactic: 1
+  reverse_fanouts:
+    rev_contains: 3
+    rev_next_packet: 2
+    rev_evidence_injection: 2
+    rev_evidence_command_exec: 2
+    rev_evidence_file_upload: 2
+    rev_evidence_recon: 2
+    rev_evidence_c2_beacon: 2
+    rev_from_host: 3
+    rev_to_host: 3
+    rev_burst_neighbor: 3
+    rev_matches_technique: 2
+    rev_has_subtechnique: 2
+    rev_belongs_to_tactic: 1
+  always_include_all_techniques: true
+  always_include_all_tactics: true
+
+dataloader:
+  num_workers: 6
+  prefetch_factor: 4
+  pin_memory: true
+  persistent_workers: true
+
+feature_store:
+  enabled: true
+  cache_fraction: 0.6
+  model_reserve_gb: 4.0
+  n_warmup_batches: 200
+
+gpu_sampling:
+  enabled: false
