@@ -36,3 +36,20 @@ def test_tuning_recovers_underpredicted_class():
     after = macro_f1(apply_bias(logits, bias), labels, c)
     assert after >= before
     assert bias[2] > bias[0]
+
+
+from graphslm_ids.offline.training.calibration import combine_tta
+
+
+def test_combine_tta_identity_preserves_argmax():
+    logits = np.array([[2.0, 0.0, -1.0], [0.0, 0.5, 0.4]])
+    out = combine_tta([logits, logits, logits])
+    assert out.shape == logits.shape
+    assert out.argmax(1).tolist() == logits.argmax(1).tolist()
+
+
+def test_combine_tta_averages_probabilities():
+    a = np.array([[10.0, 0.0]])
+    b = np.array([[0.0, 10.0]])
+    out = combine_tta([a, b])
+    assert abs(out[0, 0] - out[0, 1]) < 1e-6
