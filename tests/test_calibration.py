@@ -61,3 +61,11 @@ def test_tune_per_class_bias_rejects_empty_grid():
     labels = np.array([0, 1, 0, 1])
     with pytest.raises(ValueError):
         tune_per_class_bias(logits, labels, num_classes=2, grid=np.array([]))
+
+
+def test_evaluate_has_optional_collect_logits_default_false():
+    import inspect
+    import graphslm_ids.offline.training.train_hgt_flow_classifier as T
+    sig = inspect.signature(T.evaluate_neighbor_sampling)
+    p = sig.parameters.get("collect_logits")
+    assert p is not None and p.default is False
