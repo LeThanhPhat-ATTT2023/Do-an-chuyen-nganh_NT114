@@ -26,3 +26,35 @@ def macro_f1(preds: np.ndarray, labels: np.ndarray, num_classes: int) -> float:
 def apply_bias(logits: np.ndarray, bias: np.ndarray) -> np.ndarray:
     """Argmax over logits shifted by a per-class additive bias."""
     return (np.asarray(logits, dtype=np.float64) + np.asarray(bias, dtype=np.float64)).argmax(axis=1)
+
+
+def tune_per_class_bias(
+    val_logits: np.ndarray,
+    val_labels: np.ndarray,
+    num_classes: int,
+    grid: np.ndarray | None = None,
+    rounds: int = 3,
+) -> np.ndarray:
+    """Greedy coordinate ascent: for each class, pick the additive bias on `grid`
+    that maximizes VAL macro-F1, holding the others fixed; repeat `rounds` times.
+    Returns the bias vector (C,). Selection is ON VAL ONLY."""
+    if grid is None:
+        grid = np.linspace(-4.0, 4.0, 33)
+    val_logits = np.asarray(val_logits, dtype=np.float64)
+    val_labels = np.asarray(val_labels).ravel()
+    bias = np.zeros(num_classes, dtype=np.float64)
+    best = macro_f1(apply_bias(val_logits, bias), val_labels, num_classes)
+    for _ in range(rounds):
+        improved = False
+        for c in range(num_classes):
+            cur = bias[c]
+            best_b = cur
+            for b in grid:
+                bias[c] = b
+                f1 = macro_f1(apply_bias(val_logits, bias), val_labels, num_classes)
+                if f1 > best:
+                    best, best_b, improved = f1, b, True
+            bias[c] = best_b
+        if not improved:
+            break
+    return bias
