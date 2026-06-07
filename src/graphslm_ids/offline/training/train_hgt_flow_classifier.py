@@ -1564,6 +1564,7 @@ def evaluate_neighbor_sampling(
     logit_adjustment: torch.Tensor | None = None,
     tau_norm_divisor: torch.Tensor | None = None,
     packet_store: "TieredFeatureStore | None" = None,
+    collect_logits: bool = False,
 ) -> dict[str, Any]:
     """Two paths:
       1. DDP (``is_ddp=True``): each rank evaluates its DistributedSampler shard,
@@ -1586,6 +1587,7 @@ def evaluate_neighbor_sampling(
     loss_sum_t = torch.zeros(1, dtype=torch.float64, device=device)
     examples_t = torch.zeros(1, dtype=torch.int64, device=device)
     preds: list[np.ndarray] = []
+    logit_chunks: list[np.ndarray] = []
     preds_adj: list[np.ndarray] = []
     preds_tau: list[np.ndarray] = []
     labels: list[np.ndarray] = []
@@ -1670,6 +1672,8 @@ def evaluate_neighbor_sampling(
                     loss = F.cross_entropy(seed_logits.float(), seed_labels, reduction="sum")
                 loss_sum += float(loss.item())
                 _logits_raw = seed_logits.detach().float()
+                if collect_logits:
+                    logit_chunks.append(_logits_raw.cpu().numpy())
                 preds.append(_logits_raw.argmax(dim=1).cpu().numpy())
                 if logit_adjustment is not None:
                     _logits_adj = _logits_raw - logit_adjustment.to(_logits_raw.device)
@@ -1700,6 +1704,12 @@ def evaluate_neighbor_sampling(
         metrics["tau_normalized"] = metrics_from_predictions(
             tau_np, label_np, num_classes, label_names, loss_sum
         )
+    if collect_logits:
+        metrics["_logits"] = (
+            np.concatenate(logit_chunks) if logit_chunks
+            else np.empty((0, num_classes), dtype=np.float32)
+        )
+        metrics["_labels"] = label_np
     return metrics
 
 
