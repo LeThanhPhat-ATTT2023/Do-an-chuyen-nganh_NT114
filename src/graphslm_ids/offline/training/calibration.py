@@ -10,7 +10,11 @@ import numpy as np
 
 
 def macro_f1(preds: np.ndarray, labels: np.ndarray, num_classes: int) -> float:
-    """Unweighted mean per-class F1 (same definition as the trainer/sklearn)."""
+    """Unweighted mean per-class F1 (same definition as the trainer/sklearn).
+
+    Classes absent from both preds and labels (denominator 0) count as F1=0,
+    matching sklearn's ``zero_division=0`` default.
+    """
     preds = np.asarray(preds).ravel()
     labels = np.asarray(labels).ravel()
     f1s = []
@@ -37,9 +41,17 @@ def tune_per_class_bias(
 ) -> np.ndarray:
     """Greedy coordinate ascent: for each class, pick the additive bias on `grid`
     that maximizes VAL macro-F1, holding the others fixed; repeat `rounds` times.
-    Returns the bias vector (C,). Selection is ON VAL ONLY."""
+    Returns the bias vector (C,). Selection is ON VAL ONLY.
+
+    Cost is O(rounds * C * len(grid)) macro_f1 evaluations, each O(N * C). Intended
+    for an offline val split of ~tens of thousands of flows (seconds on CPU); for a
+    much larger val set, subsample rows before calling.
+    """
     if grid is None:
         grid = np.linspace(-4.0, 4.0, 33)
+    grid = np.asarray(grid, dtype=np.float64)
+    if grid.ndim != 1 or grid.size == 0:
+        raise ValueError("grid must be a non-empty 1-D array")
     val_logits = np.asarray(val_logits, dtype=np.float64)
     val_labels = np.asarray(val_labels).ravel()
     bias = np.zeros(num_classes, dtype=np.float64)
@@ -61,6 +73,7 @@ def tune_per_class_bias(
 
 
 def _softmax(logits: np.ndarray) -> np.ndarray:
+    """Numerically stable row-wise softmax (subtract row max before exp)."""
     z = np.asarray(logits, dtype=np.float64)
     z = z - z.max(axis=1, keepdims=True)
     e = np.exp(z)
