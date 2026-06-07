@@ -58,3 +58,20 @@ def tune_per_class_bias(
         if not improved:
             break
     return bias
+
+
+def _softmax(logits: np.ndarray) -> np.ndarray:
+    z = np.asarray(logits, dtype=np.float64)
+    z = z - z.max(axis=1, keepdims=True)
+    e = np.exp(z)
+    return e / e.sum(axis=1, keepdims=True)
+
+
+def combine_tta(logits_list: list[np.ndarray]) -> np.ndarray:
+    """Average softmax probabilities over K stochastic-sampling passes, then map
+    back to an effective logit = log(mean_prob) so per-class bias still composes
+    additively. Input: list of (N, C) RAW logit arrays for the SAME rows/order."""
+    if not logits_list:
+        raise ValueError("logits_list is empty")
+    probs = np.mean([_softmax(l) for l in logits_list], axis=0)
+    return np.log(np.clip(probs, 1e-12, None))
