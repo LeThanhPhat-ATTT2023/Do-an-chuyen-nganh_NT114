@@ -53,3 +53,11 @@ def test_combine_tta_averages_probabilities():
     b = np.array([[0.0, 10.0]])
     out = combine_tta([a, b])
     assert abs(out[0, 0] - out[0, 1]) < 1e-6
+
+
+def test_tune_per_class_bias_rejects_empty_grid():
+    import pytest
+    logits = np.zeros((4, 2))
+    labels = np.array([0, 1, 0, 1])
+    with pytest.raises(ValueError):
+        tune_per_class_bias(logits, labels, num_classes=2, grid=np.array([]))
