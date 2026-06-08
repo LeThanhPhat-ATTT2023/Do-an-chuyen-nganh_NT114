@@ -949,6 +949,8 @@ def _compute_train_loss(
     loss_type: str = "ce",
     label_smoothing: float = 0.0,
     focal_gamma: float = 2.0,
+    log_prior: torch.Tensor | None = None,
+    ldam_margins: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Unified training loss: CE | Focal.
 
@@ -958,6 +960,13 @@ def _compute_train_loss(
 
     Eval loss must stay plain CE (no smoothing) for raw loss comparability.
     """
+    if loss_type == "balanced_softmax":
+        if log_prior is None:
+            raise ValueError("balanced_softmax requires log_prior")
+        return F.cross_entropy(
+            logits + log_prior.to(logits.device), labels,
+            weight=weight, label_smoothing=label_smoothing,
+        )
     if loss_type in ("focal", "cb_focal"):
         # Focal loss (Lin et al. ICCV 2017): FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t).
         # cb_focal is identical at the function level; the behavioral difference is
