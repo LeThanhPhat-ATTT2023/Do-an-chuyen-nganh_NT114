@@ -942,6 +942,13 @@ def _tau_norm_divisor(classifier: torch.nn.Module, tau: float) -> torch.Tensor |
     return w.norm(dim=1).clamp_min(1e-12).pow(tau)
 
 
+def ldam_margins_from_counts(counts: torch.Tensor, max_margin: float = 0.5) -> torch.Tensor:
+    """LDAM per-class margins Δ_j ∝ 1 / n_j^(1/4), scaled so max(Δ) == max_margin."""
+    counts = counts.clamp_min(1.0).float()
+    m = 1.0 / counts.pow(0.25)
+    return m * (max_margin / m.max())
+
+
 def _compute_train_loss(
     logits: torch.Tensor,
     labels: torch.Tensor,
@@ -967,6 +974,13 @@ def _compute_train_loss(
             logits + log_prior.to(logits.device), labels,
             weight=weight, label_smoothing=label_smoothing,
         )
+    if loss_type == "ldam":
+        if ldam_margins is None:
+            raise ValueError("ldam requires ldam_margins")
+        margin_y = ldam_margins.to(logits.device).gather(0, labels)
+        adj = logits.clone()
+        adj.scatter_add_(1, labels.unsqueeze(1), (-margin_y).unsqueeze(1))
+        return F.cross_entropy(adj, labels, weight=weight, label_smoothing=label_smoothing)
     if loss_type in ("focal", "cb_focal"):
         # Focal loss (Lin et al. ICCV 2017): FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t).
         # cb_focal is identical at the function level; the behavioral difference is
