@@ -2019,10 +2019,22 @@ def train_neighbor_sampling(
     loss_type = str(config["train"].get("loss_type", "ce")).lower()
     label_smoothing = float(config["train"].get("label_smoothing", 0.0))
     focal_gamma = float(config["train"].get("focal_gamma", 2.0))
-    if loss_type not in {"ce", "focal", "cb_focal"}:
+    if loss_type not in {"ce", "focal", "cb_focal", "balanced_softmax", "ldam"}:
         raise ValueError(
-            f"Unknown loss_type {loss_type!r}. Supported: 'ce', 'focal', 'cb_focal'."
+            f"Unknown loss_type {loss_type!r}. Supported: 'ce', 'focal', "
+            f"'cb_focal', 'balanced_softmax', 'ldam'."
         )
+    # Long-tail loss inputs (built once from TRAIN label counts; same accessor as
+    # class_weights_from_backend). log_prior -> balanced_softmax; ldam_margins -> ldam.
+    _train_counts = np.bincount(
+        backend.get_flow_labels(np.asarray(train_idx_np, dtype=np.int64)),
+        minlength=num_classes,
+    ).astype(np.float64)
+    _counts_t = torch.tensor(_train_counts, dtype=torch.float32, device=device)
+    log_prior = torch.log((_counts_t / _counts_t.sum()).clamp_min(1e-12))
+    ldam_margins = ldam_margins_from_counts(
+        _counts_t, max_margin=float(config["train"].get("ldam_max_margin", 0.5))
+    )
     if rank == 0:
         _drw_msg = (
             f"drw_start_epoch={drw_start_epoch}/{int(config['train']['epochs'])}"
@@ -2282,6 +2294,8 @@ def train_neighbor_sampling(
                     loss_type=loss_type,
                     label_smoothing=label_smoothing,
                     focal_gamma=focal_gamma,
+                    log_prior=log_prior,
+                    ldam_margins=ldam_margins,
                 )
                 aux_loss_val_for_log = 0.0
                 if gcl_enabled and x_dict is not None and class_to_technique_idx:
