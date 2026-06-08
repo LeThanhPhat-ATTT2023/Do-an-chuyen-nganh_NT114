@@ -942,13 +942,6 @@ def _tau_norm_divisor(classifier: torch.nn.Module, tau: float) -> torch.Tensor |
     return w.norm(dim=1).clamp_min(1e-12).pow(tau)
 
 
-def ldam_margins_from_counts(counts: torch.Tensor, max_margin: float = 0.5) -> torch.Tensor:
-    """LDAM per-class margins Δ_j ∝ 1 / n_j^(1/4), scaled so max(Δ) == max_margin."""
-    counts = counts.clamp_min(1.0).float()
-    m = 1.0 / counts.pow(0.25)
-    return m * (max_margin / m.max())
-
-
 def _compute_train_loss(
     logits: torch.Tensor,
     labels: torch.Tensor,
@@ -956,8 +949,6 @@ def _compute_train_loss(
     loss_type: str = "ce",
     label_smoothing: float = 0.0,
     focal_gamma: float = 2.0,
-    log_prior: torch.Tensor | None = None,
-    ldam_margins: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Unified training loss: CE | Focal.
 
@@ -967,20 +958,6 @@ def _compute_train_loss(
 
     Eval loss must stay plain CE (no smoothing) for raw loss comparability.
     """
-    if loss_type == "balanced_softmax":
-        if log_prior is None:
-            raise ValueError("balanced_softmax requires log_prior")
-        return F.cross_entropy(
-            logits + log_prior.to(logits.device), labels,
-            weight=weight, label_smoothing=label_smoothing,
-        )
-    if loss_type == "ldam":
-        if ldam_margins is None:
-            raise ValueError("ldam requires ldam_margins")
-        margin_y = ldam_margins.to(logits.device).gather(0, labels)
-        adj = logits.clone()
-        adj.scatter_add_(1, labels.unsqueeze(1), (-margin_y).unsqueeze(1))
-        return F.cross_entropy(adj, labels, weight=weight, label_smoothing=label_smoothing)
     if loss_type in ("focal", "cb_focal"):
         # Focal loss (Lin et al. ICCV 2017): FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t).
         # cb_focal is identical at the function level; the behavioral difference is
@@ -1587,7 +1564,6 @@ def evaluate_neighbor_sampling(
     logit_adjustment: torch.Tensor | None = None,
     tau_norm_divisor: torch.Tensor | None = None,
     packet_store: "TieredFeatureStore | None" = None,
-    collect_logits: bool = False,
 ) -> dict[str, Any]:
     """Two paths:
       1. DDP (``is_ddp=True``): each rank evaluates its DistributedSampler shard,
@@ -1610,7 +1586,6 @@ def evaluate_neighbor_sampling(
     loss_sum_t = torch.zeros(1, dtype=torch.float64, device=device)
     examples_t = torch.zeros(1, dtype=torch.int64, device=device)
     preds: list[np.ndarray] = []
-    logit_chunks: list[np.ndarray] = []
     preds_adj: list[np.ndarray] = []
     preds_tau: list[np.ndarray] = []
     labels: list[np.ndarray] = []
@@ -1695,8 +1670,6 @@ def evaluate_neighbor_sampling(
                     loss = F.cross_entropy(seed_logits.float(), seed_labels, reduction="sum")
                 loss_sum += float(loss.item())
                 _logits_raw = seed_logits.detach().float()
-                if collect_logits:
-                    logit_chunks.append(_logits_raw.cpu().numpy())
                 preds.append(_logits_raw.argmax(dim=1).cpu().numpy())
                 if logit_adjustment is not None:
                     _logits_adj = _logits_raw - logit_adjustment.to(_logits_raw.device)
@@ -1727,12 +1700,6 @@ def evaluate_neighbor_sampling(
         metrics["tau_normalized"] = metrics_from_predictions(
             tau_np, label_np, num_classes, label_names, loss_sum
         )
-    if collect_logits:
-        metrics["_logits"] = (
-            np.concatenate(logit_chunks) if logit_chunks
-            else np.empty((0, num_classes), dtype=np.float32)
-        )
-        metrics["_labels"] = label_np
     return metrics
 
 
@@ -2019,22 +1986,10 @@ def train_neighbor_sampling(
     loss_type = str(config["train"].get("loss_type", "ce")).lower()
     label_smoothing = float(config["train"].get("label_smoothing", 0.0))
     focal_gamma = float(config["train"].get("focal_gamma", 2.0))
-    if loss_type not in {"ce", "focal", "cb_focal", "balanced_softmax", "ldam"}:
+    if loss_type not in {"ce", "focal", "cb_focal"}:
         raise ValueError(
-            f"Unknown loss_type {loss_type!r}. Supported: 'ce', 'focal', "
-            f"'cb_focal', 'balanced_softmax', 'ldam'."
+            f"Unknown loss_type {loss_type!r}. Supported: 'ce', 'focal', 'cb_focal'."
         )
-    # Long-tail loss inputs (built once from TRAIN label counts; same accessor as
-    # class_weights_from_backend). log_prior -> balanced_softmax; ldam_margins -> ldam.
-    _train_counts = np.bincount(
-        backend.get_flow_labels(np.asarray(train_idx_np, dtype=np.int64)),
-        minlength=num_classes,
-    ).astype(np.float64)
-    _counts_t = torch.tensor(_train_counts, dtype=torch.float32, device=device)
-    log_prior = torch.log((_counts_t / _counts_t.sum()).clamp_min(1e-12))
-    ldam_margins = ldam_margins_from_counts(
-        _counts_t, max_margin=float(config["train"].get("ldam_max_margin", 0.5))
-    )
     if rank == 0:
         _drw_msg = (
             f"drw_start_epoch={drw_start_epoch}/{int(config['train']['epochs'])}"
@@ -2294,8 +2249,6 @@ def train_neighbor_sampling(
                     loss_type=loss_type,
                     label_smoothing=label_smoothing,
                     focal_gamma=focal_gamma,
-                    log_prior=log_prior,
-                    ldam_margins=ldam_margins,
                 )
                 aux_loss_val_for_log = 0.0
                 if gcl_enabled and x_dict is not None and class_to_technique_idx:
