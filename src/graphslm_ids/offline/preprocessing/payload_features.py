@@ -1,6 +1,6 @@
 """Deterministic packet-payload features.
 
-Replaces the SecureBERT-distilled CNN embedding from v1 with three deterministic
+Replaces the SecureBERT-distilled CNN embedding from v1 with deterministic
 blocks that are NOT trained:
 
   1. Byte-distribution histogram (256-d) + entropy + printable ratio + zero fraction
@@ -10,12 +10,24 @@ blocks that are NOT trained:
      url_length, n_query_params, n_special_chars, content_type_textlike,
      has_multipart, header_length_est, body_length_est, n_uppercase, n_digits,
      n_alpha, n_null_bytes, n_newlines, n_tabs, max_run_repeated_byte
+  4. Ordered-byte block (256-d, EG-HGT v5 Phase 1): the first ORDERED_DIM raw
+     payload bytes normalized as ``byte / 255.0``, IN ORDER, zero-padded when the
+     payload is shorter. Blocks 1-2 are position-agnostic (a histogram and a
+     hashed n-gram); this block preserves byte ORDER — the exact signal a raw-
+     byte encoder (e.g. GNN4ID) exploits — while remaining a pure ``divide+pad``
+     with no learned parameters, no hashing, and no randomness.
 
-Total feature dim = 256 + 3 + 2048 + 16 = 2323.
+Total feature dim = 256 + 3 + 2048 + 16 + 256 = 2579.
 
-The point of v2 is that no payload encoder must be trained: every dimension is
-either a count, a normalized count, or a deterministic hash. That removes the
-SecureBERT/student-CNN failure mode entirely (cf. design doc section 2).
+The point is that no payload encoder must be trained: every dimension is either a
+count, a normalized count, a deterministic hash, or a plain ``byte/255`` slice.
+That removes the SecureBERT/student-CNN failure mode entirely and upholds the
+non-negotiable invariant "HGT is the ONLY model that trains" (cf. design docs
+2026-05-24 §2 and 2026-06-07 §Phase 1).
+
+The ordered block is appended LAST, so the legacy histogram/derived/ngram/struct
+offsets are unchanged. It can be disabled with ``ORDERED_BYTES_ENABLED = False``
+(the slot is then zero-filled, keeping FEATURE_DIM and all offsets stable).
 """
 from __future__ import annotations
 
@@ -28,12 +40,23 @@ HIST_DIM = 256
 DERIVED_DIM = 3
 HASH_DIM = 2048
 STRUCT_DIM = 16
-FEATURE_DIM = HIST_DIM + DERIVED_DIM + HASH_DIM + STRUCT_DIM  # = 2323
+# Ordered-byte block (EG-HGT v5 Phase 1): first K payload bytes / 255.0, in
+# order, zero-padded. Deterministic divide+pad — no learned params, no hashing.
+ORDERED_DIM = 256
+# Master switch for the ordered block. ON by default. When False the slot is
+# still allocated (zeros) so FEATURE_DIM and every offset stay constant.
+ORDERED_BYTES_ENABLED = True
+
+FEATURE_DIM = (
+    HIST_DIM + DERIVED_DIM + HASH_DIM + STRUCT_DIM + ORDERED_DIM
+)  # = 2579
 
 # Fixed offsets so callers can address feature slots without recomputation.
+# The ordered block is APPENDED last; legacy offsets below are unchanged.
 DERIVED_OFFSET = HIST_DIM
 HASH_OFFSET = HIST_DIM + DERIVED_DIM
 STRUCT_OFFSET = HIST_DIM + DERIVED_DIM + HASH_DIM
+ORDERED_OFFSET = HIST_DIM + DERIVED_DIM + HASH_DIM + STRUCT_DIM
 
 _HTTP_METHOD_RE = re.compile(rb"^(GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH) ")
 _HTTP_RESPONSE_RE = re.compile(rb"^HTTP/")
@@ -68,6 +91,20 @@ def _hashed_ngram(buf: np.ndarray, payload_len: int, n: int = 4) -> np.ndarray:
     if n_windows > 0:
         out /= n_windows
     return out.astype(np.float32)
+
+
+def _ordered_bytes(buf: np.ndarray, payload_len: int) -> np.ndarray:
+    """First ``ORDERED_DIM`` payload bytes as ``byte / 255.0``, zero-padded.
+
+    Position-preserving and 100% deterministic: a plain divide + pad with no
+    learned parameters, no hashing, and no randomness. Bytes beyond the real
+    payload length (``payload_len``) are treated as padding and left at 0.0.
+    """
+    out = np.zeros(ORDERED_DIM, dtype=np.float32)
+    take = min(int(payload_len), ORDERED_DIM)
+    if take > 0:
+        out[:take] = buf[:take].astype(np.float32) / 255.0
+    return out
 
 
 def _http_structural(buf: np.ndarray, payload_len: int) -> np.ndarray:
@@ -164,11 +201,14 @@ def compute_packet_payload_features(
     ngram = _hashed_ngram(buf, pl)
     struct = _http_structural(buf, pl)
 
-    out = np.empty(FEATURE_DIM, dtype=np.float32)
+    out = np.zeros(FEATURE_DIM, dtype=np.float32)
     out[:HIST_DIM] = hist_norm
     out[DERIVED_OFFSET:HASH_OFFSET] = derived
     out[HASH_OFFSET:STRUCT_OFFSET] = ngram
-    out[STRUCT_OFFSET:] = struct
+    out[STRUCT_OFFSET:ORDERED_OFFSET] = struct
+    if ORDERED_BYTES_ENABLED:
+        out[ORDERED_OFFSET:] = _ordered_bytes(buf, pl)
+    # else: ordered slot stays zero (np.zeros above), dims/offsets unchanged.
     return out
 
 
@@ -226,6 +266,7 @@ def _feature_names() -> list[str]:
         "n_tabs",
         "max_run_repeated_byte",
     ]
+    names += [f"obyte_{i:03d}" for i in range(ORDERED_DIM)]
     return names
 
 

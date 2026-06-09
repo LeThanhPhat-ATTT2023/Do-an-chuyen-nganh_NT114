@@ -1,0 +1,158 @@
+# EG-HGT v4 — Attack-flow isolation + stable training.
+#
+# Design: docs/superpowers/specs/2026-06-06-v4-attack-isolation-design.md
+# Root cause: docs/reports/2026-06-06-web-attack-encryption-ceiling.md
+#
+# Diff vs eg_hgt_v3fam.yaml:
+#   [DATA] new artifact outputs/v4 — built with attack-flow isolation
+#          (web-attack background -> Benign) + packet-cap sub-flow windowing.
+#   [V4-1] drw_start_pct 0.3 -> 0.0   : DRW caused both v2/v3fam to peak-and-die
+#          at exactly epoch 14 (the DRW switch). Class weights from the start.
+#   [V4-2] focal_gamma 3.0 -> 2.0     : gamma=3 over-focused, hurt majority.
+#   [V4-3] logit_adjustment 1.0 -> 0.0: tau=1.0 collapsed CmdInj/XSS to F1=0.
+#   [V4-4] hgaa.aug_ratio 0.7 -> 0.4  : less augmentation noise now that the web
+#          signal is real (clean attack flows) rather than polluted.
+#   GCL kept (academic novelty).
+
+experiment:
+  source_name: "EG-HGT v4 (attack-isolation + windowing, stable recipe)"
+  rationale: >
+    Fixes the true root cause of the web-attack plateau: ~95% of web-attack flows
+    were background IoT->cloud traffic mislabeled as the attack. Attack-flow
+    isolation keeps the attack label only for flows carrying a matching plaintext
+    HTTP attack request (DVWA), demoting background to Benign; clean web-cluster
+    separability is 0.95 (vs 0.51 polluted). Packet-cap windowing recovers
+    volumetric flood sample counts. Report BOTH original-label and cleaned-label
+    metrics for transparency.
+
+data:
+  artifact_version: v3
+  graph_npz: outputs/v4/graph.npz
+  graph_meta_json: outputs/v4/graph.meta.json
+  splits_json: outputs/v4/splits.json
+  split_protocol: random
+  add_reverse_edges: true
+  standardize_flow_features: true
+  use_semantic_edge_weights: true
+  use_temporal_edge_weights: true
+  tew_epsilon: 1.0e-3
+
+model:
+  hidden_dim: 128
+  num_layers: 4
+  num_heads: 8
+  dropout: 0.2
+  ffn_multiplier: 2
+
+train:
+  output_dir: outputs/v3/hgt_v4
+  epochs: 50
+  patience: 25
+  batch_seed_flows: 256
+  grad_accum_steps: 2
+  monitor: val_macro_f1
+  log_every: 1
+  lr: 1.0e-3
+  weight_decay: 5.0e-5
+  amp: true
+  amp_dtype: auto
+  device: cuda
+  activation_checkpointing: true
+  compile: false
+  tf32: true
+  scheduler: cosine_annealing
+  scheduler_pct_start: 0.05
+  scheduler_eta_min: 1.0e-5
+  grad_clip_norm: 1.0
+  adamw_eps: 1.0e-6
+  adamw_betas: [0.9, 0.95]
+
+  # Loss
+  loss_type: focal
+  focal_gamma: 2.0             # [V4-2] was 3.0
+  label_smoothing: 0.05
+
+  # Class weights
+  class_weight: balanced
+  class_weight_method: cb
+  cb_beta: 0.9999
+  class_weight_cap: 15.0
+
+  # DRW DISABLED — weights active from epoch 0 (no optimizer shock)
+  drw_start_pct: 0.0          # [V4-1] was 0.3
+
+  # Logit adjustment DISABLED at inference
+  logit_adjustment: 0.0       # [V4-3] was 1.0
+
+  # Misc training
+  drop_edge_prob: 0.10
+  ema_enabled: true
+  ema_decay: 0.999
+  skip_val_first_epoch: false
+  eval_every: 1
+  val_ratio: 0.1
+  test_ratio: 0.1
+  seed: 42
+  stratified_batch_sampling: true
+
+  # GCL auxiliary loss (kept — academic novelty)
+  gcl_enabled: true
+  gcl_weight: 0.3
+  gcl_temperature: 0.1
+  gcl_positive_source: class_technique_map
+  gcl_n_negatives: 16
+
+  # HGAA augmentation
+  hgaa:
+    enabled: true
+    aug_ratio_in_batch: 0.4    # [V4-4] was 0.7
+    bias_factor_T: 0.5
+    bias_top_k_rarest: 6
+
+sampler:
+  hops: 4
+  fanouts:
+    flow__contains__packet: 20
+    packet__next_packet__packet: 4
+    packet__evidence_injection__technique: 4
+    packet__evidence_command_exec__technique: 4
+    packet__evidence_file_upload__technique: 3
+    packet__evidence_recon__technique: 3
+    packet__evidence_c2_beacon__technique: 3
+    flow__from_host__host: 1
+    flow__to_host__host: 1
+    flow__burst_neighbor__flow: 6
+    flow__matches_technique__technique: 3
+    technique__has_subtechnique__technique: 2
+    technique__belongs_to_tactic__tactic: 1
+  reverse_fanouts:
+    rev_contains: 3
+    rev_next_packet: 2
+    rev_evidence_injection: 2
+    rev_evidence_command_exec: 2
+    rev_evidence_file_upload: 2
+    rev_evidence_recon: 2
+    rev_evidence_c2_beacon: 2
+    rev_from_host: 3
+    rev_to_host: 3
+    rev_burst_neighbor: 3
+    rev_matches_technique: 2
+    rev_has_subtechnique: 2
+    rev_belongs_to_tactic: 1
+  always_include_all_techniques: true
+  always_include_all_tactics: true
+
+dataloader:
+  num_workers: 6
+  prefetch_factor: 4
+  pin_memory: true
+  persistent_workers: true
+
+feature_store:
+  enabled: true
+  cache_fraction: 0.6
+  model_reserve_gb: 4.0
+  n_warmup_batches: 200
+
+gpu_sampling:
+  enabled: false
