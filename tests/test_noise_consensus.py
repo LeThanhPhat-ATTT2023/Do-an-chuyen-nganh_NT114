@@ -208,6 +208,32 @@ def test_sample_weight_none_matches_unweighted(loss_type: str) -> None:
     assert ones.item() == pytest.approx(base.item(), abs=1e-6)
 
 
+def test_build_evidence_by_flow_aggregates_packets_to_flow() -> None:
+    from graphslm_ids.offline.training.noise_consensus import build_evidence_by_flow
+
+    # 3 flows, 4 packets. contains: flow0->{pkt0,pkt1}, flow1->{pkt2}, flow2->{pkt3}
+    contains = torch.tensor([[0, 0, 1, 2],
+                             [0, 1, 2, 3]])
+    num_flows = 3
+    num_families = 2  # family 0 = command_exec, family 1 = injection
+    # evidence edges per family: (packet_id, weight). family 0 has an edge on pkt1
+    # (so flow0 gets command_exec); family 1 has an edge on pkt3 (flow2 gets injection).
+    evidence_per_family = {
+        0: (torch.tensor([1]), torch.tensor([2.5])),   # pkt1 -> command_exec w=2.5
+        1: (torch.tensor([3]), torch.tensor([0.8])),   # pkt3 -> injection w=0.8
+    }
+    ev = build_evidence_by_flow(contains, evidence_per_family, num_flows, num_families)
+    assert ev.shape == (3, 2)
+    # flow0 has a command_exec packet -> col0 > 0; no injection -> col1 == 0
+    assert ev[0, 0].item() == pytest.approx(2.5)
+    assert ev[0, 1].item() == pytest.approx(0.0)
+    # flow1 has neither
+    assert ev[1].sum().item() == pytest.approx(0.0)
+    # flow2 has an injection packet
+    assert ev[2, 1].item() == pytest.approx(0.8)
+    assert ev[2, 0].item() == pytest.approx(0.0)
+
+
 @pytest.mark.parametrize("loss_type", ["ce", "focal"])
 def test_sample_weight_zero_drops_sample(loss_type: str) -> None:
     torch.manual_seed(1)
