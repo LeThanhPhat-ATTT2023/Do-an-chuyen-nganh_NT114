@@ -942,6 +942,21 @@ def _tau_norm_divisor(classifier: torch.nn.Module, tau: float) -> torch.Tensor |
     return w.norm(dim=1).clamp_min(1e-12).pow(tau)
 
 
+def _weighted_mean(per_sample: torch.Tensor, sample_weight: torch.Tensor | None) -> torch.Tensor:
+    """Reduce a per-sample loss to a scalar.
+
+    With ``sample_weight=None`` this is a plain mean (unchanged behaviour). With a
+    per-sample weight it is the weight-normalised mean ``Σ w·l / Σ w`` — so a flow
+    down-weighted to 0 contributes nothing and the scale stays comparable to the
+    unweighted loss (not divided by the raw count). Guards against Σw==0.
+    """
+    if sample_weight is None:
+        return per_sample.mean()
+    w = sample_weight.to(per_sample.dtype)
+    denom = w.sum().clamp_min(1e-8)
+    return (per_sample * w).sum() / denom
+
+
 def _compute_train_loss(
     logits: torch.Tensor,
     labels: torch.Tensor,
@@ -949,12 +964,18 @@ def _compute_train_loss(
     loss_type: str = "ce",
     label_smoothing: float = 0.0,
     focal_gamma: float = 2.0,
+    sample_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Unified training loss: CE | Focal.
 
     - 'ce': F.cross_entropy with optional label_smoothing. Best for mild imbalance.
     - 'focal'/'cb_focal': FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t). Down-weights
       easy examples. Designed for severe imbalance. Paper default focal_gamma=2.0.
+
+    ``weight`` is the per-CLASS weight (class balancing). ``sample_weight`` is an
+    optional per-SAMPLE weight (e.g. the noise-consensus clean-confidence) that
+    multiplies each flow's loss before a weight-normalised mean. ``sample_weight=None``
+    exactly reproduces the previous unweighted behaviour.
 
     Eval loss must stay plain CE (no smoothing) for raw loss comparability.
     """
@@ -982,12 +1003,20 @@ def _compute_train_loss(
         if weight is not None:
             alpha_t = weight.gather(dim=0, index=labels)
             loss = alpha_t * loss
-        return loss.mean()
-    return F.cross_entropy(
+        return _weighted_mean(loss, sample_weight)
+    if sample_weight is None:
+        return F.cross_entropy(
+            logits, labels,
+            weight=weight,
+            label_smoothing=label_smoothing,
+        )
+    per_sample = F.cross_entropy(
         logits, labels,
         weight=weight,
         label_smoothing=label_smoothing,
+        reduction="none",
     )
+    return _weighted_mean(per_sample, sample_weight)
 
 
 def load_class_technique_map(
