@@ -32,7 +32,64 @@ __all__ = [
     "combine_clean_confidence",
     "curriculum_weight",
     "EMAConsensusBuffer",
+    "build_evidence_by_flow",
 ]
+
+
+def build_evidence_by_flow(
+    contains_edge_index: torch.Tensor,
+    evidence_per_family: dict[int, tuple[torch.Tensor, torch.Tensor]],
+    num_flows: int,
+    num_families: int,
+) -> torch.Tensor:
+    """Aggregate packet-level MITRE evidence edges up to a per-flow, per-family table.
+
+    Signal 1 (Tầng-3 grounding) needs, for each flow, the strongest matching
+    evidence-edge weight in each attack family. Evidence edges are
+    ``packet -> evidence_{family} -> technique``; a flow "has" family-F evidence if any
+    of the packets it contains is the source of an ``evidence_F`` edge. We take the MAX
+    weight (a single strong attack token is enough to ground the flow).
+
+    Args:
+        contains_edge_index: ``(2, E)`` ``flow -> contains -> packet`` edges
+            (row 0 = flow id, row 1 = packet id).
+        evidence_per_family: ``{family_col: (packet_ids, weights)}`` — for each attack
+            family, the source packet ids of its evidence edges and their weights.
+        num_flows: total flow count (table rows).
+        num_families: total attack-family count (table cols).
+
+    Returns:
+        ``(num_flows, num_families)`` float tensor; entry ``[i, f]`` is the max
+        evidence weight of family ``f`` over the packets contained in flow ``i`` (``0``
+        if none).
+    """
+    flow_of_packet_size = int(contains_edge_index[1].max().item()) + 1 if contains_edge_index.numel() else 0
+    # packet -> flow lookup (a packet belongs to one flow via contains)
+    n_packets = max(flow_of_packet_size, 0)
+    out = torch.zeros((num_flows, num_families), dtype=torch.float32)
+    if contains_edge_index.numel() == 0:
+        return out
+    packet_to_flow = torch.full((n_packets,), -1, dtype=torch.long)
+    packet_to_flow[contains_edge_index[1]] = contains_edge_index[0]
+
+    for fam, (pkt_ids, weights) in evidence_per_family.items():
+        if pkt_ids.numel() == 0:
+            continue
+        pkt_ids = pkt_ids.to(torch.long)
+        weights = weights.to(torch.float32)
+        # drop evidence packets that are out of range / not contained in any flow
+        in_range = pkt_ids < n_packets
+        pkt_ids, weights = pkt_ids[in_range], weights[in_range]
+        flows = packet_to_flow[pkt_ids]
+        valid = flows >= 0
+        flows, weights = flows[valid], weights[valid]
+        if flows.numel() == 0:
+            continue
+        # scatter-max weight into (flow, fam)
+        col = out[:, fam]
+        col.scatter_reduce_(0, flows, weights, reduce="amax", include_self=True)
+        out[:, fam] = col
+    return out
 
 
 def neighbor_consensus(
