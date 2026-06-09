@@ -131,6 +131,16 @@ def main() -> None:
     )
 
     ap.add_argument("--payload-length", type=int, default=256)
+    ap.add_argument(
+        "--no-attack-isolation",
+        action="store_true",
+        help=(
+            "Disable web-attack-flow isolation. By default (isolation ON), flows "
+            "in web-attack captures that do NOT carry a matching plaintext HTTP "
+            "attack request are relabeled Benign, fixing the ~95% background "
+            "label pollution (CommandInjection/XSS/SqlInjection/Uploading_Attack)."
+        ),
+    )
     ap.add_argument("--max-per-class", type=int, default=0, help="0 = no cap")
     ap.add_argument("--pmi-subsample-per-class", type=int, default=25_000)
     ap.add_argument("--pmi-max-total", type=int, default=200_000)
@@ -202,6 +212,18 @@ def main() -> None:
     t0 = time.time()
     packets_df = _attach_payload_column(raw_root, packets_df, args.payload_length, n_workers=args.n_workers)
     _LOG.info("  -> payload column attached (%.1fs)", time.time() - t0)
+
+    # ── Stage 2b: attack-flow isolation (fix web-attack label pollution) ──────
+    # Web-attack captures are ~95% background IoT->cloud traffic mislabeled as the
+    # attack. Keep the attack label only for flows carrying a matching plaintext
+    # HTTP attack request; demote the rest to Benign. See
+    # docs/reports/2026-06-06-web-attack-encryption-ceiling.md.
+    if not args.no_attack_isolation:
+        _LOG.info("[2b/6] attack-flow isolation (web-attack relabel) ...")
+        from graphslm_ids.offline.preprocessing.flow_attack_labeler import (
+            relabel_packets_df,
+        )
+        packets_df, _iso_audit = relabel_packets_df(packets_df, log=_LOG)
 
     # ── Stage 3: bidirectional flows + ~80 features ──────────────────────────
     _LOG.info("[3/6] flow assembly + feature build ...")

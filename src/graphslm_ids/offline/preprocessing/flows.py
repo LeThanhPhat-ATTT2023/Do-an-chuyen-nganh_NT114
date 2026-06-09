@@ -32,14 +32,38 @@ def _endpoint(ip: pd.Series, port: pd.Series) -> pd.Series:
     return ip.astype(str) + ":" + port.astype(str)
 
 
-def assign_flows(df: pd.DataFrame, timeout_s: float = 30.0) -> pd.DataFrame:
+def assign_flows(
+    df: pd.DataFrame,
+    timeout_s: float = 30.0,
+    max_packets_per_flow: int = 256,
+    per_class_max_packets: dict[str, int] | None = None,
+) -> pd.DataFrame:
     """Tag every packet row with a ``flow_id`` (string) and ``is_fwd`` (bool).
 
     Bidirectional 5-tuple: the canonical key sorts the two endpoints so packets
     in both directions of the same connection land in the same flow. ``is_fwd``
     is true for packets matching the FIRST packet's direction within the flow.
     A new flow segment is opened whenever the inter-packet gap exceeds
-    ``timeout_s`` (mirrors the v1 timeout but without the 20-packet cap).
+    ``timeout_s``.
+
+    ``max_packets_per_flow`` adds CICFlowMeter-style sub-flow windowing: a single
+    long segment is split into consecutive sub-flows of at most this many packets.
+    This recovers sample count for volumetric flood classes (Mirai / ICMP_Flood /
+    ICMP_Fragmentation) whose bidirectional 5-tuple otherwise collapses thousands
+    of packets into a handful of flows. Short flows (web/normal, < cap packets)
+    are unaffected. Set to 0 to disable.
+
+    ``per_class_max_packets`` optionally overrides the window size PER CLASS:
+    when a flow's ``label`` is a key in this dict, that (typically smaller)
+    window is used for the chunking of that flow's segments; every other class
+    falls back to ``max_packets_per_flow``. This lets volumetric flood classes
+    split into many small homogeneous sub-flows while leaving normal/web classes
+    on the default window. The split remains a deterministic, leakage-free
+    function of packet order within each segment (the label is part of the flow
+    key, so all packets of a segment share one window and one origin -> same
+    packets always yield the same chunk boundaries; no randomness, no cross-flow
+    mixing). When ``None`` (the default) behavior is byte-for-byte identical to
+    the plain ``max_packets_per_flow`` path.
     """
     if df.empty:
         out = df.copy()
@@ -65,7 +89,35 @@ def assign_flows(df: pd.DataFrame, timeout_s: float = 30.0) -> pd.DataFrame:
     gap = df["ts"] - prev_ts
     new_seg = (prev_ts.isna() | (gap > timeout_s)).astype(np.int64)
     seg_idx = new_seg.groupby(df["_key"], sort=False).cumsum()
-    df["flow_id"] = df["_key"] + "#" + seg_idx.astype(str)
+    base_key = df["_key"] + "#" + seg_idx.astype(str)
+    if max_packets_per_flow and max_packets_per_flow > 0:
+        # Sub-flow windowing: split each segment into consecutive chunks of at
+        # most ``window`` packets (volumetric-flood sample recovery). ``pos`` is
+        # the 0-based packet position WITHIN a segment, so the chunk boundaries
+        # depend only on packet order -> deterministic and leakage-free.
+        pos = base_key.groupby(base_key, sort=False).cumcount()
+        if per_class_max_packets:
+            # Per-class window: the label is the first component of ``_key`` (and
+            # thus of ``base_key``), so every packet of a segment shares one
+            # label -> one window. Map each row's window from its label, falling
+            # back to ``max_packets_per_flow`` for classes not in the override.
+            window = (
+                df["label"]
+                .astype(str)
+                .map({str(k): int(v) for k, v in per_class_max_packets.items()})
+                .fillna(int(max_packets_per_flow))
+                .astype(np.int64)
+            )
+            # Guard against a non-positive override leaking in (treat as default).
+            window = window.where(window > 0, int(max_packets_per_flow))
+            pkt_chunk = (pos.to_numpy() // window.to_numpy()).astype(np.int64)
+        else:
+            pkt_chunk = (pos // int(max_packets_per_flow)).astype(np.int64)
+        df["flow_id"] = base_key + "." + pd.Series(
+            pkt_chunk, index=base_key.index
+        ).astype(str)
+    else:
+        df["flow_id"] = base_key
 
     # `is_fwd` should reference the first packet of THIS flow segment, not the
     # canonical-low endpoint, so the direction marker is consistent with what
