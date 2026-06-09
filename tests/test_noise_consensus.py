@@ -183,3 +183,44 @@ def test_ema_buffer_untouched_flows_keep_init() -> None:
     buf = EMAConsensusBuffer(num_flows=3, decay=0.9, init=1.0)
     buf.update(torch.tensor([0]), torch.tensor([0.1]))
     assert buf.get(torch.tensor([2])).item() == pytest.approx(1.0)
+
+
+# --------------------------------------------------------------------------- #
+# trainer integration: _compute_train_loss accepts a per-sample weight
+# (backward-compatible — sample_weight=None reproduces the unweighted loss).
+# --------------------------------------------------------------------------- #
+from graphslm_ids.offline.training.train_hgt_flow_classifier import (  # noqa: E402
+    _compute_train_loss,
+)
+
+
+@pytest.mark.parametrize("loss_type", ["ce", "focal"])
+def test_sample_weight_none_matches_unweighted(loss_type: str) -> None:
+    torch.manual_seed(0)
+    logits = torch.randn(8, 5)
+    labels = torch.randint(0, 5, (8,))
+    base = _compute_train_loss(logits, labels, None, loss_type=loss_type)
+    # all-ones weight must equal the unweighted (mean) loss
+    ones = _compute_train_loss(
+        logits, labels, None, loss_type=loss_type,
+        sample_weight=torch.ones(8),
+    )
+    assert ones.item() == pytest.approx(base.item(), abs=1e-6)
+
+
+@pytest.mark.parametrize("loss_type", ["ce", "focal"])
+def test_sample_weight_zero_drops_sample(loss_type: str) -> None:
+    torch.manual_seed(1)
+    logits = torch.randn(6, 4)
+    labels = torch.randint(0, 4, (6,))
+    # Weighting the last sample to 0 must equal the mean over the first 5
+    # (weighted loss normalises by the SUM of weights, not the count).
+    w = torch.ones(6)
+    w[5] = 0.0
+    weighted = _compute_train_loss(
+        logits, labels, None, loss_type=loss_type, sample_weight=w,
+    )
+    sub = _compute_train_loss(
+        logits[:5], labels[:5], None, loss_type=loss_type,
+    )
+    assert weighted.item() == pytest.approx(sub.item(), abs=1e-5)
