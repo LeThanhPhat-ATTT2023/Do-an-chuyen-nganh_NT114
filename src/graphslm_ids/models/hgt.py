@@ -211,6 +211,7 @@ class HeteroGraphTransformer(nn.Module):
         ffn_multiplier: int = 2,
         activation_checkpointing: bool = False,
         node_types: list[str] | None = None,
+        num_families: int = 0,
     ) -> None:
         super().__init__()
         # Backwards-compatible default: v2 four-type schema. v3 callers pass the
@@ -266,6 +267,15 @@ class HeteroGraphTransformer(nn.Module):
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, num_classes),
+        )
+
+        # Optional auxiliary attack-family head (noise-robust self-learning). Predicts
+        # the MITRE attack family of a flow from its learned embedding; its softmax is
+        # the dynamic ``q`` compared against grounded evidence in the EPC noise signal.
+        # Created only when num_families>0 so existing checkpoints load unchanged.
+        self.num_families = int(num_families)
+        self.family_head = (
+            nn.Linear(hidden_dim, num_families) if num_families > 0 else None
         )
 
     def encode(
@@ -341,6 +351,7 @@ class HeteroGraphTransformer(nn.Module):
         edge_index_dict: dict[EdgeKey, torch.Tensor],
         edge_weight_dict: dict[EdgeKey, torch.Tensor] | None = None,
         return_attention: bool = False,
+        return_family: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, dict[EdgeKey, torch.Tensor]]:
         if return_attention:
             x_dict, attention_dict = self.encode(
@@ -351,4 +362,12 @@ class HeteroGraphTransformer(nn.Module):
             )
             return self.classifier(x_dict["flow"]), attention_dict
         x_dict = self.encode(node_features, edge_index_dict, edge_weight_dict=edge_weight_dict)
-        return self.classifier(x_dict["flow"])
+        logits = self.classifier(x_dict["flow"])
+        if return_family:
+            # auxiliary family logits (None-safe: caller only sets this when the head
+            # exists). Used by the noise-robust EPC signal during training.
+            family_logits = (
+                self.family_head(x_dict["flow"]) if self.family_head is not None else None
+            )
+            return logits, family_logits
+        return logits
