@@ -467,3 +467,96 @@ class NoiseRobustController:
 
 
 __all__.append("NoiseRobustController")
+
+
+# Canonical MITRE evidence family order (must match graph_builder._EVIDENCE_FAMILIES
+# and the family-head column order).
+_FAMILY_ORDER: tuple[str, ...] = (
+    "injection", "command_exec", "file_upload", "recon", "c2_beacon",
+)
+
+
+def build_noise_robust_controller(
+    *,
+    artifact,
+    num_classes: int,
+    label_mapping: dict[str, int],
+    warmup_epochs: int = 5,
+    ema_decay: float = 0.9,
+    mitre_dir: str = "data/mitre",
+) -> "NoiseRobustController":
+    """Assemble a :class:`NoiseRobustController` from a loaded graph artifact + MITRE CSVs.
+
+    Reads the flow->contains->packet edges and the 5 packet->evidence_{family}->technique
+    edges from the artifact to build the per-flow evidence table, and the
+    class_technique_map.csv + technique_family.csv to build the class->family map.
+    """
+    import csv as _csv
+    from pathlib import Path as _Path
+
+    family_to_col = {fam: i for i, fam in enumerate(_FAMILY_ORDER)}
+    num_families = len(_FAMILY_ORDER)
+
+    # --- per-flow evidence table from artifact edges ---
+    ei = artifact.edge_index
+    ea = artifact.edge_attr
+    contains = torch.as_tensor(
+        np.asarray(ei[("flow", "contains", "packet")], dtype=np.int64)
+    )
+    evidence_per_family: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+    for fam in _FAMILY_ORDER:
+        key = ("packet", f"evidence_{fam}", "technique")
+        if key not in ei:
+            continue
+        edge = np.asarray(ei[key], dtype=np.int64)
+        pkt_ids = torch.as_tensor(edge[0])                       # packet is src
+        attr = ea.get(key)
+        if attr is None:
+            weights = torch.ones(pkt_ids.shape[0], dtype=torch.float32)
+        else:
+            attr = np.asarray(attr, dtype=np.float32).reshape(pkt_ids.shape[0], -1)
+            weights = torch.as_tensor(attr[:, 0])                # first attr col = weight
+        evidence_per_family[family_to_col[fam]] = (pkt_ids, weights)
+    num_flows = int(artifact.node_features["flow"].shape[0])
+    evidence_by_flow = build_evidence_by_flow(
+        contains, evidence_per_family, num_flows, num_families
+    )
+
+    # --- class -> family map from the two CSVs ---
+    mdir = _Path(mitre_dir)
+    class_to_tech: dict[str, list[tuple[str, float]]] = {}
+    ctm = mdir / "class_technique_map.csv"
+    if ctm.exists():
+        for row in _csv.DictReader(ctm.open(encoding="utf-8")):
+            cls = (row.get("class") or "").strip()
+            tech = (row.get("technique") or "").strip()
+            if not cls or not tech:
+                continue
+            try:
+                w = float(row.get("weight") or 1.0)
+            except ValueError:
+                w = 1.0
+            class_to_tech.setdefault(cls, []).append((tech, w))
+    tech_to_family: dict[str, str] = {}
+    tf = mdir / "technique_family.csv"
+    if tf.exists():
+        for row in _csv.DictReader(tf.open(encoding="utf-8")):
+            t = (row.get("technique") or "").strip()
+            f = (row.get("family") or "").strip()
+            if t and f:
+                tech_to_family[t] = f
+    class_to_family = build_class_to_family(
+        class_to_tech, tech_to_family, family_to_col, label_mapping, num_classes
+    )
+
+    return NoiseRobustController(
+        evidence_by_flow=evidence_by_flow,
+        class_to_family=class_to_family,
+        num_classes=num_classes,
+        num_families=num_families,
+        warmup_epochs=warmup_epochs,
+        ema_decay=ema_decay,
+    )
+
+
+__all__.append("build_noise_robust_controller")
