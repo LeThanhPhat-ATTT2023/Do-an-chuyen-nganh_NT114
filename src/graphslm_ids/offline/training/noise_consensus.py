@@ -400,3 +400,70 @@ class EMAConsensusBuffer:
 
     def get(self, idx: torch.Tensor) -> torch.Tensor:
         return self.values[idx.to(torch.long).cpu()]
+
+
+class NoiseRobustController:
+    """Ties the dynamic noise-detection pieces together for the trainer.
+
+    Holds the global per-flow MITRE evidence table and the class->family map (built
+    once from the artifact), plus a persistent EMA buffer of the per-flow clean-
+    confidence ``beta``. Each training step calls :meth:`soft_targets`, which:
+
+      1. turns the model's family logits into a prediction ``q`` (dynamic, this epoch),
+      2. gathers each seed flow's grounded family evidence ``e`` (Tầng-3, static),
+      3. computes the Evidence-Prediction Contradiction ``EPC = 1 - cos(q, e)``,
+      4. fits a 2-component EM on the batch EPC -> per-flow ``beta`` (clean posterior),
+         EMA-smoothed across epochs,
+      5. returns the soft-relabel target ``beta*onehot(label) + (1-beta)*p`` where ``p``
+         is the model's CLASS prediction.
+
+    During warmup (``epoch < warmup_epochs``) it returns the hard one-hot label so the
+    model first learns basic structure before it is trusted to relabel.
+    """
+
+    def __init__(
+        self,
+        evidence_by_flow: torch.Tensor,
+        class_to_family: torch.Tensor,
+        num_classes: int,
+        num_families: int,
+        warmup_epochs: int = 5,
+        ema_decay: float = 0.9,
+        em_iters: int = 20,
+    ) -> None:
+        self.evidence_by_flow = evidence_by_flow            # (num_flows, num_families)
+        self.class_to_family = class_to_family              # (num_classes,)
+        self.num_classes = int(num_classes)
+        self.num_families = int(num_families)
+        self.warmup_epochs = int(warmup_epochs)
+        self.em_iters = int(em_iters)
+        self.beta_buffer = EMAConsensusBuffer(
+            num_flows=evidence_by_flow.shape[0], decay=ema_decay, init=1.0
+        )
+
+    def soft_targets(
+        self,
+        class_logits: torch.Tensor,
+        family_logits: torch.Tensor,
+        seed_global_ids: torch.Tensor,
+        seed_labels: torch.Tensor,
+        epoch: int,
+    ) -> torch.Tensor:
+        device = class_logits.device
+        p = torch.softmax(class_logits.float(), dim=1)           # (S, C) class pred
+        if epoch < self.warmup_epochs or family_logits is None:
+            # hard label during warmup -> identical to standard training
+            onehot = torch.zeros_like(p)
+            onehot[torch.arange(seed_labels.shape[0], device=device), seed_labels] = 1.0
+            return onehot
+
+        q = torch.softmax(family_logits.float(), dim=1)          # (S, F) family pred
+        e = self.evidence_by_flow.to(device)[seed_global_ids]    # (S, F) evidence
+        epc = evidence_prediction_contradiction(q, e)            # (S,)
+        beta_batch = em_clean_confidence(epc, n_iter=self.em_iters)  # (S,)
+        # EMA-smooth beta per flow across epochs for stability
+        beta = self.beta_buffer.update(seed_global_ids, beta_batch).to(device)
+        return soft_relabel_target(seed_labels, p, beta, self.num_classes)
+
+
+__all__.append("NoiseRobustController")

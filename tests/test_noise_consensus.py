@@ -268,6 +268,53 @@ def test_soft_relabel_rows_sum_to_one() -> None:
     assert torch.allclose(t.sum(dim=1), torch.ones(3), atol=1e-6)
 
 
+def test_controller_soft_targets_relabels_noisy_attack_flow() -> None:
+    """The controller ties EPC -> EM -> soft-relabel for a batch.
+
+    Construct 6 seed flows: 3 genuine attack flows of class 1 (family col 0) whose
+    family prediction AGREES with evidence, and 3 'noisy' flows also labeled class 1
+    but whose family prediction is benign-ish and evidence is family 0 -> contradiction.
+    The soft target of the noisy flows should move OFF the given label toward the model
+    prediction, while the clean flows stay near their label.
+    """
+    from graphslm_ids.offline.training.noise_consensus import NoiseRobustController
+
+    num_classes, num_families = 3, 2
+    # class 1 -> family col 0 ; classes 0,2 -> non-attack (-1)
+    class_to_family = torch.tensor([-1, 0, -1])
+    # per-flow evidence table (global) for 6 flows: all claim family 0 evidence present
+    evidence_by_flow = torch.zeros((6, num_families))
+    evidence_by_flow[:, 0] = 1.0
+    ctrl = NoiseRobustController(
+        evidence_by_flow=evidence_by_flow,
+        class_to_family=class_to_family,
+        num_classes=num_classes,
+        num_families=num_families,
+        warmup_epochs=0,
+        ema_decay=0.0,   # no smoothing -> pure per-epoch for a deterministic test
+    )
+    seed_global_ids = torch.arange(6)
+    seed_labels = torch.tensor([1, 1, 1, 1, 1, 1])
+    # family logits: flows 0-2 predict family 0 strongly (agree); 3-5 predict family 1
+    family_logits = torch.tensor(
+        [[5.0, -5.0]] * 3 + [[-5.0, 5.0]] * 3
+    )
+    # class logits: clean flows predict class 1; noisy flows predict class 0
+    class_logits = torch.tensor(
+        [[-5.0, 5.0, -5.0]] * 3 + [[5.0, -5.0, -5.0]] * 3
+    )
+    targets = ctrl.soft_targets(
+        class_logits, family_logits, seed_global_ids, seed_labels, epoch=5
+    )
+    assert targets.shape == (6, 3)
+    assert torch.allclose(targets.sum(dim=1), torch.ones(6), atol=1e-5)
+    # clean flows (0-2): target mass on the given label (class 1) stays high
+    assert (targets[:3, 1] > 0.8).all()
+    # noisy flows (3-5): target mass moved OFF class 1 toward model's class-0 prediction
+    assert (targets[3:, 1] < 0.6).all()
+    assert (targets[3:, 0] > targets[3:, 1]).all()
+
+
 def test_build_class_to_family_maps_via_technique() -> None:
     from graphslm_ids.offline.training.noise_consensus import build_class_to_family
 
