@@ -24,6 +24,7 @@ per-sample loss weight, so a single model becomes more noise-robust as it trains
 """
 from __future__ import annotations
 
+import numpy as np
 import torch
 
 __all__ = [

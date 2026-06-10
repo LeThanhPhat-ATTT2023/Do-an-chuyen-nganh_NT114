@@ -2116,28 +2116,8 @@ def train_neighbor_sampling(
     if rank == 0 and tau_norm > 0.0:
         print(f"[tau_norm] tau={tau_norm} (post-hoc classifier weight normalization)", flush=True)
 
-    # Noise-robust self-learning controller (config-gated). Builds the per-flow MITRE
-    # evidence table + class->family map once; soft_targets() is called each train step.
+    # Noise-robust controller is built later, after ``label_names`` is defined.
     noise_robust_ctrl = None
-    if _nr_enabled:
-        from graphslm_ids.offline.training.noise_consensus import (
-            build_noise_robust_controller,
-        )
-        noise_robust_ctrl = build_noise_robust_controller(
-            artifact=backend.artifact,
-            num_classes=num_classes,
-            label_mapping={v: k for k, v in label_names.items()},
-            warmup_epochs=int(_nr_cfg.get("warmup_epochs", 5)),
-            ema_decay=float(_nr_cfg.get("ema_decay", 0.9)),
-            mitre_dir=str(_nr_cfg.get("mitre_dir", "data/mitre")),
-        )
-        if rank == 0:
-            print(
-                f"[noise_robust] ENABLED warmup={_nr_cfg.get('warmup_epochs', 5)} "
-                f"ema_decay={_nr_cfg.get('ema_decay', 0.9)} families=5 "
-                f"(Evidence-Prediction Contradiction + soft-relabel)",
-                flush=True,
-            )
 
     drop_edge_prob = float(config["train"].get("drop_edge_prob", 0.0))
     if rank == 0 and drop_edge_prob > 0.0:
@@ -2180,6 +2160,32 @@ def train_neighbor_sampling(
     output_dir = ensure_dir(Path(config["train"]["output_dir"])) if rank == 0 else Path(config["train"]["output_dir"])
     best_checkpoint = output_dir / "hgt_flow_best.pt"
     label_names = label_name_mapping(backend.manifest, labels_np)
+
+    # Noise-robust self-learning controller (config-gated). Built here, after
+    # label_names exists. Assembles the per-flow MITRE evidence table + class->family
+    # map once; soft_targets() is called each train step.
+    if _nr_enabled:
+        from graphslm_ids.offline.training.noise_consensus import (
+            build_noise_robust_controller,
+        )
+        noise_robust_ctrl = build_noise_robust_controller(
+            artifact=backend.artifact,
+            num_classes=num_classes,
+            label_mapping={v: k for k, v in label_names.items()},
+            warmup_epochs=int(_nr_cfg.get("warmup_epochs", 5)),
+            ema_decay=float(_nr_cfg.get("ema_decay", 0.9)),
+            mitre_dir=str(_nr_cfg.get("mitre_dir", "data/mitre")),
+        )
+        if rank == 0:
+            _nf_attack = int((noise_robust_ctrl.class_to_family >= 0).sum().item())
+            print(
+                f"[noise_robust] ENABLED warmup={_nr_cfg.get('warmup_epochs', 5)} "
+                f"ema_decay={_nr_cfg.get('ema_decay', 0.9)} families=5 "
+                f"attack_classes_mapped={_nf_attack} "
+                f"(Evidence-Prediction Contradiction + soft-relabel)",
+                flush=True,
+            )
+
     monitor = str(config["train"]["monitor"])
     if monitor not in {"val_macro_f1", "val_accuracy", "val_balanced", "val_loss"}:
         raise ValueError(
