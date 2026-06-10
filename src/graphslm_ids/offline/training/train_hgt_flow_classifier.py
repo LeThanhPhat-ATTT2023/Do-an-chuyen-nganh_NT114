@@ -1888,6 +1888,11 @@ def train_neighbor_sampling(
     # Order matters only for layer construction (deterministic param naming);
     # the rest of the model keys by string.
     derived_node_types = list(node_input_dims.keys()) + ["tactic"]
+    # Noise-robust self-learning (config-gated): the auxiliary family head predicts a
+    # flow's MITRE attack family for the Evidence-Prediction Contradiction signal.
+    _nr_cfg = config["train"].get("noise_robust") or {}
+    _nr_enabled = bool(_nr_cfg.get("enabled", False))
+    _nr_num_families = 5 if _nr_enabled else 0
     raw_model = HeteroGraphTransformer(
         node_input_dims=node_input_dims,
         edge_types=edge_types,
@@ -1900,6 +1905,7 @@ def train_neighbor_sampling(
         ffn_multiplier=int(config["model"]["ffn_multiplier"]),
         activation_checkpointing=bool(config["train"].get("activation_checkpointing", False)),
         node_types=derived_node_types,
+        num_families=_nr_num_families,
     ).to(device)
 
     # Compile the plain module FIRST, then wrap with DDP — this is the order
@@ -2110,6 +2116,29 @@ def train_neighbor_sampling(
     if rank == 0 and tau_norm > 0.0:
         print(f"[tau_norm] tau={tau_norm} (post-hoc classifier weight normalization)", flush=True)
 
+    # Noise-robust self-learning controller (config-gated). Builds the per-flow MITRE
+    # evidence table + class->family map once; soft_targets() is called each train step.
+    noise_robust_ctrl = None
+    if _nr_enabled:
+        from graphslm_ids.offline.training.noise_consensus import (
+            build_noise_robust_controller,
+        )
+        noise_robust_ctrl = build_noise_robust_controller(
+            artifact=backend.artifact,
+            num_classes=num_classes,
+            label_mapping={v: k for k, v in label_names.items()},
+            warmup_epochs=int(_nr_cfg.get("warmup_epochs", 5)),
+            ema_decay=float(_nr_cfg.get("ema_decay", 0.9)),
+            mitre_dir=str(_nr_cfg.get("mitre_dir", "data/mitre")),
+        )
+        if rank == 0:
+            print(
+                f"[noise_robust] ENABLED warmup={_nr_cfg.get('warmup_epochs', 5)} "
+                f"ema_decay={_nr_cfg.get('ema_decay', 0.9)} families=5 "
+                f"(Evidence-Prediction Contradiction + soft-relabel)",
+                flush=True,
+            )
+
     drop_edge_prob = float(config["train"].get("drop_edge_prob", 0.0))
     if rank == 0 and drop_edge_prob > 0.0:
         print(f"[drop_edge] prob={drop_edge_prob}", flush=True)
@@ -2273,12 +2302,34 @@ def train_neighbor_sampling(
                     logits = model(nf, ei, edge_weight_dict=ew)
                     x_dict = None
                 seed_logits = logits[sm].float()
-                primary_loss = _compute_train_loss(
-                    seed_logits, sl, weight,
-                    loss_type=loss_type,
-                    label_smoothing=label_smoothing,
-                    focal_gamma=focal_gamma,
-                )
+                # Noise-robust self-learning: replace the hard-label loss with a
+                # soft-relabel target the model derives this epoch from Evidence-
+                # Prediction Contradiction (warmup epochs fall back to the hard label
+                # inside the controller, so early training is unchanged).
+                if noise_robust_ctrl is not None and x_dict is not None:
+                    family_logits = (
+                        raw_model.family_head(x_dict["flow"])[sm].float()
+                        if raw_model.family_head is not None else None
+                    )
+                    _seed_gids = torch.as_tensor(
+                        np.asarray(batch.seed_flow_ids, dtype=np.int64), device=device
+                    )
+                    soft_tgt = noise_robust_ctrl.soft_targets(
+                        seed_logits, family_logits, _seed_gids, sl, epoch=epoch,
+                    )
+                    _logp = F.log_softmax(seed_logits, dim=1)
+                    if weight is not None:
+                        _w = weight.gather(0, sl)
+                        primary_loss = -(_w * (soft_tgt * _logp).sum(dim=1)).sum() / _w.sum().clamp_min(1e-8)
+                    else:
+                        primary_loss = -(soft_tgt * _logp).sum(dim=1).mean()
+                else:
+                    primary_loss = _compute_train_loss(
+                        seed_logits, sl, weight,
+                        loss_type=loss_type,
+                        label_smoothing=label_smoothing,
+                        focal_gamma=focal_gamma,
+                    )
                 aux_loss_val_for_log = 0.0
                 if gcl_enabled and x_dict is not None and class_to_technique_idx:
                     contains_key = ("flow", "contains", "packet")
