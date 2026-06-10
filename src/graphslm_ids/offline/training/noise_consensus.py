@@ -33,7 +33,127 @@ __all__ = [
     "curriculum_weight",
     "EMAConsensusBuffer",
     "build_evidence_by_flow",
+    "static_evidence_weight",
+    "evidence_prediction_contradiction",
+    "em_clean_confidence",
+    "soft_relabel_target",
 ]
+
+
+def evidence_prediction_contradiction(
+    q: torch.Tensor, e: torch.Tensor, eps: float = 1e-8
+) -> torch.Tensor:
+    """Evidence-Prediction Contradiction (EPC) — the DYNAMIC noise signal.
+
+    ``q`` (N, F) is the model's CURRENT predicted attack-family distribution for each
+    flow (evolves every epoch as the model learns); ``e`` (N, F) is the grounded MITRE
+    evidence mass per family (Tầng-3, from the graph). EPC is ``1 - cos(q, e)``: low
+    when what the model now thinks the flow is agrees with its grounded evidence (likely
+    clean), high when they contradict (label suspect).
+
+    A flow with NO evidence (``||e|| == 0``, background traffic) cannot be judged by
+    evidence and returns a NEUTRAL ``0.5`` — the EM step + label handle it; we neither
+    punish nor reward purely for missing evidence.
+    """
+    q_norm = q.norm(dim=1)
+    e_norm = e.norm(dim=1)
+    dot = (q * e).sum(dim=1)
+    cos = dot / (q_norm * e_norm).clamp_min(eps)
+    epc = 1.0 - cos
+    # neutral 0.5 where there is no evidence to contradict
+    no_evidence = e_norm <= eps
+    epc = torch.where(no_evidence, torch.full_like(epc, 0.5), epc)
+    return epc.clamp(0.0, 1.0)
+
+
+def em_clean_confidence(epc: torch.Tensor, n_iter: int = 30, eps: float = 1e-6) -> torch.Tensor:
+    """Per-flow clean-confidence ``beta`` via a 2-component 1-D Gaussian mixture on EPC.
+
+    The clean component has the SMALLER mean EPC (predictions agree with evidence). We
+    fit means/variances/mixing-weights by EM (recomputed each epoch, so beta tracks the
+    model), then return the posterior probability of the clean component as ``beta_i``.
+    This is the "model decides which labels to trust, and gets better each epoch" step —
+    no hand-set threshold (DivideMix/ICGNN style).
+    """
+    x = epc.detach().float().reshape(-1)
+    n = x.numel()
+    if n == 0:
+        return x
+    # init: clean mean at the low end, noisy mean at the high end
+    lo, hi = x.min(), x.max()
+    mu = torch.stack([lo + 0.25 * (hi - lo), lo + 0.75 * (hi - lo)])
+    var = torch.full((2,), float(((hi - lo) ** 2).clamp_min(eps) / 4 + eps))
+    pi = torch.tensor([0.5, 0.5])
+
+    for _ in range(n_iter):
+        # E-step: responsibilities
+        diff2 = (x[:, None] - mu[None, :]) ** 2
+        log_g = -0.5 * (diff2 / var[None, :].clamp_min(eps) + torch.log(2 * torch.pi * var[None, :].clamp_min(eps)))
+        log_w = torch.log(pi.clamp_min(eps))[None, :] + log_g
+        log_w = log_w - log_w.logsumexp(dim=1, keepdim=True)
+        r = log_w.exp()                                   # (n, 2)
+        # M-step
+        nk = r.sum(dim=0).clamp_min(eps)
+        pi = nk / n
+        mu = (r * x[:, None]).sum(dim=0) / nk
+        var = (r * (x[:, None] - mu[None, :]) ** 2).sum(dim=0) / nk
+        var = var.clamp_min(eps)
+
+    # clean component = the one with the smaller mean EPC
+    clean_k = int(torch.argmin(mu).item())
+    diff2 = (x[:, None] - mu[None, :]) ** 2
+    log_g = -0.5 * (diff2 / var[None, :].clamp_min(eps) + torch.log(2 * torch.pi * var[None, :].clamp_min(eps)))
+    log_w = torch.log(pi.clamp_min(eps))[None, :] + log_g
+    log_w = log_w - log_w.logsumexp(dim=1, keepdim=True)
+    beta = log_w.exp()[:, clean_k]
+    return beta.clamp(0.0, 1.0)
+
+
+def soft_relabel_target(
+    labels: torch.Tensor, q: torch.Tensor, beta: torch.Tensor, num_classes: int
+) -> torch.Tensor:
+    """Soft training target blending the given (noisy) label with the model prediction.
+
+    ``target_i = beta_i · onehot(y_i) + (1 - beta_i) · q_i`` (ICGNN Eq. 6). When the
+    label is believed clean (``beta→1``) the target is the given label; when believed
+    noisy (``beta→0``) the model is trained toward its own family-aware prediction
+    instead of the wrong label. ``q`` here is the per-CLASS prediction (N, num_classes).
+    Rows sum to 1.
+    """
+    onehot = torch.zeros((labels.shape[0], num_classes), dtype=q.dtype, device=q.device)
+    onehot[torch.arange(labels.shape[0]), labels] = 1.0
+    b = beta.to(q.dtype).reshape(-1, 1)
+    return b * onehot + (1.0 - b) * q
+
+
+def static_evidence_weight(
+    contains_edge_index: torch.Tensor,
+    evidence_per_family: dict[int, tuple[torch.Tensor, torch.Tensor]],
+    labels: torch.Tensor,
+    class_to_family: torch.Tensor,
+    num_families: int,
+    w_min: float = 0.2,
+) -> torch.Tensor:
+    """Static per-flow loss weight from Signal 1 (MITRE evidence grounding) alone.
+
+    Computes ``evidence_support`` for every flow (1 if its attack label is grounded by
+    a matching MITRE evidence edge or the class is non-attack; 0 if it claims an attack
+    with no matching evidence) and maps it to a loss weight in ``[w_min, 1]``:
+
+        w_i = 1.0           if supported / non-attack
+        w_i = w_min         if attack-labeled but ungrounded (prime noise candidate)
+
+    This is independent of the model and of training epoch, so it can be precomputed
+    once over ALL flows and indexed per batch — the least-invasive way to make the
+    trainer noise-robust. Signal 2 (neighbor consensus) can refine this later.
+    """
+    num_flows = labels.shape[0]
+    ev = build_evidence_by_flow(
+        contains_edge_index, evidence_per_family, num_flows, num_families
+    )
+    support = evidence_support(labels, ev, class_to_family)   # (num_flows,) in {0,1}
+    # map support 1 -> weight 1, support 0 -> weight w_min
+    return w_min + (1.0 - w_min) * support
 
 
 def build_evidence_by_flow(
