@@ -37,7 +37,41 @@ __all__ = [
     "evidence_prediction_contradiction",
     "em_clean_confidence",
     "soft_relabel_target",
+    "build_class_to_family",
 ]
+
+
+def build_class_to_family(
+    class_to_tech: dict[str, list[tuple[str, float]]],
+    tech_to_family: dict[str, str],
+    family_to_col: dict[str, int],
+    label_mapping: dict[str, int],
+    num_classes: int,
+) -> torch.Tensor:
+    """Map each class id -> its dominant MITRE attack-family column, or -1 (non-attack).
+
+    A class points at one or more techniques (with weights); each technique belongs to a
+    family. We sum the class's technique weights per family and pick the family with the
+    largest mass. Classes with no technique (e.g. Benign) or whose families are unknown
+    map to ``-1`` so the evidence signal treats them as non-attack (always trusted).
+    """
+    out = torch.full((num_classes,), -1, dtype=torch.long)
+    for class_name, cls_idx in label_mapping.items():
+        if cls_idx < 0 or cls_idx >= num_classes:
+            continue
+        pairs = class_to_tech.get(class_name) or []
+        fam_mass: dict[int, float] = {}
+        for tech_id, weight in pairs:
+            fam_name = tech_to_family.get(tech_id)
+            if fam_name is None:
+                continue
+            col = family_to_col.get(fam_name)
+            if col is None:
+                continue
+            fam_mass[col] = fam_mass.get(col, 0.0) + float(weight)
+        if fam_mass:
+            out[cls_idx] = max(fam_mass, key=fam_mass.get)
+    return out
 
 
 def evidence_prediction_contradiction(

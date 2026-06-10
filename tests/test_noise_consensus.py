@@ -268,6 +268,29 @@ def test_soft_relabel_rows_sum_to_one() -> None:
     assert torch.allclose(t.sum(dim=1), torch.ones(3), atol=1e-6)
 
 
+def test_build_class_to_family_maps_via_technique() -> None:
+    from graphslm_ids.offline.training.noise_consensus import build_class_to_family
+
+    # class -> technique (with weights) ; technique -> family ; family name -> col
+    class_to_tech = {
+        "CommandInjection": [("T1059", 1.0)],
+        "XSS": [("T1190", 0.7), ("T1189", 0.3)],
+        "Benign": [],
+    }
+    tech_to_family = {"T1059": "command_exec", "T1190": "injection", "T1189": "injection"}
+    family_to_col = {"injection": 0, "command_exec": 1, "file_upload": 2,
+                     "recon": 3, "c2_beacon": 4}
+    label_mapping = {"Benign": 0, "CommandInjection": 1, "XSS": 2}
+    num_classes = 3
+    c2f = build_class_to_family(
+        class_to_tech, tech_to_family, family_to_col, label_mapping, num_classes
+    )
+    assert c2f.shape == (3,)
+    assert c2f[0].item() == -1            # Benign -> non-attack
+    assert c2f[1].item() == 1            # CommandInjection -> command_exec col 1
+    assert c2f[2].item() == 0            # XSS -> injection (dominant T1190) col 0
+
+
 # --------------------------------------------------------------------------- #
 # trainer integration: _compute_train_loss accepts a per-sample weight
 # (backward-compatible — sample_weight=None reproduces the unweighted loss).
