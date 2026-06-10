@@ -186,6 +186,89 @@ def test_ema_buffer_untouched_flows_keep_init() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# DYNAMIC mechanism (ICGNN-style): the model self-detects noise each epoch.
+#   - evidence_prediction_contradiction: 1 - cos(q_i, e_i)  (dynamic via q_i)
+#   - em_clean_confidence: 2-component fit per epoch -> beta_i (clean posterior)
+#   - soft_relabel_target: beta*onehot(label) + (1-beta)*q  (ICGNN Eq.6)
+# --------------------------------------------------------------------------- #
+from graphslm_ids.offline.training.noise_consensus import (  # noqa: E402
+    em_clean_confidence,
+    evidence_prediction_contradiction,
+    soft_relabel_target,
+)
+
+
+def test_epc_zero_when_prediction_matches_evidence() -> None:
+    # model predicts family 0, evidence is purely family 0 -> agree=1 -> EPC=0.
+    q = torch.tensor([[1.0, 0.0, 0.0]])
+    e = torch.tensor([[2.0, 0.0, 0.0]])   # un-normalised; cosine ignores scale
+    epc = evidence_prediction_contradiction(q, e)
+    assert epc.shape == (1,)
+    assert epc.item() == pytest.approx(0.0, abs=1e-6)
+
+
+def test_epc_high_when_prediction_contradicts_evidence() -> None:
+    # model predicts family 0, evidence says family 1 -> orthogonal -> EPC ~ 1.
+    q = torch.tensor([[1.0, 0.0]])
+    e = torch.tensor([[0.0, 1.0]])
+    epc = evidence_prediction_contradiction(q, e)
+    assert epc.item() == pytest.approx(1.0, abs=1e-6)
+
+
+def test_epc_no_evidence_returns_neutral() -> None:
+    # a flow with zero evidence (background) cannot be judged by EPC -> neutral 0.5
+    # (we don't want to punish or reward purely from missing evidence; the EM step
+    # and label decide). Implementation choice documented in the spec.
+    q = torch.tensor([[0.7, 0.3]])
+    e = torch.tensor([[0.0, 0.0]])
+    epc = evidence_prediction_contradiction(q, e)
+    assert epc.item() == pytest.approx(0.5, abs=1e-6)
+
+
+def test_em_clean_confidence_separates_two_clusters() -> None:
+    # Build an EPC distribution: a clean cluster (low EPC ~0.1) and a noisy cluster
+    # (high EPC ~0.9). beta should be ~1 for low-EPC and ~0 for high-EPC samples.
+    epc = torch.tensor([0.05, 0.1, 0.12, 0.08,   # clean
+                        0.88, 0.92, 0.9, 0.95])   # noisy
+    beta = em_clean_confidence(epc, n_iter=50)
+    assert beta.shape == epc.shape
+    assert (beta[:4] > 0.5).all()    # clean cluster -> high clean-confidence
+    assert (beta[4:] < 0.5).all()    # noisy cluster -> low clean-confidence
+
+
+def test_em_clean_confidence_in_unit_range() -> None:
+    torch.manual_seed(0)
+    epc = torch.rand(200)
+    beta = em_clean_confidence(epc, n_iter=30)
+    assert (beta >= 0.0).all() and (beta <= 1.0).all()
+
+
+def test_soft_relabel_blends_label_and_prediction() -> None:
+    # beta=1 -> pure given label; beta=0 -> pure model prediction; 0.5 -> average.
+    labels = torch.tensor([0, 1])
+    q = torch.tensor([[0.2, 0.8], [0.9, 0.1]])
+    num_classes = 2
+    # beta = 1: target == one-hot(label)
+    t1 = soft_relabel_target(labels, q, torch.tensor([1.0, 1.0]), num_classes)
+    assert torch.allclose(t1, torch.tensor([[1.0, 0.0], [0.0, 1.0]]), atol=1e-6)
+    # beta = 0: target == model prediction q
+    t0 = soft_relabel_target(labels, q, torch.tensor([0.0, 0.0]), num_classes)
+    assert torch.allclose(t0, q, atol=1e-6)
+    # beta = 0.5 on sample 0: average of one-hot(0) and q[0]
+    th = soft_relabel_target(labels[:1], q[:1], torch.tensor([0.5]), num_classes)
+    expected = 0.5 * torch.tensor([[1.0, 0.0]]) + 0.5 * q[:1]
+    assert torch.allclose(th, expected, atol=1e-6)
+
+
+def test_soft_relabel_rows_sum_to_one() -> None:
+    labels = torch.tensor([0, 2, 1])
+    q = torch.softmax(torch.randn(3, 3), dim=1)
+    beta = torch.tensor([0.3, 0.7, 0.0])
+    t = soft_relabel_target(labels, q, beta, num_classes=3)
+    assert torch.allclose(t.sum(dim=1), torch.ones(3), atol=1e-6)
+
+
+# --------------------------------------------------------------------------- #
 # trainer integration: _compute_train_loss accepts a per-sample weight
 # (backward-compatible — sample_weight=None reproduces the unweighted loss).
 # --------------------------------------------------------------------------- #
@@ -206,6 +289,29 @@ def test_sample_weight_none_matches_unweighted(loss_type: str) -> None:
         sample_weight=torch.ones(8),
     )
     assert ones.item() == pytest.approx(base.item(), abs=1e-6)
+
+
+def test_static_evidence_weight_downweights_unsupported_attack_flows() -> None:
+    """End-to-end of Signal 1 as a static per-flow weight vector.
+
+    3 flows: flow0 = attack class 3 WITH matching evidence (keep weight 1),
+    flow1 = attack class 3 WITHOUT evidence (noise -> down-weight to w_min),
+    flow2 = benign class 0 (always 1).
+    """
+    from graphslm_ids.offline.training.noise_consensus import static_evidence_weight
+
+    contains = torch.tensor([[0, 1, 2], [0, 1, 2]])      # flow i contains packet i
+    evidence_per_family = {0: (torch.tensor([0]), torch.tensor([2.0]))}  # pkt0 -> fam0
+    labels = torch.tensor([3, 3, 0])
+    class_to_family = torch.tensor([-1, -1, -1, 0])      # class 3 -> family 0; others none
+    w = static_evidence_weight(
+        contains, evidence_per_family, labels, class_to_family,
+        num_families=1, w_min=0.2,
+    )
+    assert w.shape == (3,)
+    assert w[0].item() == pytest.approx(1.0)   # supported attack
+    assert w[1].item() == pytest.approx(0.2)   # unsupported attack -> down-weighted
+    assert w[2].item() == pytest.approx(1.0)   # benign
 
 
 def test_build_evidence_by_flow_aggregates_packets_to_flow() -> None:
