@@ -114,11 +114,13 @@ def em_clean_confidence(epc: torch.Tensor, n_iter: int = 30, eps: float = 1e-6) 
     n = x.numel()
     if n == 0:
         return x
-    # init: clean mean at the low end, noisy mean at the high end
+    # init: clean mean at the low end, noisy mean at the high end. All init tensors
+    # are created on x.device so the EM runs entirely on the input's device (cuda/cpu).
+    dev = x.device
     lo, hi = x.min(), x.max()
     mu = torch.stack([lo + 0.25 * (hi - lo), lo + 0.75 * (hi - lo)])
-    var = torch.full((2,), float(((hi - lo) ** 2).clamp_min(eps) / 4 + eps))
-    pi = torch.tensor([0.5, 0.5])
+    var = torch.full((2,), float(((hi - lo) ** 2).clamp_min(eps) / 4 + eps), device=dev)
+    pi = torch.tensor([0.5, 0.5], device=dev)
 
     for _ in range(n_iter):
         # E-step: responsibilities

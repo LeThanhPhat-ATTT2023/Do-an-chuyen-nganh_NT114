@@ -236,6 +236,14 @@ def test_em_clean_confidence_separates_two_clusters() -> None:
     assert (beta[4:] < 0.5).all()    # noisy cluster -> low clean-confidence
 
 
+def test_em_clean_confidence_preserves_input_device() -> None:
+    # Regression guard: all EM init tensors must live on the input's device, so the
+    # routine works on cuda (the bug that crashed the first smoke-train at epoch 5).
+    epc = torch.rand(20)
+    beta = em_clean_confidence(epc, n_iter=10)
+    assert beta.device == epc.device
+
+
 def test_em_clean_confidence_in_unit_range() -> None:
     torch.manual_seed(0)
     epc = torch.rand(200)
