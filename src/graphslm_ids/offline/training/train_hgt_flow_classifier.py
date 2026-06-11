@@ -2166,6 +2166,15 @@ def train_neighbor_sampling(
     # map once; soft_targets() is called each train step.
     _family_supervision_loss = None
     if _nr_enabled:
+        # The noise-robust train-step reads the flow embedding from x_dict, which is
+        # only populated on the gcl_enabled code path. Fail loudly rather than silently
+        # training plain hard-label loss while the [noise_robust] banner claims it's on.
+        if not gcl_enabled:
+            raise ValueError(
+                "train.noise_robust.enabled requires train.gcl_enabled=true "
+                "(the noise-robust step needs the flow embedding produced on the GCL "
+                "encode path). Set gcl_enabled: true or disable noise_robust."
+            )
         from graphslm_ids.offline.training.noise_consensus import (
             build_noise_robust_controller,
             family_supervision_loss as _family_supervision_loss,
@@ -2325,20 +2334,26 @@ def train_neighbor_sampling(
                     soft_tgt = noise_robust_ctrl.soft_targets(
                         seed_logits, family_logits, _seed_gids, sl, epoch=epoch,
                     )
-                    # Soft-relabel cross-entropy, KEEPING the focal modulation + per-class
-                    # weight the config declares (focal factor keyed on the given label's
-                    # probability, as in _compute_train_loss). Without this the rare
-                    # classes silently lose focal.
+                    # Soft-relabel cross-entropy, matching _compute_train_loss EXACTLY
+                    # except for the soft target — keeps focal modulation, per-class
+                    # weight (alpha_t), label_smoothing, and the SAME reduction
+                    # (mean over the alpha-weighted per-sample loss), so enabling
+                    # noise_robust does not change the loss scale / effective LR vs the
+                    # baseline. This preserves a fair A/B and an unchanged warmup phase.
                     _logp = F.log_softmax(seed_logits, dim=1)
-                    _ce = -(soft_tgt * _logp).sum(dim=1)                 # (S,) per-sample
+                    if label_smoothing > 0.0:
+                        # blend the soft target toward uniform, as label smoothing does
+                        _uniform = torch.full_like(_logp, 1.0 / _logp.shape[1])
+                        _tgt = (1.0 - label_smoothing) * soft_tgt + label_smoothing * _uniform
+                    else:
+                        _tgt = soft_tgt
+                    _ce = -(_tgt * _logp).sum(dim=1)                      # (S,) per-sample
                     if loss_type in ("focal", "cb_focal"):
                         _p_t = _logp.gather(1, sl.unsqueeze(1)).squeeze(1).exp()
                         _ce = (1.0 - _p_t).pow(focal_gamma) * _ce
                     if weight is not None:
-                        _w = weight.gather(0, sl)
-                        primary_loss = (_w * _ce).sum() / _w.sum().clamp_min(1e-8)
-                    else:
-                        primary_loss = _ce.mean()
+                        _ce = weight.gather(0, sl) * _ce                  # alpha_t, as in focal
+                    primary_loss = _ce.mean()                            # same reduction as baseline
                     # BUG #1 fix: train the family head with grounded-evidence weak labels
                     # so q is meaningful and EPC is a real signal (not noise).
                     if family_logits is not None and _family_supervision_loss is not None:
