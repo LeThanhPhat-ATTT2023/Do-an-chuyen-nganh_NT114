@@ -323,6 +323,37 @@ def test_controller_soft_targets_relabels_noisy_attack_flow() -> None:
     assert (targets[3:, 0] > targets[3:, 1]).all()
 
 
+def test_family_supervision_loss_teaches_evidence_family() -> None:
+    """The family head must be TRAINED, else q is meaningless and EPC is noise.
+
+    family_supervision_loss is a cross-entropy that pushes the family head toward the
+    family with the strongest grounded evidence on each flow, computed ONLY over flows
+    that carry evidence (others have no target). Lower when the head already predicts
+    the evidence family.
+    """
+    from graphslm_ids.offline.training.noise_consensus import family_supervision_loss
+
+    num_families = 3
+    # 3 flows: 0 has evidence in family 1, 1 in family 2, 2 has NO evidence (ignored)
+    evidence = torch.tensor([[0.0, 2.0, 0.0], [0.0, 0.0, 1.5], [0.0, 0.0, 0.0]])
+    # head already predicts the right family for 0 and 1 -> low loss
+    good_logits = torch.tensor([[-5.0, 5.0, -5.0], [-5.0, -5.0, 5.0], [0.0, 0.0, 0.0]])
+    bad_logits = torch.tensor([[5.0, -5.0, -5.0], [5.0, -5.0, -5.0], [0.0, 0.0, 0.0]])
+    loss_good = family_supervision_loss(good_logits, evidence)
+    loss_bad = family_supervision_loss(bad_logits, evidence)
+    assert loss_good.item() < loss_bad.item()
+    assert loss_good.item() >= 0.0
+
+
+def test_family_supervision_loss_zero_when_no_evidence_at_all() -> None:
+    from graphslm_ids.offline.training.noise_consensus import family_supervision_loss
+
+    logits = torch.randn(4, 3)
+    evidence = torch.zeros(4, 3)   # no flow has evidence -> no supervision signal
+    loss = family_supervision_loss(logits, evidence)
+    assert loss.item() == pytest.approx(0.0)
+
+
 def test_controller_keeps_label_when_no_evidence() -> None:
     """A flow with NO matching evidence cannot be judged by Evidence-Prediction
     Contradiction, so it must keep its given label (beta=1) — never get relabeled.

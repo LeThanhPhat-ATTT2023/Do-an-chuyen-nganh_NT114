@@ -2164,9 +2164,11 @@ def train_neighbor_sampling(
     # Noise-robust self-learning controller (config-gated). Built here, after
     # label_names exists. Assembles the per-flow MITRE evidence table + class->family
     # map once; soft_targets() is called each train step.
+    _family_supervision_loss = None
     if _nr_enabled:
         from graphslm_ids.offline.training.noise_consensus import (
             build_noise_robust_controller,
+            family_supervision_loss as _family_supervision_loss,
         )
         noise_robust_ctrl = build_noise_robust_controller(
             artifact=backend.artifact,
@@ -2323,12 +2325,26 @@ def train_neighbor_sampling(
                     soft_tgt = noise_robust_ctrl.soft_targets(
                         seed_logits, family_logits, _seed_gids, sl, epoch=epoch,
                     )
+                    # Soft-relabel cross-entropy, KEEPING the focal modulation + per-class
+                    # weight the config declares (focal factor keyed on the given label's
+                    # probability, as in _compute_train_loss). Without this the rare
+                    # classes silently lose focal.
                     _logp = F.log_softmax(seed_logits, dim=1)
+                    _ce = -(soft_tgt * _logp).sum(dim=1)                 # (S,) per-sample
+                    if loss_type in ("focal", "cb_focal"):
+                        _p_t = _logp.gather(1, sl.unsqueeze(1)).squeeze(1).exp()
+                        _ce = (1.0 - _p_t).pow(focal_gamma) * _ce
                     if weight is not None:
                         _w = weight.gather(0, sl)
-                        primary_loss = -(_w * (soft_tgt * _logp).sum(dim=1)).sum() / _w.sum().clamp_min(1e-8)
+                        primary_loss = (_w * _ce).sum() / _w.sum().clamp_min(1e-8)
                     else:
-                        primary_loss = -(soft_tgt * _logp).sum(dim=1).mean()
+                        primary_loss = _ce.mean()
+                    # BUG #1 fix: train the family head with grounded-evidence weak labels
+                    # so q is meaningful and EPC is a real signal (not noise).
+                    if family_logits is not None and _family_supervision_loss is not None:
+                        _ev = noise_robust_ctrl.batch_evidence(_seed_gids, device)
+                        _fam_loss = _family_supervision_loss(family_logits, _ev)
+                        primary_loss = primary_loss + 0.3 * _fam_loss
                 else:
                     primary_loss = _compute_train_loss(
                         seed_logits, sl, weight,

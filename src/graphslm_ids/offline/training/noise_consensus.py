@@ -39,6 +39,7 @@ __all__ = [
     "em_clean_confidence",
     "soft_relabel_target",
     "build_class_to_family",
+    "family_supervision_loss",
 ]
 
 
@@ -73,6 +74,28 @@ def build_class_to_family(
         if fam_mass:
             out[cls_idx] = max(fam_mass, key=fam_mass.get)
     return out
+
+
+def family_supervision_loss(
+    family_logits: torch.Tensor, evidence: torch.Tensor, eps: float = 1e-8
+) -> torch.Tensor:
+    """Weak-supervision loss that TRAINS the auxiliary family head.
+
+    Without this the head's softmax ``q`` is meaningless and the Evidence-Prediction
+    Contradiction signal is noise. We use the grounded MITRE evidence (Tầng-3) as a weak
+    label: a flow that carries evidence should have its family head predict the family
+    with the strongest evidence mass. Cross-entropy is computed ONLY over flows that
+    carry evidence (the others provide no supervision); returns 0 if none do.
+
+    Args:
+        family_logits: ``(N, F)`` raw family-head logits.
+        evidence: ``(N, F)`` grounded evidence mass per family.
+    """
+    has_ev = evidence.sum(dim=1) > eps
+    if not bool(has_ev.any()):
+        return family_logits.new_zeros(())
+    targets = evidence[has_ev].argmax(dim=1)
+    return torch.nn.functional.cross_entropy(family_logits[has_ev], targets)
 
 
 def evidence_prediction_contradiction(
@@ -443,6 +466,10 @@ class NoiseRobustController:
         self.beta_buffer = EMAConsensusBuffer(
             num_flows=evidence_by_flow.shape[0], decay=ema_decay, init=1.0
         )
+
+    def batch_evidence(self, seed_global_ids: torch.Tensor, device) -> torch.Tensor:
+        """Per-seed grounded evidence table (S, F) for the family-supervision loss."""
+        return self.evidence_by_flow.to(device)[seed_global_ids]
 
     def soft_targets(
         self,
