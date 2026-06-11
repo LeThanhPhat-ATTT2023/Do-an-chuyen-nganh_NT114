@@ -462,8 +462,21 @@ class NoiseRobustController:
 
         q = torch.softmax(family_logits.float(), dim=1)          # (S, F) family pred
         e = self.evidence_by_flow.to(device)[seed_global_ids]    # (S, F) evidence
-        epc = evidence_prediction_contradiction(q, e)            # (S,)
-        beta_batch = em_clean_confidence(epc, n_iter=self.em_iters)  # (S,)
+
+        # Only flows that CARRY grounded evidence can be judged by Evidence-Prediction
+        # Contradiction. A flow with no matching evidence (e.g. volumetric DDoS / scan
+        # Recon flows, whose attacks leave no payload attack-token, or a non-attack
+        # class) is NOT gradable — it keeps beta=1 (full label trust) and is excluded
+        # from the EM fit, so it can never be wrongly dragged into the noisy cluster and
+        # relabeled. This confines the mechanism to the web-attack flows that actually
+        # have the label-pollution problem.
+        gradable = e.norm(dim=1) > 1e-8                          # (S,)
+        beta_batch = torch.ones(seed_labels.shape[0], device=device)
+        if bool(gradable.any()):
+            epc_g = evidence_prediction_contradiction(q[gradable], e[gradable])
+            beta_g = em_clean_confidence(epc_g, n_iter=self.em_iters).to(device)
+            beta_batch = beta_batch.clone()
+            beta_batch[gradable] = beta_g
         # EMA-smooth beta per flow across epochs for stability
         beta = self.beta_buffer.update(seed_global_ids, beta_batch).to(device)
         return soft_relabel_target(seed_labels, p, beta, self.num_classes)
