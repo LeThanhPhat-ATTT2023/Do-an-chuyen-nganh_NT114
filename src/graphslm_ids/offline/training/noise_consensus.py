@@ -21,6 +21,15 @@ per-sample loss weight, so a single model becomes more noise-robust as it trains
 
 ``combine_clean_confidence`` blends them; ``curriculum_weight`` applies warmup + clamp;
 ``EMAConsensusBuffer`` smooths the score across epochs. All pure & unit-tested.
+
+The previous Evidence-Prediction Contradiction (EPC) + 2-component EM soft-relabel path
+was measured HARMFUL in a full training run and has been removed (2026-06-11).  It is
+replaced by EACS (Evidence-Anchored Candidate-Set self-relabeling): suspect flows
+(labeled with a polluted web-attack class AND carrying no matching MITRE evidence) receive
+a soft target restricted to {own label, Benign}, disambiguated by the model's own
+prediction, optionally modulated by graph-neighbor consensus, EMA-smoothed.  Anchors
+(same classes WITH evidence) and all other classes keep hard labels.
+See: docs/superpowers/specs/2026-06-11-eacs-noise-robust-design.md
 """
 from __future__ import annotations
 
@@ -35,11 +44,12 @@ __all__ = [
     "EMAConsensusBuffer",
     "build_evidence_by_flow",
     "static_evidence_weight",
-    "evidence_prediction_contradiction",
-    "em_clean_confidence",
-    "soft_relabel_target",
     "build_class_to_family",
-    "family_supervision_loss",
+    "soft_target_focal_loss",
+    "EACSController",
+    "build_eacs_controller",
+    "evidence_table_from_artifact",
+    "class_to_family_from_csvs",
 ]
 
 
@@ -74,116 +84,6 @@ def build_class_to_family(
         if fam_mass:
             out[cls_idx] = max(fam_mass, key=fam_mass.get)
     return out
-
-
-def family_supervision_loss(
-    family_logits: torch.Tensor, evidence: torch.Tensor, eps: float = 1e-8
-) -> torch.Tensor:
-    """Weak-supervision loss that TRAINS the auxiliary family head.
-
-    Without this the head's softmax ``q`` is meaningless and the Evidence-Prediction
-    Contradiction signal is noise. We use the grounded MITRE evidence (Tầng-3) as a weak
-    label: a flow that carries evidence should have its family head predict the family
-    with the strongest evidence mass. Cross-entropy is computed ONLY over flows that
-    carry evidence (the others provide no supervision); returns 0 if none do.
-
-    Args:
-        family_logits: ``(N, F)`` raw family-head logits.
-        evidence: ``(N, F)`` grounded evidence mass per family.
-    """
-    has_ev = evidence.sum(dim=1) > eps
-    if not bool(has_ev.any()):
-        return family_logits.new_zeros(())
-    targets = evidence[has_ev].argmax(dim=1)
-    return torch.nn.functional.cross_entropy(family_logits[has_ev], targets)
-
-
-def evidence_prediction_contradiction(
-    q: torch.Tensor, e: torch.Tensor, eps: float = 1e-8
-) -> torch.Tensor:
-    """Evidence-Prediction Contradiction (EPC) — the DYNAMIC noise signal.
-
-    ``q`` (N, F) is the model's CURRENT predicted attack-family distribution for each
-    flow (evolves every epoch as the model learns); ``e`` (N, F) is the grounded MITRE
-    evidence mass per family (Tầng-3, from the graph). EPC is ``1 - cos(q, e)``: low
-    when what the model now thinks the flow is agrees with its grounded evidence (likely
-    clean), high when they contradict (label suspect).
-
-    A flow with NO evidence (``||e|| == 0``, background traffic) cannot be judged by
-    evidence and returns a NEUTRAL ``0.5`` — the EM step + label handle it; we neither
-    punish nor reward purely for missing evidence.
-    """
-    q_norm = q.norm(dim=1)
-    e_norm = e.norm(dim=1)
-    dot = (q * e).sum(dim=1)
-    cos = dot / (q_norm * e_norm).clamp_min(eps)
-    epc = 1.0 - cos
-    # neutral 0.5 where there is no evidence to contradict
-    no_evidence = e_norm <= eps
-    epc = torch.where(no_evidence, torch.full_like(epc, 0.5), epc)
-    return epc.clamp(0.0, 1.0)
-
-
-def em_clean_confidence(epc: torch.Tensor, n_iter: int = 30, eps: float = 1e-6) -> torch.Tensor:
-    """Per-flow clean-confidence ``beta`` via a 2-component 1-D Gaussian mixture on EPC.
-
-    The clean component has the SMALLER mean EPC (predictions agree with evidence). We
-    fit means/variances/mixing-weights by EM (recomputed each epoch, so beta tracks the
-    model), then return the posterior probability of the clean component as ``beta_i``.
-    This is the "model decides which labels to trust, and gets better each epoch" step —
-    no hand-set threshold (DivideMix/ICGNN style).
-    """
-    x = epc.detach().float().reshape(-1)
-    n = x.numel()
-    if n == 0:
-        return x
-    # init: clean mean at the low end, noisy mean at the high end. All init tensors
-    # are created on x.device so the EM runs entirely on the input's device (cuda/cpu).
-    dev = x.device
-    lo, hi = x.min(), x.max()
-    mu = torch.stack([lo + 0.25 * (hi - lo), lo + 0.75 * (hi - lo)])
-    var = torch.full((2,), float(((hi - lo) ** 2).clamp_min(eps) / 4 + eps), device=dev)
-    pi = torch.tensor([0.5, 0.5], device=dev)
-
-    for _ in range(n_iter):
-        # E-step: responsibilities
-        diff2 = (x[:, None] - mu[None, :]) ** 2
-        log_g = -0.5 * (diff2 / var[None, :].clamp_min(eps) + torch.log(2 * torch.pi * var[None, :].clamp_min(eps)))
-        log_w = torch.log(pi.clamp_min(eps))[None, :] + log_g
-        log_w = log_w - log_w.logsumexp(dim=1, keepdim=True)
-        r = log_w.exp()                                   # (n, 2)
-        # M-step
-        nk = r.sum(dim=0).clamp_min(eps)
-        pi = nk / n
-        mu = (r * x[:, None]).sum(dim=0) / nk
-        var = (r * (x[:, None] - mu[None, :]) ** 2).sum(dim=0) / nk
-        var = var.clamp_min(eps)
-
-    # clean component = the one with the smaller mean EPC
-    clean_k = int(torch.argmin(mu).item())
-    diff2 = (x[:, None] - mu[None, :]) ** 2
-    log_g = -0.5 * (diff2 / var[None, :].clamp_min(eps) + torch.log(2 * torch.pi * var[None, :].clamp_min(eps)))
-    log_w = torch.log(pi.clamp_min(eps))[None, :] + log_g
-    log_w = log_w - log_w.logsumexp(dim=1, keepdim=True)
-    beta = log_w.exp()[:, clean_k]
-    return beta.clamp(0.0, 1.0)
-
-
-def soft_relabel_target(
-    labels: torch.Tensor, q: torch.Tensor, beta: torch.Tensor, num_classes: int
-) -> torch.Tensor:
-    """Soft training target blending the given (noisy) label with the model prediction.
-
-    ``target_i = beta_i · onehot(y_i) + (1 - beta_i) · q_i`` (ICGNN Eq. 6). When the
-    label is believed clean (``beta→1``) the target is the given label; when believed
-    noisy (``beta→0``) the model is trained toward its own family-aware prediction
-    instead of the wrong label. ``q`` here is the per-CLASS prediction (N, num_classes).
-    Rows sum to 1.
-    """
-    onehot = torch.zeros((labels.shape[0], num_classes), dtype=q.dtype, device=q.device)
-    onehot[torch.arange(labels.shape[0]), labels] = 1.0
-    b = beta.to(q.dtype).reshape(-1, 1)
-    return b * onehot + (1.0 - b) * q
 
 
 def static_evidence_weight(
@@ -428,90 +328,6 @@ class EMAConsensusBuffer:
         return self.values[idx.to(torch.long).cpu()]
 
 
-class NoiseRobustController:
-    """Ties the dynamic noise-detection pieces together for the trainer.
-
-    Holds the global per-flow MITRE evidence table and the class->family map (built
-    once from the artifact), plus a persistent EMA buffer of the per-flow clean-
-    confidence ``beta``. Each training step calls :meth:`soft_targets`, which:
-
-      1. turns the model's family logits into a prediction ``q`` (dynamic, this epoch),
-      2. gathers each seed flow's grounded family evidence ``e`` (Tầng-3, static),
-      3. computes the Evidence-Prediction Contradiction ``EPC = 1 - cos(q, e)``,
-      4. fits a 2-component EM on the batch EPC -> per-flow ``beta`` (clean posterior),
-         EMA-smoothed across epochs,
-      5. returns the soft-relabel target ``beta*onehot(label) + (1-beta)*p`` where ``p``
-         is the model's CLASS prediction.
-
-    During warmup (``epoch < warmup_epochs``) it returns the hard one-hot label so the
-    model first learns basic structure before it is trusted to relabel.
-    """
-
-    def __init__(
-        self,
-        evidence_by_flow: torch.Tensor,
-        class_to_family: torch.Tensor,
-        num_classes: int,
-        num_families: int,
-        warmup_epochs: int = 5,
-        ema_decay: float = 0.9,
-        em_iters: int = 20,
-    ) -> None:
-        self.evidence_by_flow = evidence_by_flow            # (num_flows, num_families)
-        self.class_to_family = class_to_family              # (num_classes,)
-        self.num_classes = int(num_classes)
-        self.num_families = int(num_families)
-        self.warmup_epochs = int(warmup_epochs)
-        self.em_iters = int(em_iters)
-        self.beta_buffer = EMAConsensusBuffer(
-            num_flows=evidence_by_flow.shape[0], decay=ema_decay, init=1.0
-        )
-
-    def batch_evidence(self, seed_global_ids: torch.Tensor, device) -> torch.Tensor:
-        """Per-seed grounded evidence table (S, F) for the family-supervision loss."""
-        return self.evidence_by_flow.to(device)[seed_global_ids]
-
-    def soft_targets(
-        self,
-        class_logits: torch.Tensor,
-        family_logits: torch.Tensor,
-        seed_global_ids: torch.Tensor,
-        seed_labels: torch.Tensor,
-        epoch: int,
-    ) -> torch.Tensor:
-        device = class_logits.device
-        p = torch.softmax(class_logits.float(), dim=1)           # (S, C) class pred
-        if epoch < self.warmup_epochs or family_logits is None:
-            # hard label during warmup -> identical to standard training
-            onehot = torch.zeros_like(p)
-            onehot[torch.arange(seed_labels.shape[0], device=device), seed_labels] = 1.0
-            return onehot
-
-        q = torch.softmax(family_logits.float(), dim=1)          # (S, F) family pred
-        e = self.evidence_by_flow.to(device)[seed_global_ids]    # (S, F) evidence
-
-        # Only flows that CARRY grounded evidence can be judged by Evidence-Prediction
-        # Contradiction. A flow with no matching evidence (e.g. volumetric DDoS / scan
-        # Recon flows, whose attacks leave no payload attack-token, or a non-attack
-        # class) is NOT gradable — it keeps beta=1 (full label trust) and is excluded
-        # from the EM fit, so it can never be wrongly dragged into the noisy cluster and
-        # relabeled. This confines the mechanism to the web-attack flows that actually
-        # have the label-pollution problem.
-        gradable = e.norm(dim=1) > 1e-8                          # (S,)
-        beta_batch = torch.ones(seed_labels.shape[0], device=device)
-        if bool(gradable.any()):
-            epc_g = evidence_prediction_contradiction(q[gradable], e[gradable])
-            beta_g = em_clean_confidence(epc_g, n_iter=self.em_iters).to(device)
-            beta_batch = beta_batch.clone()
-            beta_batch[gradable] = beta_g
-        # EMA-smooth beta per flow across epochs for stability
-        beta = self.beta_buffer.update(seed_global_ids, beta_batch).to(device)
-        return soft_relabel_target(seed_labels, p, beta, self.num_classes)
-
-
-__all__.append("NoiseRobustController")
-
-
 # Canonical MITRE evidence family order (must match graph_builder._EVIDENCE_FAMILIES
 # and the family-head column order).
 _FAMILY_ORDER: tuple[str, ...] = (
@@ -519,30 +335,12 @@ _FAMILY_ORDER: tuple[str, ...] = (
 )
 
 
-def build_noise_robust_controller(
-    *,
-    artifact,
-    num_classes: int,
-    label_mapping: dict[str, int],
-    warmup_epochs: int = 5,
-    ema_decay: float = 0.9,
-    mitre_dir: str = "data/mitre",
-) -> "NoiseRobustController":
-    """Assemble a :class:`NoiseRobustController` from a loaded graph artifact + MITRE CSVs.
-
-    Reads the flow->contains->packet edges and the 5 packet->evidence_{family}->technique
-    edges from the artifact to build the per-flow evidence table, and the
-    class_technique_map.csv + technique_family.csv to build the class->family map.
-    """
-    import csv as _csv
-    from pathlib import Path as _Path
-
-    family_to_col = {fam: i for i, fam in enumerate(_FAMILY_ORDER)}
-    num_families = len(_FAMILY_ORDER)
-
-    # --- per-flow evidence table from artifact edges ---
+def evidence_table_from_artifact(artifact) -> torch.Tensor:
+    """Per-flow, per-family MITRE evidence table (num_flows, 5) from a loaded
+    graph artifact (flow->contains->packet + packet->evidence_*->technique)."""
     ei = artifact.edge_index
     ea = artifact.edge_attr
+    family_to_col = {fam: i for i, fam in enumerate(_FAMILY_ORDER)}
     contains = torch.as_tensor(
         np.asarray(ei[("flow", "contains", "packet")], dtype=np.int64)
     )
@@ -552,20 +350,28 @@ def build_noise_robust_controller(
         if key not in ei:
             continue
         edge = np.asarray(ei[key], dtype=np.int64)
-        pkt_ids = torch.as_tensor(edge[0])                       # packet is src
+        pkt_ids = torch.as_tensor(edge[0])
         attr = ea.get(key)
         if attr is None:
             weights = torch.ones(pkt_ids.shape[0], dtype=torch.float32)
         else:
             attr = np.asarray(attr, dtype=np.float32).reshape(pkt_ids.shape[0], -1)
-            weights = torch.as_tensor(attr[:, 0])                # first attr col = weight
+            weights = torch.as_tensor(attr[:, 0])
         evidence_per_family[family_to_col[fam]] = (pkt_ids, weights)
     num_flows = int(artifact.node_features["flow"].shape[0])
-    evidence_by_flow = build_evidence_by_flow(
-        contains, evidence_per_family, num_flows, num_families
+    return build_evidence_by_flow(
+        contains, evidence_per_family, num_flows, len(_FAMILY_ORDER)
     )
 
-    # --- class -> family map from the two CSVs ---
+
+def class_to_family_from_csvs(
+    mitre_dir: str, label_mapping: dict[str, int], num_classes: int
+) -> torch.Tensor:
+    """class id -> dominant MITRE family column (or -1) from the two MITRE CSVs."""
+    import csv as _csv
+    from pathlib import Path as _Path
+
+    family_to_col = {fam: i for i, fam in enumerate(_FAMILY_ORDER)}
     mdir = _Path(mitre_dir)
     class_to_tech: dict[str, list[tuple[str, float]]] = {}
     ctm = mdir / "class_technique_map.csv"
@@ -588,18 +394,195 @@ def build_noise_robust_controller(
             f = (row.get("family") or "").strip()
             if t and f:
                 tech_to_family[t] = f
-    class_to_family = build_class_to_family(
+    return build_class_to_family(
         class_to_tech, tech_to_family, family_to_col, label_mapping, num_classes
     )
 
-    return NoiseRobustController(
-        evidence_by_flow=evidence_by_flow,
-        class_to_family=class_to_family,
+
+def soft_target_focal_loss(
+    logits: torch.Tensor,
+    soft_targets: torch.Tensor,
+    weight: torch.Tensor | None,
+    *,
+    loss_type: str = "ce",
+    label_smoothing: float = 0.0,
+    focal_gamma: float = 2.0,
+) -> torch.Tensor:
+    """Soft-target counterpart of the trainer's ``_compute_train_loss``.
+
+    Reduces EXACTLY to the hard-label focal loss when ``soft_targets`` is one-hot
+    (same smoothing blend, focal modulation, per-class alpha, mean reduction) —
+    so warmup epochs and non-suspect flows reproduce the baseline loss bit-for-bit.
+    The focal factor and alpha are keyed on the soft target's EXPECTATION::
+
+        p_t     = sum_c t_c * p_c
+        alpha_t = sum_c t_c * weight_c
+
+    so a flow whose target has shifted toward Benign is focal-weighted and
+    alpha-weighted as (mostly) a Benign sample, not as its polluted attack label.
+    (For ``loss_type='ce'`` with ``weight`` the reduction differs from
+    ``F.cross_entropy``'s weight-normalised mean; the trainer only routes
+    focal/cb_focal through here.)
+    """
+    log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+    if label_smoothing > 0.0:
+        uniform = torch.full_like(log_probs, 1.0 / log_probs.shape[-1])
+        t = (1.0 - label_smoothing) * soft_targets + label_smoothing * uniform
+    else:
+        t = soft_targets
+    ce = -(t * log_probs).sum(dim=-1)
+    if loss_type in ("focal", "cb_focal"):
+        p_t = (soft_targets * log_probs.exp()).sum(dim=-1)
+        ce = (1.0 - p_t).pow(focal_gamma) * ce
+    if weight is not None:
+        alpha_t = soft_targets @ weight.to(soft_targets.dtype)
+        ce = alpha_t * ce
+    return ce.mean()
+
+
+class EACSController:
+    """Evidence-Anchored Candidate-Set self-relabeling (design 2026-06-11).
+
+    Flow groups, precomputed once over ALL flows:
+      * suspect  — labeled with a polluted web class AND carrying no matching-family
+        MITRE evidence: the prime noise candidates. Candidate set {y, Benign}.
+      * anchor   — same classes WITH matching evidence: grounded true attacks,
+        beta=1 forever (they teach the model the real attack pattern).
+      * everything else — untouched, beta=1.
+
+    Per epoch after warmup, for suspect flows only::
+
+        beta_raw = p[y] / (p[y] + p[Benign])          # 2-way disambiguation
+        beta     = beta_raw^lam * consensus^(1-lam)   # optional neighbor modulation
+        beta     = EMA(beta)                          # per-flow, across epochs
+        target   = beta*onehot(y) + (1-beta)*onehot(Benign)
+
+    The candidate-set restriction structurally bounds confirmation bias: a suspect
+    can only move between its own label and Benign, never to a third class.
+    """
+
+    def __init__(
+        self,
+        *,
+        suspect_mask: torch.Tensor,
+        anchor_mask: torch.Tensor,
+        benign_class_id: int,
+        num_classes: int,
+        warmup_epochs: int = 5,
+        ema_decay: float = 0.9,
+        lambda_disambig: float = 0.7,
+    ) -> None:
+        self.suspect_mask = suspect_mask.to(torch.bool).cpu()
+        self.anchor_mask = anchor_mask.to(torch.bool).cpu()
+        self.benign_class_id = int(benign_class_id)
+        self.num_classes = int(num_classes)
+        self.warmup_epochs = int(warmup_epochs)
+        self.lambda_disambig = float(lambda_disambig)
+        self.beta_buffer = EMAConsensusBuffer(
+            num_flows=int(suspect_mask.shape[0]), decay=ema_decay, init=1.0
+        )
+        self._stats = self._fresh_stats()
+
+    @staticmethod
+    def _fresh_stats() -> dict:
+        return {"suspects_seen": 0, "relabeled": 0, "beta_sum": 0.0, "per_class": {}}
+
+    def epoch_stats(self, reset: bool = False) -> dict:
+        s = self._stats
+        out = {
+            "suspects_seen": s["suspects_seen"],
+            "relabeled": s["relabeled"],
+            "mean_beta": (s["beta_sum"] / s["suspects_seen"]) if s["suspects_seen"] else 1.0,
+            "per_class": dict(s["per_class"]),
+        }
+        if reset:
+            self._stats = self._fresh_stats()
+        return out
+
+    def soft_targets(
+        self,
+        class_logits: torch.Tensor,
+        seed_global_ids: torch.Tensor,
+        seed_labels: torch.Tensor,
+        epoch: int,
+        consensus: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """(S, C) soft training targets for the seed flows. Pure one-hot during
+        warmup and for every non-suspect row."""
+        device = class_logits.device
+        p = torch.softmax(class_logits.detach().float(), dim=1)
+        onehot = torch.zeros_like(p)
+        onehot[torch.arange(seed_labels.shape[0], device=device), seed_labels] = 1.0
+        if epoch <= self.warmup_epochs:
+            return onehot
+        sus = self.suspect_mask.to(device)[seed_global_ids]
+        if not bool(sus.any()):
+            return onehot
+        p_y = p.gather(1, seed_labels.view(-1, 1)).squeeze(1)
+        p_b = p[:, self.benign_class_id]
+        beta_raw = p_y / (p_y + p_b).clamp_min(1e-12)
+        if consensus is not None and self.lambda_disambig < 1.0:
+            lam = self.lambda_disambig
+            beta_raw = beta_raw.clamp(1e-8, 1.0).pow(lam) * (
+                consensus.to(device).to(beta_raw.dtype).clamp(1e-8, 1.0).pow(1.0 - lam)
+            )
+        sus_idx = torch.nonzero(sus, as_tuple=False).reshape(-1)
+        beta_sus = self.beta_buffer.update(
+            seed_global_ids[sus_idx], beta_raw[sus_idx]
+        ).to(device).to(p.dtype)
+        beta = torch.ones_like(beta_raw)
+        beta[sus_idx] = beta_sus
+        benign_onehot = torch.zeros_like(p)
+        benign_onehot[:, self.benign_class_id] = 1.0
+        targets = beta.unsqueeze(1) * onehot + (1.0 - beta).unsqueeze(1) * benign_onehot
+        targets = torch.where(sus.unsqueeze(1), targets, onehot)
+        # diagnostics
+        self._stats["suspects_seen"] += int(sus_idx.numel())
+        self._stats["relabeled"] += int((beta_sus < 0.5).sum().item())
+        self._stats["beta_sum"] += float(beta_sus.sum().item())
+        sus_labels = seed_labels[sus_idx]
+        for cid in sus_labels.unique().tolist():
+            pc = self._stats["per_class"].setdefault(int(cid), {"seen": 0, "relabeled": 0})
+            cmask = sus_labels == cid
+            pc["seen"] += int(cmask.sum().item())
+            pc["relabeled"] += int((beta_sus[cmask] < 0.5).sum().item())
+        return targets
+
+
+def build_eacs_controller(
+    *,
+    artifact,
+    num_classes: int,
+    label_mapping: dict[str, int],
+    suspect_classes: list[str],
+    warmup_epochs: int = 5,
+    ema_decay: float = 0.9,
+    lambda_disambig: float = 0.7,
+    mitre_dir: str = "data/mitre",
+) -> EACSController:
+    """Assemble an EACSController from a loaded graph artifact + MITRE CSVs."""
+    if "Benign" not in label_mapping:
+        raise ValueError("EACS requires a 'Benign' class in label_mapping")
+    evidence_by_flow = evidence_table_from_artifact(artifact)
+    class_to_family = class_to_family_from_csvs(mitre_dir, label_mapping, num_classes)
+    flow_labels = torch.as_tensor(np.asarray(artifact.flow_y, dtype=np.int64))
+    sus_ids = sorted(
+        label_mapping[c] for c in suspect_classes if c in label_mapping
+    )
+    if not sus_ids:
+        raise ValueError(f"none of suspect_classes {suspect_classes!r} in label_mapping")
+    in_suspect_class = torch.isin(flow_labels, torch.tensor(sus_ids, dtype=torch.long))
+    fam = class_to_family[flow_labels]
+    has_matching_ev = torch.zeros_like(in_suspect_class)
+    ok = fam >= 0
+    idx_ok = torch.arange(flow_labels.shape[0])[ok]
+    has_matching_ev[idx_ok] = evidence_by_flow[idx_ok, fam[ok]] > 0
+    return EACSController(
+        suspect_mask=in_suspect_class & ~has_matching_ev,
+        anchor_mask=in_suspect_class & has_matching_ev,
+        benign_class_id=int(label_mapping["Benign"]),
         num_classes=num_classes,
-        num_families=num_families,
         warmup_epochs=warmup_epochs,
         ema_decay=ema_decay,
+        lambda_disambig=lambda_disambig,
     )
-
-
-__all__.append("build_noise_robust_controller")
