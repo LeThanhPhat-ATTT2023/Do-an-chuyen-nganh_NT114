@@ -323,6 +323,67 @@ def test_controller_soft_targets_relabels_noisy_attack_flow() -> None:
     assert (targets[3:, 0] > targets[3:, 1]).all()
 
 
+def test_controller_keeps_label_when_no_evidence() -> None:
+    """A flow with NO matching evidence cannot be judged by Evidence-Prediction
+    Contradiction, so it must keep its given label (beta=1) — never get relabeled.
+
+    This is the fix for the regression where Recon/DDoS classes (which carry almost no
+    evidence edges) were wrongly dragged into the 'noisy' EM cluster and corrupted.
+    """
+    from graphslm_ids.offline.training.noise_consensus import NoiseRobustController
+
+    num_classes, num_families = 4, 2
+    class_to_family = torch.tensor([-1, 0, 1, 1])
+    # flow 0: attack class 3 (family 1) but ZERO evidence -> must keep label
+    # flow 1: attack class 3 (family 1) WITH family-1 evidence, but model predicts
+    #         family 0 (contradiction) -> may be relabeled
+    evidence_by_flow = torch.zeros((2, num_families))
+    evidence_by_flow[1, 1] = 1.0
+    ctrl = NoiseRobustController(
+        evidence_by_flow=evidence_by_flow, class_to_family=class_to_family,
+        num_classes=num_classes, num_families=num_families,
+        warmup_epochs=0, ema_decay=0.0,
+    )
+    seed_global_ids = torch.tensor([0, 1])
+    seed_labels = torch.tensor([3, 3])
+    family_logits = torch.tensor([[5.0, -5.0], [5.0, -5.0]])   # both predict family 0
+    class_logits = torch.tensor([[5.0, -5.0, -5.0, -5.0]] * 2)  # both predict class 0
+    targets = ctrl.soft_targets(class_logits, family_logits, seed_global_ids, seed_labels, epoch=5)
+    # flow 0 (no evidence) keeps its label class 3 -> target mass ~1 on class 3
+    assert targets[0, 3].item() == pytest.approx(1.0, abs=1e-4)
+
+
+def test_no_evidence_flows_excluded_from_em_even_amid_noisy_cluster() -> None:
+    """The real-scale failure: many no-evidence flows (correct labels, e.g. Recon/DDoS)
+    are batched with a clear clean/noisy EM split. The no-evidence ones must NOT be
+    pulled into the noisy cluster and relabeled — they keep beta=1 regardless of EM.
+    """
+    from graphslm_ids.offline.training.noise_consensus import NoiseRobustController
+
+    num_classes, num_families = 5, 2
+    class_to_family = torch.tensor([-1, 0, 0, 1, 1])
+    n = 12
+    evidence_by_flow = torch.zeros((n, num_families))
+    # flows 0-3: HAVE family-0 evidence (the gradable web-like flows)
+    evidence_by_flow[0:4, 0] = 1.0
+    # flows 4-11: NO evidence (Recon/DDoS-like, correct labels) -> must keep label
+    ctrl = NoiseRobustController(
+        evidence_by_flow=evidence_by_flow, class_to_family=class_to_family,
+        num_classes=num_classes, num_families=num_families,
+        warmup_epochs=0, ema_decay=0.0,
+    )
+    seed_global_ids = torch.arange(n)
+    seed_labels = torch.tensor([1, 1, 1, 1] + [3] * 8)
+    # gradable flows 0-1 agree (family0), 2-3 contradict (predict family1) -> EM split
+    fam = torch.tensor(
+        [[5.0, -5.0], [5.0, -5.0], [-5.0, 5.0], [-5.0, 5.0]] + [[-5.0, 5.0]] * 8
+    )
+    cls = torch.zeros(n, num_classes); cls[:, 0] = 5.0   # model predicts class 0 for all
+    targets = ctrl.soft_targets(cls, fam, seed_global_ids, seed_labels, epoch=5)
+    # every no-evidence flow (4-11) keeps its given label (class 3), full mass
+    assert (targets[4:, 3] > 0.99).all(), targets[4:, 3]
+
+
 def test_build_class_to_family_maps_via_technique() -> None:
     from graphslm_ids.offline.training.noise_consensus import build_class_to_family
 
