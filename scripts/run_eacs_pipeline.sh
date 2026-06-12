@@ -38,7 +38,7 @@ else
 fi
 
 echo "=== [2/4] artifact audit $(date) ==="
-python scripts/diagnostics/v3_artifact_audit.py "$OUT/graph.npz" 2>&1 | tee "$OUT/audit.log"
+python scripts/diagnostics/v3_artifact_audit.py --npz "$OUT/graph.npz" --pmi "$OUT/pmi_table.parquet" 2>&1 | tee "$OUT/audit.log"
 
 echo "=== [3/4] clean answer key (eval-only) $(date) ==="
 python scripts/tools/extract_clean_eval_labels.py \
