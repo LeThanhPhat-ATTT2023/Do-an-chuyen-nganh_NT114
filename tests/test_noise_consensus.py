@@ -21,6 +21,7 @@ import pytest
 import torch
 
 from graphslm_ids.offline.training.noise_consensus import (
+    EACSController,
     EMAConsensusBuffer,
     combine_clean_confidence,
     curriculum_weight,
@@ -296,3 +297,101 @@ def test_sample_weight_zero_drops_sample(loss_type: str) -> None:
         logits[:5], labels[:5], None, loss_type=loss_type,
     )
     assert weighted.item() == pytest.approx(sub.item(), abs=1e-5)
+
+
+# --------------------------------------------------------------------------- #
+# EACSController — evidence-anchored candidate-set self-relabeling (2026-06-11)
+# --------------------------------------------------------------------------- #
+def _make_eacs(num_flows: int = 8, **kw) -> "EACSController":
+    suspect = torch.zeros(num_flows, dtype=torch.bool)
+    suspect[1] = True
+    suspect[2] = True
+    anchor = torch.zeros(num_flows, dtype=torch.bool)
+    anchor[3] = True
+    defaults = dict(
+        suspect_mask=suspect,
+        anchor_mask=anchor,
+        benign_class_id=0,
+        num_classes=4,
+        warmup_epochs=2,
+        ema_decay=0.5,
+        lambda_disambig=1.0,
+    )
+    defaults.update(kw)
+    return EACSController(**defaults)
+
+
+def test_eacs_warmup_returns_pure_onehot_and_counts_nothing() -> None:
+    ctrl = _make_eacs()
+    logits = torch.randn(3, 4)
+    gids = torch.tensor([1, 2, 5])      # two suspects in the batch
+    labels = torch.tensor([2, 3, 1])
+    tgt = ctrl.soft_targets(logits, gids, labels, epoch=2)  # epoch <= warmup
+    expected = torch.zeros(3, 4)
+    expected[torch.arange(3), labels] = 1.0
+    assert torch.allclose(tgt, expected)
+    s = ctrl.epoch_stats()
+    assert s["suspects_seen"] == 0 and s["relabeled"] == 0
+    assert s["mean_beta"] == pytest.approx(1.0)
+
+
+def test_eacs_post_warmup_suspect_blends_only_within_candidate_set() -> None:
+    ctrl = _make_eacs()
+    # row0: suspect flow 1, label y=2, logits strongly favor Benign(0)
+    # row1: non-suspect flow 5, label 3 -> must stay hard one-hot
+    logits = torch.tensor([[5.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 5.0]])
+    gids = torch.tensor([1, 5])
+    labels = torch.tensor([2, 3])
+    tgt = ctrl.soft_targets(logits, gids, labels, epoch=3)
+    # suspect row: mass only on {y=2, benign=0}, sums to 1, beta < 0.5
+    assert tgt[0, 1].item() == pytest.approx(0.0)
+    assert tgt[0, 3].item() == pytest.approx(0.0)
+    assert tgt[0].sum().item() == pytest.approx(1.0)
+    assert tgt[0, 2].item() < 0.5 and tgt[0, 0].item() > 0.5
+    # non-suspect row untouched
+    assert torch.allclose(tgt[1], torch.tensor([0.0, 0.0, 0.0, 1.0]))
+    s = ctrl.epoch_stats()
+    assert s["suspects_seen"] == 1
+    assert s["relabeled"] == 1
+    assert s["per_class"] == {2: {"seen": 1, "relabeled": 1}}
+
+
+def test_eacs_anchor_keeps_hard_label_even_when_model_disagrees() -> None:
+    ctrl = _make_eacs()
+    # anchor flow 3 (has MITRE evidence): model prefers Benign but target stays y
+    logits = torch.tensor([[8.0, 0.0, 0.0, 0.0]])
+    tgt = ctrl.soft_targets(logits, torch.tensor([3]), torch.tensor([2]), epoch=3)
+    assert torch.allclose(tgt[0], torch.tensor([0.0, 0.0, 1.0, 0.0]))
+    assert ctrl.epoch_stats()["suspects_seen"] == 0
+
+
+def test_eacs_ema_blends_beta_across_epochs() -> None:
+    ctrl = _make_eacs()  # decay 0.5
+    gids = torch.tensor([1])
+    labels = torch.tensor([2])
+    # epoch 3: model confident in y -> beta1 ~ 1
+    hi = torch.tensor([[0.0, 0.0, 8.0, 0.0]])
+    b1 = ctrl.soft_targets(hi, gids, labels, epoch=3)[0, 2].item()
+    # epoch 4: model flips to Benign -> raw beta ~ 0, but EMA keeps half of b1
+    lo = torch.tensor([[8.0, 0.0, 0.0, 0.0]])
+    b2 = ctrl.soft_targets(lo, gids, labels, epoch=4)[0, 2].item()
+    raw2 = torch.softmax(lo.float(), 1)
+    raw2 = (raw2[0, 2] / (raw2[0, 2] + raw2[0, 0])).item()
+    assert b2 == pytest.approx(0.5 * b1 + 0.5 * raw2, abs=1e-5)
+    assert raw2 < b2 < b1  # smoothed, not jumping straight to the raw value
+
+
+def test_eacs_consensus_modulates_beta_when_lambda_below_one() -> None:
+    ctrl = _make_eacs(lambda_disambig=0.5)
+    logits = torch.tensor([[0.0, 0.0, 2.0, 0.0]])  # mildly favors y=2
+    gids = torch.tensor([1])
+    labels = torch.tensor([2])
+    # neighbors strongly disagree (consensus -> 0) -> beta drops vs consensus=1
+    t_low = ctrl.soft_targets(
+        logits, gids, labels, epoch=3, consensus=torch.tensor([1e-6])
+    )[0, 2].item()
+    ctrl2 = _make_eacs(lambda_disambig=0.5)
+    t_high = ctrl2.soft_targets(
+        logits, gids, labels, epoch=3, consensus=torch.tensor([1.0])
+    )[0, 2].item()
+    assert t_low < t_high
