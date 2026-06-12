@@ -2245,6 +2245,10 @@ def train_neighbor_sampling(
             "suspect_classes",
             ["CommandInjection", "XSS", "SqlInjection", "Uploading_Attack"],
         ))
+        _anchor_mask_npy = _nr_cfg.get("anchor_mask_npy")
+        _anchor_mask = (
+            np.load(_anchor_mask_npy) if _anchor_mask_npy else None
+        )
         noise_robust_ctrl = build_eacs_controller(
             artifact=backend.artifact,
             num_classes=num_classes,
@@ -2254,6 +2258,7 @@ def train_neighbor_sampling(
             ema_decay=float(_nr_cfg.get("ema_decay", 0.9)),
             lambda_disambig=float(_nr_cfg.get("lambda_disambig", 0.7)),
             mitre_dir=str(_nr_cfg.get("mitre_dir", "data/mitre")),
+            anchor_mask=_anchor_mask,
         )
         if rank == 0:
             print(
@@ -2261,6 +2266,7 @@ def train_neighbor_sampling(
                 f"ema_decay={_nr_cfg.get('ema_decay', 0.9)} "
                 f"lambda_disambig={noise_robust_ctrl.lambda_disambig} "
                 f"suspect_classes={_suspect_classes} "
+                f"anchor_source={'procedure-mask:' + str(_anchor_mask_npy) if _anchor_mask_npy else 'evidence-weight>0'} "
                 f"suspects={int(noise_robust_ctrl.suspect_mask.sum())} "
                 f"anchors={int(noise_robust_ctrl.anchor_mask.sum())}",
                 flush=True,

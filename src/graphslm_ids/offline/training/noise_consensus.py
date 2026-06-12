@@ -559,12 +559,18 @@ def build_eacs_controller(
     ema_decay: float = 0.9,
     lambda_disambig: float = 0.7,
     mitre_dir: str = "data/mitre",
+    anchor_mask: np.ndarray | None = None,
 ) -> EACSController:
-    """Assemble an EACSController from a loaded graph artifact + MITRE CSVs."""
+    """Assemble an EACSController from a loaded graph artifact + MITRE CSVs.
+
+    ``anchor_mask`` (bool, num_flows) overrides the default evidence-weight
+    anchor rule. The default — any matching-family MSEE weight > 0 — measures
+    16% precision against the clean answer key (5.4k background flows anchored
+    to wrong hard attack labels); a precomputed procedure-literal mask
+    (scripts/tools/extract_eacs_anchor_mask.py) measures 95% / recall ~1.0.
+    """
     if "Benign" not in label_mapping:
         raise ValueError("EACS requires a 'Benign' class in label_mapping")
-    evidence_by_flow = evidence_table_from_artifact(artifact)
-    class_to_family = class_to_family_from_csvs(mitre_dir, label_mapping, num_classes)
     flow_labels = torch.as_tensor(np.asarray(artifact.flow_y, dtype=np.int64))
     sus_ids = sorted(
         label_mapping[c] for c in suspect_classes if c in label_mapping
@@ -572,11 +578,23 @@ def build_eacs_controller(
     if not sus_ids:
         raise ValueError(f"none of suspect_classes {suspect_classes!r} in label_mapping")
     in_suspect_class = torch.isin(flow_labels, torch.tensor(sus_ids, dtype=torch.long))
-    fam = class_to_family[flow_labels]
-    has_matching_ev = torch.zeros_like(in_suspect_class)
-    ok = fam >= 0
-    idx_ok = torch.arange(flow_labels.shape[0])[ok]
-    has_matching_ev[idx_ok] = evidence_by_flow[idx_ok, fam[ok]] > 0
+    if anchor_mask is not None:
+        if anchor_mask.shape[0] != flow_labels.shape[0]:
+            raise ValueError(
+                f"anchor_mask has {anchor_mask.shape[0]} flows, artifact has "
+                f"{flow_labels.shape[0]}"
+            )
+        has_matching_ev = torch.as_tensor(np.asarray(anchor_mask, dtype=bool))
+    else:
+        evidence_by_flow = evidence_table_from_artifact(artifact)
+        class_to_family = class_to_family_from_csvs(
+            mitre_dir, label_mapping, num_classes
+        )
+        fam = class_to_family[flow_labels]
+        has_matching_ev = torch.zeros_like(in_suspect_class)
+        ok = fam >= 0
+        idx_ok = torch.arange(flow_labels.shape[0])[ok]
+        has_matching_ev[idx_ok] = evidence_by_flow[idx_ok, fam[ok]] > 0
     return EACSController(
         suspect_mask=in_suspect_class & ~has_matching_ev,
         anchor_mask=in_suspect_class & has_matching_ev,

@@ -395,3 +395,40 @@ def test_eacs_consensus_modulates_beta_when_lambda_below_one() -> None:
         logits, gids, labels, epoch=3, consensus=torch.tensor([1.0])
     )[0, 2].item()
     assert t_low < t_high
+
+
+def test_build_eacs_controller_with_precomputed_anchor_mask() -> None:
+    from graphslm_ids.offline.training.noise_consensus import build_eacs_controller
+
+    class _Art:  # minimal artifact stub: mask path never touches evidence
+        flow_y = np.array([0, 1, 1, 2, 1, 0])  # 0=Benign, 1=XSS, 2=other
+
+    label_mapping = {"Benign": 0, "XSS": 1, "Recon-OSScan": 2}
+    anchor = np.array([False, True, False, True, False, False])
+    ctrl = build_eacs_controller(
+        artifact=_Art(),
+        num_classes=3,
+        label_mapping=label_mapping,
+        suspect_classes=["XSS"],
+        anchor_mask=anchor,
+    )
+    # anchor applies only inside the suspect classes: flow1 (XSS, anchored);
+    # flow3 is anchored in the mask but not a suspect-class flow -> neither.
+    assert ctrl.anchor_mask.tolist() == [False, True, False, False, False, False]
+    assert ctrl.suspect_mask.tolist() == [False, False, True, False, True, False]
+
+
+def test_build_eacs_controller_anchor_mask_length_mismatch_raises() -> None:
+    from graphslm_ids.offline.training.noise_consensus import build_eacs_controller
+
+    class _Art:
+        flow_y = np.array([0, 1])
+
+    with pytest.raises(ValueError, match="anchor_mask"):
+        build_eacs_controller(
+            artifact=_Art(),
+            num_classes=2,
+            label_mapping={"Benign": 0, "XSS": 1},
+            suspect_classes=["XSS"],
+            anchor_mask=np.array([True]),
+        )
