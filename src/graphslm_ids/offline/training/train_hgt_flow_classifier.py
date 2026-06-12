@@ -905,6 +905,8 @@ def _compute_monitor_score(monitor: str, val_metrics: dict) -> float:
       - "val_balanced": 0.5·(accuracy + macro_f1) — optimizes BOTH jointly, so
         checkpoint selection prefers a model strong on majority AND minority.
       - "val_loss": negative validation loss (lower loss → higher score).
+      - "val_macro_f1_clean": macro-F1 vs the CLEAN answer key (LNL protocol);
+        NaN if no clean answer key is attached this epoch.
 
     NaN propagates (e.g. epoch-1 val skipped) and the caller's isnan guard
     handles it.
@@ -918,6 +920,11 @@ def _compute_monitor_score(monitor: str, val_metrics: dict) -> float:
     if monitor == "val_loss":
         vl = val_metrics.get("loss")
         return -(float(vl) if vl is not None else float("inf"))
+    if monitor == "val_macro_f1_clean":
+        clean = val_metrics.get("clean") if isinstance(val_metrics, dict) else None
+        if not clean or clean.get("macro_f1") is None:
+            return float("nan")
+        return float(clean["macro_f1"])
     raise ValueError(
         f"Unknown monitor metric {monitor!r}. Supported: "
         f"'val_macro_f1', 'val_accuracy', 'val_balanced', 'val_loss'."
@@ -1593,6 +1600,7 @@ def evaluate_neighbor_sampling(
     logit_adjustment: torch.Tensor | None = None,
     tau_norm_divisor: torch.Tensor | None = None,
     packet_store: "TieredFeatureStore | None" = None,
+    clean_labels: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     """Two paths:
       1. DDP (``is_ddp=True``): each rank evaluates its DistributedSampler shard,
@@ -1612,6 +1620,8 @@ def evaluate_neighbor_sampling(
     counts_acc = torch.zeros((num_classes, 4), dtype=torch.int64, device=device)
     counts_acc_adj = torch.zeros((num_classes, 4), dtype=torch.int64, device=device)
     counts_acc_tau = torch.zeros((num_classes, 4), dtype=torch.int64, device=device)
+    counts_acc_clean = torch.zeros((num_classes, 4), dtype=torch.int64, device=device)
+    n_clean_seen = 0
     loss_sum_t = torch.zeros(1, dtype=torch.float64, device=device)
     examples_t = torch.zeros(1, dtype=torch.int64, device=device)
     preds: list[np.ndarray] = []
@@ -1640,6 +1650,15 @@ def evaluate_neighbor_sampling(
                 loss_sum_t += loss.detach().to(torch.float64)
                 examples_t += seed_labels.numel()
                 _logits_raw = seed_logits.detach().float()
+                if clean_labels is not None:
+                    _gids = torch.as_tensor(
+                        np.asarray(batch.seed_flow_ids, dtype=np.int64)
+                    )
+                    _clean_y = clean_labels[_gids].to(device)
+                    counts_acc_clean += _per_class_counts_tensor(
+                        _logits_raw.argmax(dim=1), _clean_y, num_classes
+                    )
+                    n_clean_seen += int(seed_labels.numel())
                 counts_acc += _per_class_counts_tensor(_logits_raw.argmax(dim=1), seed_labels, num_classes)
                 if logit_adjustment is not None:
                     _logits_adj = _logits_raw - logit_adjustment.to(_logits_raw.device)
@@ -1683,6 +1702,12 @@ def evaluate_neighbor_sampling(
                     float(loss_sum_t.item()),
                     int(examples_t.item()),
                 )
+            if clean_labels is not None:
+                dist.all_reduce(counts_acc_clean, op=dist.ReduceOp.SUM)
+                metrics["clean"] = _metrics_from_counts(
+                    counts_acc_clean.cpu().numpy(), label_names, None,
+                    int(examples_t.item()),
+                )
             return metrics
         else:
             for i, batch in enumerate(loader, start=1):
@@ -1699,6 +1724,15 @@ def evaluate_neighbor_sampling(
                     loss = F.cross_entropy(seed_logits.float(), seed_labels, reduction="sum")
                 loss_sum += float(loss.item())
                 _logits_raw = seed_logits.detach().float()
+                if clean_labels is not None:
+                    _gids = torch.as_tensor(
+                        np.asarray(batch.seed_flow_ids, dtype=np.int64)
+                    )
+                    _clean_y = clean_labels[_gids].to(device)
+                    counts_acc_clean += _per_class_counts_tensor(
+                        _logits_raw.argmax(dim=1), _clean_y, num_classes
+                    )
+                    n_clean_seen += int(seed_labels.numel())
                 preds.append(_logits_raw.argmax(dim=1).cpu().numpy())
                 if logit_adjustment is not None:
                     _logits_adj = _logits_raw - logit_adjustment.to(_logits_raw.device)
@@ -1728,6 +1762,10 @@ def evaluate_neighbor_sampling(
         tau_np = np.concatenate(preds_tau) if preds_tau else np.empty((0,), dtype=np.int64)
         metrics["tau_normalized"] = metrics_from_predictions(
             tau_np, label_np, num_classes, label_names, loss_sum
+        )
+    if clean_labels is not None:
+        metrics["clean"] = _metrics_from_counts(
+            counts_acc_clean.cpu().numpy(), label_names, None, int(n_clean_seen),
         )
     return metrics
 
@@ -1892,7 +1930,14 @@ def train_neighbor_sampling(
     # flow's MITRE attack family for the Evidence-Prediction Contradiction signal.
     _nr_cfg = config["train"].get("noise_robust") or {}
     _nr_enabled = bool(_nr_cfg.get("enabled", False))
-    _nr_num_families = 5 if _nr_enabled else 0
+    _nr_mode = str(_nr_cfg.get("mode", "eacs")).lower()
+    if _nr_enabled and _nr_mode != "eacs":
+        raise ValueError(
+            f"train.noise_robust.mode={_nr_mode!r} unsupported — the EPC/EM path "
+            "was removed (measured harmful, see 2026-06-11 EACS design). Use 'eacs'."
+        )
+    # EACS does not use the auxiliary family head (EPC removed).
+    _nr_num_families = 0
     raw_model = HeteroGraphTransformer(
         node_input_dims=node_input_dims,
         edge_types=edge_types,
@@ -2161,47 +2206,72 @@ def train_neighbor_sampling(
     best_checkpoint = output_dir / "hgt_flow_best.pt"
     label_names = label_name_mapping(backend.manifest, labels_np)
 
+    # Eval-only CLEAN answer key (standard LNL protocol: train on noisy labels,
+    # grade on clean ones). Never enters the training loss.
+    clean_eval_labels_t: torch.Tensor | None = None
+    _clean_eval_path = config["train"].get("clean_eval_labels")
+    if _clean_eval_path:
+        if not hasattr(backend, "artifact"):
+            raise ValueError(
+                "train.clean_eval_labels requires the in-memory v3 backend "
+                "(backend.artifact is missing on this backend type)."
+            )
+        _cl = np.load(_clean_eval_path)
+        _n_flows_total = int(np.asarray(backend.artifact.flow_y).shape[0])
+        if int(_cl.shape[0]) != _n_flows_total:
+            raise ValueError(
+                f"clean_eval_labels has {_cl.shape[0]} rows but the artifact has "
+                f"{_n_flows_total} flows — wrong answer key for this graph."
+            )
+        clean_eval_labels_t = torch.as_tensor(np.asarray(_cl, dtype=np.int64))
+        if rank == 0:
+            _n_diff = int((np.asarray(_cl) != np.asarray(backend.artifact.flow_y)).sum())
+            print(
+                f"[clean_eval] answer key loaded from {_clean_eval_path} "
+                f"({_n_diff} flows differ from the noisy labels)",
+                flush=True,
+            )
+
     # Noise-robust self-learning controller (config-gated). Built here, after
     # label_names exists. Assembles the per-flow MITRE evidence table + class->family
     # map once; soft_targets() is called each train step.
-    _family_supervision_loss = None
     if _nr_enabled:
-        # The noise-robust train-step reads the flow embedding from x_dict, which is
-        # only populated on the gcl_enabled code path. Fail loudly rather than silently
-        # training plain hard-label loss while the [noise_robust] banner claims it's on.
-        if not gcl_enabled:
-            raise ValueError(
-                "train.noise_robust.enabled requires train.gcl_enabled=true "
-                "(the noise-robust step needs the flow embedding produced on the GCL "
-                "encode path). Set gcl_enabled: true or disable noise_robust."
-            )
         from graphslm_ids.offline.training.noise_consensus import (
-            build_noise_robust_controller,
-            family_supervision_loss as _family_supervision_loss,
+            build_eacs_controller,
+            neighbor_consensus,
+            soft_target_focal_loss,
         )
-        noise_robust_ctrl = build_noise_robust_controller(
+        _suspect_classes = list(_nr_cfg.get(
+            "suspect_classes",
+            ["CommandInjection", "XSS", "SqlInjection", "Uploading_Attack"],
+        ))
+        noise_robust_ctrl = build_eacs_controller(
             artifact=backend.artifact,
             num_classes=num_classes,
             label_mapping={v: k for k, v in label_names.items()},
+            suspect_classes=_suspect_classes,
             warmup_epochs=int(_nr_cfg.get("warmup_epochs", 5)),
             ema_decay=float(_nr_cfg.get("ema_decay", 0.9)),
+            lambda_disambig=float(_nr_cfg.get("lambda_disambig", 0.7)),
             mitre_dir=str(_nr_cfg.get("mitre_dir", "data/mitre")),
         )
         if rank == 0:
-            _nf_attack = int((noise_robust_ctrl.class_to_family >= 0).sum().item())
             print(
-                f"[noise_robust] ENABLED warmup={_nr_cfg.get('warmup_epochs', 5)} "
-                f"ema_decay={_nr_cfg.get('ema_decay', 0.9)} families=5 "
-                f"attack_classes_mapped={_nf_attack} "
-                f"(Evidence-Prediction Contradiction + soft-relabel)",
+                f"[noise_robust] ENABLED mode=eacs warmup={noise_robust_ctrl.warmup_epochs} "
+                f"ema_decay={_nr_cfg.get('ema_decay', 0.9)} "
+                f"lambda_disambig={noise_robust_ctrl.lambda_disambig} "
+                f"suspect_classes={_suspect_classes} "
+                f"suspects={int(noise_robust_ctrl.suspect_mask.sum())} "
+                f"anchors={int(noise_robust_ctrl.anchor_mask.sum())}",
                 flush=True,
             )
 
     monitor = str(config["train"]["monitor"])
-    if monitor not in {"val_macro_f1", "val_accuracy", "val_balanced", "val_loss"}:
+    if monitor not in {"val_macro_f1", "val_accuracy", "val_balanced", "val_loss", "val_macro_f1_clean"}:
         raise ValueError(
             f"Unknown monitor metric {monitor!r}. Supported: "
-            f"'val_macro_f1', 'val_accuracy', 'val_balanced', 'val_loss'."
+            f"'val_macro_f1', 'val_accuracy', 'val_balanced', 'val_loss', "
+            f"'val_macro_f1_clean'."
         )
     log_every = max(1, int(config["train"]["log_every"]))
     use_amp, amp_dtype = resolve_amp(config, device)
@@ -2319,47 +2389,41 @@ def train_neighbor_sampling(
                     logits = model(nf, ei, edge_weight_dict=ew)
                     x_dict = None
                 seed_logits = logits[sm].float()
-                # Noise-robust self-learning: replace the hard-label loss with a
-                # soft-relabel target the model derives this epoch from Evidence-
-                # Prediction Contradiction (warmup epochs fall back to the hard label
-                # inside the controller, so early training is unchanged).
-                if noise_robust_ctrl is not None and x_dict is not None:
-                    family_logits = (
-                        raw_model.family_head(x_dict["flow"])[sm].float()
-                        if raw_model.family_head is not None else None
-                    )
+                # EACS noise-robust self-learning: suspect flows (web-attack label,
+                # no MITRE evidence) get a soft target inside {y, Benign}; anchors
+                # and all other flows keep the hard label. Warmup epochs return pure
+                # one-hot, so early training matches the baseline exactly.
+                if noise_robust_ctrl is not None:
                     _seed_gids = torch.as_tensor(
                         np.asarray(batch.seed_flow_ids, dtype=np.int64), device=device
                     )
+                    _cons = None
+                    if noise_robust_ctrl.lambda_disambig < 1.0:
+                        _ff_parts = []
+                        for _ff_key in (
+                            ("flow", "burst_neighbor", "flow"),
+                            ("flow", "rev_burst_neighbor", "flow"),
+                        ):
+                            _ff = ei.get(_ff_key)
+                            if _ff is not None and _ff.numel() > 0:
+                                _ff_parts.append(_ff)
+                        if _ff_parts:
+                            _seed_idx_local = torch.nonzero(sm, as_tuple=False).reshape(-1)
+                            _cons = neighbor_consensus(
+                                torch.softmax(logits.detach().float(), dim=1),
+                                torch.cat(_ff_parts, dim=1),
+                                _seed_idx_local,
+                                sl,
+                            )
                     soft_tgt = noise_robust_ctrl.soft_targets(
-                        seed_logits, family_logits, _seed_gids, sl, epoch=epoch,
+                        seed_logits, _seed_gids, sl, epoch=epoch, consensus=_cons,
                     )
-                    # Soft-relabel cross-entropy, matching _compute_train_loss EXACTLY
-                    # except for the soft target — keeps focal modulation, per-class
-                    # weight (alpha_t), label_smoothing, and the SAME reduction
-                    # (mean over the alpha-weighted per-sample loss), so enabling
-                    # noise_robust does not change the loss scale / effective LR vs the
-                    # baseline. This preserves a fair A/B and an unchanged warmup phase.
-                    _logp = F.log_softmax(seed_logits, dim=1)
-                    if label_smoothing > 0.0:
-                        # blend the soft target toward uniform, as label smoothing does
-                        _uniform = torch.full_like(_logp, 1.0 / _logp.shape[1])
-                        _tgt = (1.0 - label_smoothing) * soft_tgt + label_smoothing * _uniform
-                    else:
-                        _tgt = soft_tgt
-                    _ce = -(_tgt * _logp).sum(dim=1)                      # (S,) per-sample
-                    if loss_type in ("focal", "cb_focal"):
-                        _p_t = _logp.gather(1, sl.unsqueeze(1)).squeeze(1).exp()
-                        _ce = (1.0 - _p_t).pow(focal_gamma) * _ce
-                    if weight is not None:
-                        _ce = weight.gather(0, sl) * _ce                  # alpha_t, as in focal
-                    primary_loss = _ce.mean()                            # same reduction as baseline
-                    # BUG #1 fix: train the family head with grounded-evidence weak labels
-                    # so q is meaningful and EPC is a real signal (not noise).
-                    if family_logits is not None and _family_supervision_loss is not None:
-                        _ev = noise_robust_ctrl.batch_evidence(_seed_gids, device)
-                        _fam_loss = _family_supervision_loss(family_logits, _ev)
-                        primary_loss = primary_loss + 0.3 * _fam_loss
+                    primary_loss = soft_target_focal_loss(
+                        seed_logits, soft_tgt, weight,
+                        loss_type=loss_type,
+                        label_smoothing=label_smoothing,
+                        focal_gamma=focal_gamma,
+                    )
                 else:
                     primary_loss = _compute_train_loss(
                         seed_logits, sl, weight,
@@ -2738,6 +2802,7 @@ def train_neighbor_sampling(
                 logit_adjustment=eval_logit_adjustment,
                 tau_norm_divisor=_tau_div,
                 packet_store=packet_store,
+                clean_labels=clean_eval_labels_t,
             )
         else:
             val_metrics = {
@@ -2786,6 +2851,17 @@ def train_neighbor_sampling(
                 f"augmented={_hgaa_snap['augmented']} "
                 f"aug_rate={_hgaa_snap['aug_rate']:.3f} "
                 f"op_counts={_hgaa_snap['op_counts']}",
+                flush=True,
+            )
+        if noise_robust_ctrl is not None and rank == 0:
+            _es = noise_robust_ctrl.epoch_stats(reset=True)
+            _pc_named = {
+                label_names.get(cid, str(cid)): v for cid, v in _es["per_class"].items()
+            }
+            print(
+                f"[eacs] epoch={epoch} suspects_seen={_es['suspects_seen']} "
+                f"mean_beta={_es['mean_beta']:.3f} relabeled={_es['relabeled']} "
+                f"per_class={_pc_named}",
                 flush=True,
             )
         _wandb_log(entry, use_wandb)
@@ -2852,10 +2928,15 @@ def train_neighbor_sampling(
                 f" | TauNorm: val_acc={_tn['accuracy']:.4f} val_macro_f1={_tn['macro_f1']:.4f}"
                 if isinstance(_tn, dict) else ""
             )
+            _cl = val_metrics.get("clean") if isinstance(val_metrics, dict) else None
+            _cl_str = (
+                f" | CLEAN: val_acc={_cl['accuracy']:.4f} val_macro_f1_clean={_cl['macro_f1']:.4f}"
+                if isinstance(_cl, dict) and _cl.get("macro_f1") is not None else ""
+            )
             print(
                 f"Epoch {epoch:03d} | loss={_loss:.4f} {_train_acc_str}"
                 f"val_acc={val_metrics['accuracy']:.4f} "
-                f"val_macro_f1={val_metrics['macro_f1']:.4f}{_la_str}{_tn_str} "
+                f"val_macro_f1={val_metrics['macro_f1']:.4f}{_la_str}{_tn_str}{_cl_str} "
                 f"avg_flow_nodes={avg_nodes.get('flow', 0.0):.1f} "
                 f"avg_packet_nodes={avg_nodes.get('packet', 0.0):.1f}"
             )
@@ -2917,6 +2998,7 @@ def train_neighbor_sampling(
             logit_adjustment=eval_logit_adjustment,
             tau_norm_divisor=_tau_norm_divisor(state_holder.classifier, tau_norm),
             packet_store=packet_store,
+            clean_labels=clean_eval_labels_t,
         )
         device_str = f"{device} x{world_size}" if is_ddp else str(device)
         summary = {
@@ -2942,6 +3024,22 @@ def train_neighbor_sampling(
             "history": history,
         }
         write_json(output_dir / "training_summary.json", summary)
+        if noise_robust_ctrl is not None and clean_eval_labels_t is not None:
+            # Headline detector metric: did the model self-discover the noise?
+            # Oracle = clean answer key disagrees with the noisy label. Score = 1-beta.
+            # Restricted to TRAIN-seen suspect flows (beta_buffer.seen).
+            from sklearn.metrics import roc_auc_score
+            _sus_np = noise_robust_ctrl.suspect_mask.cpu().numpy()
+            _seen_np = noise_robust_ctrl.beta_buffer.seen.cpu().numpy()
+            _beta_np = noise_robust_ctrl.beta_buffer.values.cpu().numpy()
+            _flow_y_np = np.asarray(backend.artifact.flow_y, dtype=np.int64)
+            _oracle = clean_eval_labels_t.cpu().numpy() != _flow_y_np
+            _m = _sus_np & _seen_np
+            _det: dict[str, Any] = {"n_scored": int(_m.sum())}
+            if _m.any() and len(np.unique(_oracle[_m])) == 2:
+                _det["roc_auc"] = float(roc_auc_score(_oracle[_m], 1.0 - _beta_np[_m]))
+            print(f"[eacs] noise-detection vs oracle: {_det}", flush=True)
+            write_json(output_dir / "eacs_noise_detection.json", _det)
         print(f"[OK] Best checkpoint: {best_checkpoint}")
         print(f"[OK] Training summary: {output_dir / 'training_summary.json'}")
     _wandb_finish(use_wandb)
