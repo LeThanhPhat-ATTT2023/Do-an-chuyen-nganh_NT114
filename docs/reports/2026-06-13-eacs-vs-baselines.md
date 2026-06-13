@@ -17,11 +17,27 @@ self-relabels using MITRE evidence + the model's own predictions only.
 
 | Model | noisy | clean (raw) | clean (calibrated) | noisy − clean |
 |---|---|---|---|---|
-| GNN4ID (retrained on v3 dist.) | **0.8588** | 0.7294 | — | **+0.129** |
-| HGT de-inflated (no EACS) | 0.8520 | 0.7224 | 0.7753 | **+0.130** |
+| XGBoost (flow features, tabular) | **1.0000** | 0.7626 | — | **+0.237** |
+| GNN4ID (retrained on v3 dist.) | 0.8588 | 0.7294 | — | +0.129 |
+| HGT de-inflated (no EACS) | 0.8520 | 0.7224 | 0.7753 | +0.130 |
 | **HGT + EACS v2** | 0.7228 | **0.8582** | 0.8518 | **−0.135** |
 
 VAL-split clean macro for EACS v2: **0.8856 raw → 0.9269 calibrated**.
+
+**XGBoost is the cleanest demonstration of the whole thesis.** A tabular
+gradient-boosted-tree model over only the 79 flow features reaches a *perfect*
+noisy macro-F1 of **1.0000** — every class, including the four polluted web
+classes (CmdInj/XSS/SQLi/Upload all 1.000). Published as-is on the noisy
+benchmark it would look like flawless SOTA. But it is the **worst noise
+memorizer of all**: clean macro 0.7626, the largest noisy−clean gap (+0.237).
+With a random split over per-pcap labels, each campaign's behavioural
+fingerprint leaks train→test, and an unregularized tree ensemble memorizes
+"which pcap a flow came from" exactly — so it reproduces the *label noise*
+perfectly. Memorization scales with tabular capacity: XGBoost (1.000) > graph
+models (0.85) > EACS, the only model that *refuses* to memorize (0.72 noisy /
+0.86 clean). This is also the strongest motivation for the temporal split,
+which breaks the campaign-fingerprint leakage that inflates the random-split
+numbers.
 
 ### Reading the sign of (noisy − clean)
 
@@ -41,14 +57,17 @@ graded on the clean key (107 true attacks among 21,186 test flows):
 
 | Model | TP | FP | FN | recall | precision | F1 |
 |---|---|---|---|---|---|---|
+| XGBoost (tabular) | 107 | **1426** | 0 | 1.000 | 0.070 | 0.130 |
 | HGT de-inflated | 106 | **1667** | 1 | 0.991 | 0.060 | 0.113 |
 | **HGT + EACS v2** | 106 | **42** | 1 | 0.991 | **0.716** | **0.831** |
 
-Both models **find** the attacks (identical recall: 106/107, one miss). The
-difference is false alarms: the de-inflated model flags **1,667** benign flows as
-web attacks because it learned "anything resembling the XSS/SQLi campaign = attack";
-EACS flags **42**. A **97.5 % reduction in false positives at equal recall** — the
-operational value a SOC actually feels.
+Every model **finds** the attacks (recall ≈ 1.0). The difference is false alarms:
+XGBoost and the de-inflated HGT flag **1,426** and **1,667** benign flows as web
+attacks because they learned "anything resembling the XSS/SQLi campaign = attack";
+EACS flags **42**. A **~97 % reduction in false positives at equal recall** — the
+operational value a SOC actually feels. XGBoost's clean web precision of 0.070
+(107 real attacks among 1,533 flagged) is the per-class face of its perfect-but-
+hollow noisy score.
 
 ## Self-supervision quality (no answer-key peeking)
 
