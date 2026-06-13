@@ -1,0 +1,67 @@
+{
+  "experiment": "gnn4id_on_v3_imbalanced_distribution_CLEAN_regrade",
+  "split": "random",
+  "checkpoint": "baselines/gnn4id/outputs/outputs_v1/checkpoint_imbalanced.pt",
+  "noisy_macro_f1_reproduced": 0.8588,
+  "noisy_macro_f1_published": 0.8588,
+  "clean_macro_f1": 0.7294,
+  "clean_accuracy": 0.8688,
+  "clean_weighted_f1": 0.8838,
+  "clean_per_class_f1": {
+    "Backdoor_Malware": 0.7572,
+    "Benign": 0.3663,
+    "BrowserHijacking": 0.8909,
+    "CommandInjection": 0.0,
+    "DDoS-ACK_Fragmentation": 0.9965,
+    "DDoS-ICMP_Flood": 1.0,
+    "DDoS-ICMP_Fragmentation": 0.9534,
+    "DDoS-PSHACK_Flood": 0.9981,
+    "DDoS-RSTFINFlood": 0.9984,
+    "Mirai-udpplain": 0.9895,
+    "Recon-HostDiscovery": 0.9747,
+    "Recon-OSScan": 0.96,
+    "Recon-PingSweep": 0.9982,
+    "Recon-PortScan": 0.9724,
+    "SqlInjection": 0.2654,
+    "Uploading_Attack": 0.0153,
+    "VulnerabilityScan": 0.9782,
+    "XSS": 0.0149
+  },
+  "clean_per_class_support": {
+    "Backdoor_Malware": 455,
+    "Benign": 2737,
+    "BrowserHijacking": 486,
+    "CommandInjection": 18,
+    "DDoS-ACK_Fragmentation": 2434,
+    "DDoS-ICMP_Flood": 35,
+    "DDoS-ICMP_Fragmentation": 94,
+    "DDoS-PSHACK_Flood": 2434,
+    "DDoS-RSTFINFlood": 2434,
+    "Mirai-udpplain": 48,
+    "Recon-HostDiscovery": 2434,
+    "Recon-OSScan": 1603,
+    "Recon-PingSweep": 273,
+    "Recon-PortScan": 2417,
+    "SqlInjection": 141,
+    "Uploading_Attack": 7,
+    "VulnerabilityScan": 1609,
+    "XSS": 10
+  },
+  "demoted_per_class": {
+    "XSS": 578,
+    "SqlInjection": 724,
+    "CommandInjection": 604,
+    "Uploading_Attack": 217
+  },
+  "unidentifiable_per_class": {
+    "XSS": 3,
+    "CommandInjection": 3,
+    "SqlInjection": 2
+  },
+  "attack_port_pairs_per_class": {
+    "CommandInjection": 81,
+    "SqlInjection": 917,
+    "Uploading_Attack": 29,
+    "XSS": 47
+  }
+}
