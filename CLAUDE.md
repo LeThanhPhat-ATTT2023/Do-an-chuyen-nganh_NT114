@@ -2,8 +2,14 @@
 
 A heterogeneous-graph intrusion detection system on CIC-IoT-2023-style traffic.
 Raw PCAPs → an evidence-grounded knowledge graph (flow / packet / host / technique /
-tactic nodes) → an HGT flow classifier trained with a GCL auxiliary loss, evaluated
-on **both** random and temporal splits.
+tactic nodes) → an HGT flow classifier trained with a GCL auxiliary loss **and an
+EACS noise-robust self-relabeling controller**, evaluated on **both** random and
+temporal splits **and** on a signature-isolated clean answer key (LNL protocol).
+
+Current artifact: **`v3_ob`** (ordered-byte graph, **18 classes**, 211,851 flows).
+The headline result is the **sign of (noisy − clean) macro-F1**: every baseline
+memorizes the dataset's per-pcap label noise (positive gap), only HGT+EACS filters
+it (negative gap). See `docs/reports/2026-06-13-eacs-vs-baselines.md`.
 
 ## Python environment (USE THIS)
 - Dedicated venv: **`D:\v\nt114`** (Windows).
@@ -14,13 +20,14 @@ on **both** random and temporal splits.
 - Machine: 16 logical CPUs, ~16 GB RAM. CPU-only torch locally; full HGT training runs on a remote L40S (48 GB) VM.
 
 ## Local data
-- `data/raw/14gb/<class>/*.pcap` — 13 PCAPs (5.6 GB total), one per attack class.
+- `data/raw/<class>/*.pcap` — 18 PCAPs, one per attack class.
 - `data/mitre/` — MITRE ATT&CK CSVs + STIX `enterprise-attack.json` (technique embeddings, technique↔tactic edges, class→technique map, technique families).
-- `outputs/v3/graph.npz` (+ `graph.meta.json`, `splits.json`, `pmi_table.parquet`) — the built graph artifact (gitignored).
+- `outputs/v3_ob/graph.npz` (+ `graph.meta.json`, `splits.json`, `pmi_table.parquet`) — the current built graph artifact (gitignored).
+- `outputs/v3_ob/clean_eval_labels.npy` + `eacs_anchor_mask.npy` — eval-only clean answer key and EACS anchor mask (built from pcaps via `scripts/tools/`).
 
-Dataset: CIC-IoT-2023 style, **13 classes**, ~612k bidirectional flows / ~600k packet nodes (control packets kept). Labels assigned per-PCAP-file via `infer_label_from_path`.
+Dataset: CIC-IoT-2023 style, **18 classes**, **211,851 bidirectional flows** (`v3_ob`), control packets kept. Labels assigned per-PCAP-file via `infer_label_from_path` — this per-capture labeling is the source of the asymmetric label noise on the 4 web-attack classes (CommandInjection / XSS / SqlInjection / Uploading_Attack), quantified at 14,276 flows by the clean key.
 
-`packet_x` (the dominant feature array, `(n_packets, 2323)`) is stored on disk as **float16** to halve footprint; the loader upcasts to float32 by default (or keeps float16 with `packet_dtype="preserve"`). See the tiered feature store below.
+`packet_x` (the dominant packet feature array) is stored on disk as **float16** to halve footprint; the loader upcasts to float32 by default (or keeps float16 with `packet_dtype="preserve"`). See the tiered feature store below.
 
 ## Preprocessing pipeline — Smart-BOTH Hybrid
 
@@ -41,7 +48,8 @@ One flat package: `src/graphslm_ids/offline/preprocessing/`. End-to-end on local
 11. `cli.py` — single-command orchestrator (local CPU).
 
 Then training + eval:
-- `training/train_hgt_flow_classifier.py` — reads `data.artifact_version: v3`, calls `load_v3_artifact()`, adds a **GCL auxiliary loss** with positive pairs from the class→technique map.
+- `training/train_hgt_flow_classifier.py` — reads `data.artifact_version: v3`, calls `load_v3_artifact()`, adds a **GCL auxiliary loss** (positive pairs from the class→technique map) and an optional **EACS** controller (`train.noise_robust.mode: eacs`): suspect web-attack flows without matching MITRE evidence get a model-driven soft target in `{own label, Benign}`; evidence-anchored true attacks (`eacs_anchor_mask.npy`) and all other classes keep hard labels.
+- `scripts/eval/calibrate_thresholds.py` — grade a checkpoint on **both** noisy and clean labels, compute the web-binary metric, calibrate a per-class additive logit bias on clean VAL and apply to TEST (decision-rule only, no retrain/relabel).
 - `scripts/eval/v3_eval_both_splits.py` — run the identical model on random + temporal splits, report the GAP.
 
 ### Design principles (do not deviate)
@@ -64,39 +72,59 @@ Both are config-gated and OFF by default (`feature_store.enabled`, `gpu_sampling
 
 ### Run commands
 ```bat
-:: Build the graph artifact (local CPU, ~2.5 hours)
+:: Build the graph artifact (local CPU)
 D:\v\nt114\Scripts\python.exe -m graphslm_ids.offline.preprocessing.cli ^
-  --raw-root data/raw/14gb ^
-  --out-npz outputs/v3/graph.npz ^
-  --out-meta outputs/v3/graph.meta.json ^
-  --pmi-table outputs/v3/pmi_table.parquet ^
-  --pmi-meta outputs/v3/pmi.meta.json ^
-  --splits-json outputs/v3/splits.json ^
+  --raw-root data/raw ^
+  --out-npz outputs/v3_ob/graph.npz ^
+  --out-meta outputs/v3_ob/graph.meta.json ^
+  --pmi-table outputs/v3_ob/pmi_table.parquet ^
+  --pmi-meta outputs/v3_ob/pmi.meta.json ^
+  --splits-json outputs/v3_ob/splits.json ^
   --pmi-subsample-per-class 25000 ^
   --temporal-train-frac 0.80 ^
   --temporal-val-frac 0.10
 
 :: Sanity audit BEFORE upload
-D:\v\nt114\Scripts\python.exe scripts/diagnostics/v3_artifact_audit.py outputs/v3/graph.npz
+D:\v\nt114\Scripts\python.exe scripts/diagnostics/v3_artifact_audit.py outputs/v3_ob/graph.npz
+
+:: Build eval-only clean answer key + EACS anchor mask (need pcaps)
+D:\v\nt114\Scripts\python.exe scripts/tools/extract_clean_eval_labels.py ^
+  --graph-meta outputs/v3_ob/graph.meta.json --raw-root data/raw ^
+  --out-npy outputs/v3_ob/clean_eval_labels.npy --out-audit outputs/v3_ob/clean_eval_labels.audit.json
+D:\v\nt114\Scripts\python.exe scripts/tools/extract_eacs_anchor_mask.py ^
+  --graph-meta outputs/v3_ob/graph.meta.json --raw-root data/raw ^
+  --out-npy outputs/v3_ob/eacs_anchor_mask.npy --out-audit outputs/v3_ob/anchor.audit.json
 
 :: (Optional) downcast an existing fp32 artifact to fp16 without rebuilding
-D:\v\nt114\Scripts\python.exe scripts/tools/downcast_packet_x.py outputs/v3/graph.npz outputs/v3/graph.npz
+D:\v\nt114\Scripts\python.exe scripts/tools/downcast_packet_x.py outputs/v3_ob/graph.npz outputs/v3_ob/graph.npz
 
 :: Smoke train HGT on CPU (verify trainer integration)
 D:\v\nt114\Scripts\python.exe -m graphslm_ids.offline.training.train_hgt_flow_classifier ^
-  --config configs/eg_hgt.yaml --device cpu --epochs 2
+  --config configs/eg_hgt_v6_ob_eacs_v2.yaml --device cpu --epochs 2
 
-:: Eval both splits AFTER server training
+:: Train HGT + EACS v2 on the server
+D:\v\nt114\Scripts\python.exe -m graphslm_ids.offline.training.train_hgt_flow_classifier ^
+  --config configs/eg_hgt_v6_ob_eacs_v2.yaml --device cuda
+
+:: Grade noisy + clean (+ calibration on clean val) AFTER training
+D:\v\nt114\Scripts\python.exe scripts/eval/calibrate_thresholds.py ^
+  --config configs/eg_hgt_v6_ob_eacs_v2.yaml ^
+  --checkpoint outputs/v3_ob_eacs_v2/hgt_flow_best.pt ^
+  --training-summary outputs/v3_ob_eacs_v2/training_summary.json ^
+  --clean-labels outputs/v3_ob/clean_eval_labels.npy ^
+  --out outputs/v3_ob_eacs_v2/confusion_calibrated.json --device cuda
+
+:: Eval both splits (Smart-BOTH gap)
 D:\v\nt114\Scripts\python.exe scripts/eval/v3_eval_both_splits.py ^
-  --checkpoint-random outputs/v3/checkpoint_random.pt ^
-  --checkpoint-temporal outputs/v3/checkpoint_temporal.pt ^
-  --graph outputs/v3/graph.npz
+  --checkpoint-random outputs/v3_ob_eacs_v2/hgt_flow_best.pt ^
+  --checkpoint-temporal outputs/v3_ob_eacs_v2_temporal/hgt_flow_best.pt ^
+  --graph outputs/v3_ob/graph.npz
 
 :: All unit tests
 D:\v\nt114\Scripts\python.exe -m pytest tests/ -q
 ```
 
-To enable the tiered feature store on the L40S, add to `configs/eg_hgt.yaml`:
+The tiered feature store is already enabled in `configs/eg_hgt_v6_ob_eacs_v2.yaml`. To enable it in another config, add:
 ```yaml
 feature_store:
   enabled: true
@@ -115,10 +143,11 @@ v1 HGT plateaued at macro-F1 ≈ 0.12. Root cause was the input pipeline, not th
 The current pipeline fixes all three (all-packets+flags extractor; ~80 CICFlowMeter features; evidence-grounded MSEE edges) and adds **zero learned encoders** — every HGT input is deterministic; HGT is the only model that trains. (The legacy three-tier v1 loader, `load_three_tier_graph_artifact`, is kept only for the on-disk graph store path.)
 
 ## Academic novelty (Q1 framing)
-Three layers:
+Four layers:
 
 1. **Multi-Source Evidence Ensemble (MSEE)** for packet→technique edges: replaces both hand-crafted signature rules and semantically-invalid embedding cosine with a three-source statistical ensemble — PMI candidate generation, L1-regularized multinomial logistic refinement, and MITRE procedure substring matching. Each edge carries token-level provenance suitable for SOC audit. No learned encoder.
 2. **Typed heterogeneous schema**: 5 typed evidence edge types per attack family (injection / command_exec / file_upload / recon / c2_beacon), flow-flow homophily edges, host tier — HGT's multi-head attention operates on many typed relations. PMI provides PRIOR weights; HGT attention REFINES; GCL auxiliary loss SUPERVISES.
 3. **Smart-BOTH evaluation protocol**: report both random-stratified (matches prior work) and temporal split (deployment-realistic). The gap between random and temporal F1 is itself a finding — a small gap means the model captures attack-intrinsic patterns rather than dataset-specific campaign fingerprints.
+4. **EACS + clean-key (LNL) grading**: quantify CIC-IoT-2023's per-capture label noise with a signature-isolated answer key (eval-only, never in any loss), then prove noise-filtering via the **sign of (noisy − clean) macro-F1**. EACS self-relabels suspect web-attack flows using MITRE evidence + the model's own predictions (procedure-literal anchor, 95.2% precision). Same HGT backbone, same data, same split — the only changed variable is the EACS controller; baselines memorize the noise (positive gap), EACS filters it (negative gap), with ~97% fewer false web-attack alarms at equal recall.
 
 This is what XG-NID (post-hoc LLM narrative, no knowledge graph) and PacketCLIP (learned contrastive encoder, single-source) structurally cannot match.
