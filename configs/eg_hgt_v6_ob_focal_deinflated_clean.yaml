@@ -1,0 +1,143 @@
+# EG-HGT v6 de-inflated recipe on the CLEAN-LABEL ordered-byte graph.
+# Identical to eg_hgt_v6_ob_focal_deinflated.yaml EXCEPT the graph: this one points
+# at outputs/v3_ob_clean (rebuilt with attack-isolation ON -> web-attack label
+# pollution removed) instead of outputs/v3_ob (original labels).
+#
+# This is the CLEAN-LABEL cell of the 2x2 noise-quantification table. Reading the
+# 2x2 across a row (same model+recipe, original vs clean labels) quantifies how
+# much macro-F1 the dataset's per-pcap label noise costs. Both cells use the SAME
+# de-inflated recipe + ordered-byte feature, so the ONLY changed variable is the
+# label-cleaning -> apples-to-apples.
+
+experiment:
+  source_name: "EG-HGT v6 de-inflated on CLEAN labels (attack-isolation ON, ordered-byte, 50ep)"
+  rationale: >
+    Same de-inflated focal recipe and ordered-byte feature as the original-label
+    cell, but on the relabeled graph where web-attack background pollution
+    (~95% IoT->cloud traffic mislabeled as the attack) is demoted to Benign by
+    signature-based attack-flow isolation. The macro-F1 gap (original vs clean) is
+    the quantitative evidence that the CIC-IoT-2023 per-pcap labeling is noisy.
+
+data:
+  artifact_version: v3
+  graph_npz: outputs/v3_ob_clean/graph.npz
+  graph_meta_json: outputs/v3_ob_clean/graph.meta.json
+  splits_json: outputs/v3_ob_clean/splits.json
+  split_protocol: random
+  add_reverse_edges: true
+  standardize_flow_features: true
+  use_semantic_edge_weights: true
+  use_temporal_edge_weights: true
+  tew_epsilon: 1.0e-3
+
+model:
+  hidden_dim: 128
+  num_layers: 4
+  num_heads: 8
+  dropout: 0.2
+  ffn_multiplier: 2
+
+train:
+  output_dir: outputs/v3_ob_clean_focal
+  epochs: 50
+  patience: 10
+  batch_seed_flows: 256
+  grad_accum_steps: 2
+  monitor: val_macro_f1
+  log_every: 1
+  lr: 1.0e-3
+  weight_decay: 5.0e-5
+  amp: true
+  amp_dtype: auto
+  device: cuda
+  activation_checkpointing: true
+  compile: false
+  tf32: true
+  scheduler: cosine_annealing
+  scheduler_pct_start: 0.05
+  scheduler_eta_min: 1.0e-5
+  grad_clip_norm: 1.0
+  adamw_eps: 1.0e-6
+  adamw_betas: [0.9, 0.95]
+
+  loss_type: focal
+  focal_gamma: 1.5
+  label_smoothing: 0.05
+
+  class_weight: balanced
+  class_weight_method: cb
+  cb_beta: 0.985
+  class_weight_cap: 4.0
+
+  drw_start_pct: 0.0
+  logit_adjustment: 0.0
+
+  drop_edge_prob: 0.10
+  ema_enabled: true
+  ema_decay: 0.999
+  skip_val_first_epoch: false
+  eval_every: 1
+  val_ratio: 0.1
+  test_ratio: 0.1
+  seed: 42
+  stratified_batch_sampling: true
+
+  gcl_enabled: true
+  gcl_weight: 0.3
+  gcl_temperature: 0.1
+  gcl_positive_source: class_technique_map
+  gcl_n_negatives: 16
+
+  hgaa:
+    enabled: true
+    aug_ratio_in_batch: 0.4
+    bias_factor_T: 0.5
+    bias_top_k_rarest: 6
+
+sampler:
+  hops: 4
+  fanouts:
+    flow__contains__packet: 20
+    packet__next_packet__packet: 4
+    packet__evidence_injection__technique: 4
+    packet__evidence_command_exec__technique: 4
+    packet__evidence_file_upload__technique: 3
+    packet__evidence_recon__technique: 3
+    packet__evidence_c2_beacon__technique: 3
+    flow__from_host__host: 1
+    flow__to_host__host: 1
+    flow__burst_neighbor__flow: 6
+    flow__matches_technique__technique: 3
+    technique__has_subtechnique__technique: 2
+    technique__belongs_to_tactic__tactic: 1
+  reverse_fanouts:
+    rev_contains: 3
+    rev_next_packet: 2
+    rev_evidence_injection: 2
+    rev_evidence_command_exec: 2
+    rev_evidence_file_upload: 2
+    rev_evidence_recon: 2
+    rev_evidence_c2_beacon: 2
+    rev_from_host: 3
+    rev_to_host: 3
+    rev_burst_neighbor: 3
+    rev_matches_technique: 2
+    rev_has_subtechnique: 2
+    rev_belongs_to_tactic: 1
+  always_include_all_techniques: true
+  always_include_all_tactics: true
+
+dataloader:
+  num_workers: 6
+  prefetch_factor: 4
+  pin_memory: true
+  persistent_workers: true
+
+feature_store:
+  enabled: true
+  cache_fraction: 0.6
+  model_reserve_gb: 4.0
+  n_warmup_batches: 200
+
+gpu_sampling:
+  enabled: false
