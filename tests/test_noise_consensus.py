@@ -1,0 +1,434 @@
+"""Tests for the noise-robust training core (EG-HGT noise-consensus, 2026-06).
+
+These are the spec for ``graphslm_ids.offline.training.noise_consensus``: four
+pure, deterministic helpers that let the model SELF-DETECT instance-dependent
+label noise during a single training run, with no hand-crafted signatures and no
+test-set peeking. See docs/superpowers/specs/2026-06-09-neighbor-consensus-
+noise-robust-hgt-design.md.
+
+The four units (all CPU, fast, no model/graph load):
+  1. neighbor_consensus  — soft graph-neighbor label agreement (Signal 2).
+  2. evidence_support    — MITRE-evidence grounding of a flow's attack label
+                           (Signal 1, the Tầng-3 contribution).
+  3. combine_clean_confidence — geometric blend of the two signals.
+  4. curriculum_weight   — warmup + clamp -> per-sample loss weight.
+  5. EMAConsensusBuffer  — persistent per-flow EMA across epochs.
+"""
+from __future__ import annotations
+
+import numpy as np
+import pytest
+import torch
+
+from graphslm_ids.offline.training.noise_consensus import (
+    EACSController,
+    EMAConsensusBuffer,
+    combine_clean_confidence,
+    curriculum_weight,
+    evidence_support,
+    neighbor_consensus,
+)
+
+
+# --------------------------------------------------------------------------- #
+# Signal 2: neighbor_consensus
+# --------------------------------------------------------------------------- #
+def test_consensus_high_when_neighbors_predict_my_label() -> None:
+    # 3 flows. Seed flow 0 has label 1. Its two neighbors (1, 2) both predict
+    # class 1 with high prob -> consensus for flow 0 should be high (~0.9).
+    pred = torch.tensor(
+        [
+            [0.05, 0.90, 0.05],  # flow 0 (seed)
+            [0.05, 0.90, 0.05],  # neighbor
+            [0.10, 0.85, 0.05],  # neighbor
+        ]
+    )
+    # undirected neighbor edges 0-1 and 0-2 (as a 2xE index over local node ids)
+    edge_index = torch.tensor([[0, 0], [1, 2]])
+    seed_idx = torch.tensor([0])
+    seed_labels = torch.tensor([1])
+    c = neighbor_consensus(pred, edge_index, seed_idx, seed_labels)
+    assert c.shape == (1,)
+    assert c.item() == pytest.approx((0.90 + 0.85) / 2, abs=1e-6)
+
+
+def test_consensus_low_when_neighbors_predict_other_label() -> None:
+    # Seed flow 0 labeled 2 (an "attack"), but its neighbors are background the
+    # model predicts as class 0 -> they do NOT support label 2 -> low consensus.
+    pred = torch.tensor(
+        [
+            [0.10, 0.10, 0.80],  # flow 0 (seed) — model itself unsure-ish
+            [0.95, 0.03, 0.02],  # neighbor -> class 0
+            [0.92, 0.05, 0.03],  # neighbor -> class 0
+        ]
+    )
+    edge_index = torch.tensor([[0, 0], [1, 2]])
+    c = neighbor_consensus(pred, edge_index, torch.tensor([0]), torch.tensor([2]))
+    assert c.item() == pytest.approx((0.02 + 0.03) / 2, abs=1e-6)
+    assert c.item() < 0.1
+
+
+def test_consensus_isolated_flow_defaults_to_one() -> None:
+    # A seed with no neighbors cannot be judged -> default trust = 1.0 (we never
+    # penalise a flow just for being unconnected).
+    pred = torch.tensor([[0.2, 0.8]])
+    edge_index = torch.empty((2, 0), dtype=torch.long)
+    c = neighbor_consensus(pred, edge_index, torch.tensor([0]), torch.tensor([1]))
+    assert c.item() == pytest.approx(1.0)
+
+
+# --------------------------------------------------------------------------- #
+# Signal 1: evidence_support (the Tầng-3 / MITRE contribution)
+# --------------------------------------------------------------------------- #
+def test_evidence_support_attack_with_matching_evidence_is_one() -> None:
+    # Flow labeled as attack-class 3, and it HAS a matching evidence-edge weight
+    # (>0) for that class's family -> fully supported (1.0).
+    # evidence_by_flow[i, family] = summed matching evidence weight.
+    labels = torch.tensor([3])
+    # one family column; flow 0 has weight 2.5 in the family that maps to class 3
+    evidence = torch.tensor([[2.5]])
+    # class->family map: class 3 -> family col 0; non-attack classes -> -1 (benign)
+    class_to_family = torch.tensor([-1, -1, -1, 0])
+    s = evidence_support(labels, evidence, class_to_family)
+    assert s.item() == pytest.approx(1.0)
+
+
+def test_evidence_support_attack_without_evidence_is_low() -> None:
+    # Flow labeled attack-class 3 but ZERO matching evidence -> prime noise
+    # candidate -> support 0.0.
+    labels = torch.tensor([3])
+    evidence = torch.tensor([[0.0]])
+    class_to_family = torch.tensor([-1, -1, -1, 0])
+    s = evidence_support(labels, evidence, class_to_family)
+    assert s.item() == pytest.approx(0.0)
+
+
+def test_evidence_support_non_attack_class_is_one() -> None:
+    # Benign / volumetric classes are not subject to web label pollution; they
+    # are trusted by construction (class_to_family == -1 -> support 1.0).
+    labels = torch.tensor([0, 1])
+    evidence = torch.tensor([[0.0], [0.0]])
+    class_to_family = torch.tensor([-1, -1, -1, 0])
+    s = evidence_support(labels, evidence, class_to_family)
+    assert torch.allclose(s, torch.ones(2))
+
+
+# --------------------------------------------------------------------------- #
+# combine_clean_confidence
+# --------------------------------------------------------------------------- #
+def test_combine_is_geometric_blend() -> None:
+    ev = torch.tensor([1.0, 0.0, 0.81])
+    co = torch.tensor([0.5, 0.5, 0.49])
+    lam = 0.5
+    out = combine_clean_confidence(ev, co, lam)
+    expected = (ev ** lam) * (co ** (1 - lam))
+    assert torch.allclose(out, expected, atol=1e-6)
+    # a zero in EITHER signal drives the blend toward zero (flow 1: ev=0)
+    assert out[1].item() == pytest.approx(0.0)
+
+
+def test_combine_lambda_one_is_evidence_only() -> None:
+    ev = torch.tensor([0.3, 0.9])
+    co = torch.tensor([0.99, 0.01])
+    out = combine_clean_confidence(ev, co, lam=1.0)
+    assert torch.allclose(out, ev, atol=1e-6)
+
+
+# --------------------------------------------------------------------------- #
+# curriculum_weight
+# --------------------------------------------------------------------------- #
+def test_curriculum_warmup_returns_all_ones() -> None:
+    clean = torch.tensor([0.1, 0.5, 0.9])
+    w = curriculum_weight(clean, epoch=2, warmup_epochs=5, w_min=0.2)
+    assert torch.allclose(w, torch.ones(3))
+
+
+def test_curriculum_after_warmup_clamps_to_wmin() -> None:
+    clean = torch.tensor([0.0, 0.5, 1.0])
+    w = curriculum_weight(clean, epoch=10, warmup_epochs=5, w_min=0.2)
+    # 0.0 -> clamped up to w_min 0.2; 0.5 stays; 1.0 stays.
+    assert w[0].item() == pytest.approx(0.2)
+    assert w[1].item() == pytest.approx(0.5)
+    assert w[2].item() == pytest.approx(1.0)
+
+
+def test_curriculum_weight_in_unit_range() -> None:
+    clean = torch.rand(100)
+    w = curriculum_weight(clean, epoch=10, warmup_epochs=5, w_min=0.3)
+    assert (w >= 0.3 - 1e-6).all() and (w <= 1.0 + 1e-6).all()
+
+
+# --------------------------------------------------------------------------- #
+# EMAConsensusBuffer
+# --------------------------------------------------------------------------- #
+def test_ema_buffer_first_update_is_identity() -> None:
+    buf = EMAConsensusBuffer(num_flows=4, decay=0.9, init=1.0)
+    vals = torch.tensor([0.2, 0.4])
+    idx = torch.tensor([1, 3])
+    out = buf.update(idx, vals)
+    # first time a flow is seen, EMA returns the raw value (no stale init bias)
+    assert out[0].item() == pytest.approx(0.2)
+    assert out[1].item() == pytest.approx(0.4)
+    assert buf.get(torch.tensor([1])).item() == pytest.approx(0.2)
+
+
+def test_ema_buffer_second_update_blends() -> None:
+    buf = EMAConsensusBuffer(num_flows=2, decay=0.8, init=1.0)
+    buf.update(torch.tensor([0]), torch.tensor([1.0]))
+    out = buf.update(torch.tensor([0]), torch.tensor([0.0]))
+    # EMA: 0.8*1.0 + 0.2*0.0 = 0.8
+    assert out.item() == pytest.approx(0.8, abs=1e-6)
+
+
+def test_ema_buffer_untouched_flows_keep_init() -> None:
+    buf = EMAConsensusBuffer(num_flows=3, decay=0.9, init=1.0)
+    buf.update(torch.tensor([0]), torch.tensor([0.1]))
+    assert buf.get(torch.tensor([2])).item() == pytest.approx(1.0)
+
+
+def test_build_class_to_family_maps_via_technique() -> None:
+    from graphslm_ids.offline.training.noise_consensus import build_class_to_family
+
+    # class -> technique (with weights) ; technique -> family ; family name -> col
+    class_to_tech = {
+        "CommandInjection": [("T1059", 1.0)],
+        "XSS": [("T1190", 0.7), ("T1189", 0.3)],
+        "Benign": [],
+    }
+    tech_to_family = {"T1059": "command_exec", "T1190": "injection", "T1189": "injection"}
+    family_to_col = {"injection": 0, "command_exec": 1, "file_upload": 2,
+                     "recon": 3, "c2_beacon": 4}
+    label_mapping = {"Benign": 0, "CommandInjection": 1, "XSS": 2}
+    num_classes = 3
+    c2f = build_class_to_family(
+        class_to_tech, tech_to_family, family_to_col, label_mapping, num_classes
+    )
+    assert c2f.shape == (3,)
+    assert c2f[0].item() == -1            # Benign -> non-attack
+    assert c2f[1].item() == 1            # CommandInjection -> command_exec col 1
+    assert c2f[2].item() == 0            # XSS -> injection (dominant T1190) col 0
+
+
+# --------------------------------------------------------------------------- #
+# trainer integration: _compute_train_loss accepts a per-sample weight
+# (backward-compatible — sample_weight=None reproduces the unweighted loss).
+# --------------------------------------------------------------------------- #
+from graphslm_ids.offline.training.train_hgt_flow_classifier import (  # noqa: E402
+    _compute_train_loss,
+)
+
+
+@pytest.mark.parametrize("loss_type", ["ce", "focal"])
+def test_sample_weight_none_matches_unweighted(loss_type: str) -> None:
+    torch.manual_seed(0)
+    logits = torch.randn(8, 5)
+    labels = torch.randint(0, 5, (8,))
+    base = _compute_train_loss(logits, labels, None, loss_type=loss_type)
+    # all-ones weight must equal the unweighted (mean) loss
+    ones = _compute_train_loss(
+        logits, labels, None, loss_type=loss_type,
+        sample_weight=torch.ones(8),
+    )
+    assert ones.item() == pytest.approx(base.item(), abs=1e-6)
+
+
+def test_static_evidence_weight_downweights_unsupported_attack_flows() -> None:
+    """End-to-end of Signal 1 as a static per-flow weight vector.
+
+    3 flows: flow0 = attack class 3 WITH matching evidence (keep weight 1),
+    flow1 = attack class 3 WITHOUT evidence (noise -> down-weight to w_min),
+    flow2 = benign class 0 (always 1).
+    """
+    from graphslm_ids.offline.training.noise_consensus import static_evidence_weight
+
+    contains = torch.tensor([[0, 1, 2], [0, 1, 2]])      # flow i contains packet i
+    evidence_per_family = {0: (torch.tensor([0]), torch.tensor([2.0]))}  # pkt0 -> fam0
+    labels = torch.tensor([3, 3, 0])
+    class_to_family = torch.tensor([-1, -1, -1, 0])      # class 3 -> family 0; others none
+    w = static_evidence_weight(
+        contains, evidence_per_family, labels, class_to_family,
+        num_families=1, w_min=0.2,
+    )
+    assert w.shape == (3,)
+    assert w[0].item() == pytest.approx(1.0)   # supported attack
+    assert w[1].item() == pytest.approx(0.2)   # unsupported attack -> down-weighted
+    assert w[2].item() == pytest.approx(1.0)   # benign
+
+
+def test_build_evidence_by_flow_aggregates_packets_to_flow() -> None:
+    from graphslm_ids.offline.training.noise_consensus import build_evidence_by_flow
+
+    # 3 flows, 4 packets. contains: flow0->{pkt0,pkt1}, flow1->{pkt2}, flow2->{pkt3}
+    contains = torch.tensor([[0, 0, 1, 2],
+                             [0, 1, 2, 3]])
+    num_flows = 3
+    num_families = 2  # family 0 = command_exec, family 1 = injection
+    # evidence edges per family: (packet_id, weight). family 0 has an edge on pkt1
+    # (so flow0 gets command_exec); family 1 has an edge on pkt3 (flow2 gets injection).
+    evidence_per_family = {
+        0: (torch.tensor([1]), torch.tensor([2.5])),   # pkt1 -> command_exec w=2.5
+        1: (torch.tensor([3]), torch.tensor([0.8])),   # pkt3 -> injection w=0.8
+    }
+    ev = build_evidence_by_flow(contains, evidence_per_family, num_flows, num_families)
+    assert ev.shape == (3, 2)
+    # flow0 has a command_exec packet -> col0 > 0; no injection -> col1 == 0
+    assert ev[0, 0].item() == pytest.approx(2.5)
+    assert ev[0, 1].item() == pytest.approx(0.0)
+    # flow1 has neither
+    assert ev[1].sum().item() == pytest.approx(0.0)
+    # flow2 has an injection packet
+    assert ev[2, 1].item() == pytest.approx(0.8)
+    assert ev[2, 0].item() == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize("loss_type", ["ce", "focal"])
+def test_sample_weight_zero_drops_sample(loss_type: str) -> None:
+    torch.manual_seed(1)
+    logits = torch.randn(6, 4)
+    labels = torch.randint(0, 4, (6,))
+    # Weighting the last sample to 0 must equal the mean over the first 5
+    # (weighted loss normalises by the SUM of weights, not the count).
+    w = torch.ones(6)
+    w[5] = 0.0
+    weighted = _compute_train_loss(
+        logits, labels, None, loss_type=loss_type, sample_weight=w,
+    )
+    sub = _compute_train_loss(
+        logits[:5], labels[:5], None, loss_type=loss_type,
+    )
+    assert weighted.item() == pytest.approx(sub.item(), abs=1e-5)
+
+
+# --------------------------------------------------------------------------- #
+# EACSController — evidence-anchored candidate-set self-relabeling (2026-06-11)
+# --------------------------------------------------------------------------- #
+def _make_eacs(num_flows: int = 8, **kw) -> "EACSController":
+    suspect = torch.zeros(num_flows, dtype=torch.bool)
+    suspect[1] = True
+    suspect[2] = True
+    anchor = torch.zeros(num_flows, dtype=torch.bool)
+    anchor[3] = True
+    defaults = dict(
+        suspect_mask=suspect,
+        anchor_mask=anchor,
+        benign_class_id=0,
+        num_classes=4,
+        warmup_epochs=2,
+        ema_decay=0.5,
+        lambda_disambig=1.0,
+    )
+    defaults.update(kw)
+    return EACSController(**defaults)
+
+
+def test_eacs_warmup_returns_pure_onehot_and_counts_nothing() -> None:
+    ctrl = _make_eacs()
+    logits = torch.randn(3, 4)
+    gids = torch.tensor([1, 2, 5])      # two suspects in the batch
+    labels = torch.tensor([2, 3, 1])
+    tgt = ctrl.soft_targets(logits, gids, labels, epoch=2)  # epoch <= warmup
+    expected = torch.zeros(3, 4)
+    expected[torch.arange(3), labels] = 1.0
+    assert torch.allclose(tgt, expected)
+    s = ctrl.epoch_stats()
+    assert s["suspects_seen"] == 0 and s["relabeled"] == 0
+    assert s["mean_beta"] == pytest.approx(1.0)
+
+
+def test_eacs_post_warmup_suspect_blends_only_within_candidate_set() -> None:
+    ctrl = _make_eacs()
+    # row0: suspect flow 1, label y=2, logits strongly favor Benign(0)
+    # row1: non-suspect flow 5, label 3 -> must stay hard one-hot
+    logits = torch.tensor([[5.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 5.0]])
+    gids = torch.tensor([1, 5])
+    labels = torch.tensor([2, 3])
+    tgt = ctrl.soft_targets(logits, gids, labels, epoch=3)
+    # suspect row: mass only on {y=2, benign=0}, sums to 1, beta < 0.5
+    assert tgt[0, 1].item() == pytest.approx(0.0)
+    assert tgt[0, 3].item() == pytest.approx(0.0)
+    assert tgt[0].sum().item() == pytest.approx(1.0)
+    assert tgt[0, 2].item() < 0.5 and tgt[0, 0].item() > 0.5
+    # non-suspect row untouched
+    assert torch.allclose(tgt[1], torch.tensor([0.0, 0.0, 0.0, 1.0]))
+    s = ctrl.epoch_stats()
+    assert s["suspects_seen"] == 1
+    assert s["relabeled"] == 1
+    assert s["per_class"] == {2: {"seen": 1, "relabeled": 1}}
+
+
+def test_eacs_anchor_keeps_hard_label_even_when_model_disagrees() -> None:
+    ctrl = _make_eacs()
+    # anchor flow 3 (has MITRE evidence): model prefers Benign but target stays y
+    logits = torch.tensor([[8.0, 0.0, 0.0, 0.0]])
+    tgt = ctrl.soft_targets(logits, torch.tensor([3]), torch.tensor([2]), epoch=3)
+    assert torch.allclose(tgt[0], torch.tensor([0.0, 0.0, 1.0, 0.0]))
+    assert ctrl.epoch_stats()["suspects_seen"] == 0
+
+
+def test_eacs_ema_blends_beta_across_epochs() -> None:
+    ctrl = _make_eacs()  # decay 0.5
+    gids = torch.tensor([1])
+    labels = torch.tensor([2])
+    # epoch 3: model confident in y -> beta1 ~ 1
+    hi = torch.tensor([[0.0, 0.0, 8.0, 0.0]])
+    b1 = ctrl.soft_targets(hi, gids, labels, epoch=3)[0, 2].item()
+    # epoch 4: model flips to Benign -> raw beta ~ 0, but EMA keeps half of b1
+    lo = torch.tensor([[8.0, 0.0, 0.0, 0.0]])
+    b2 = ctrl.soft_targets(lo, gids, labels, epoch=4)[0, 2].item()
+    raw2 = torch.softmax(lo.float(), 1)
+    raw2 = (raw2[0, 2] / (raw2[0, 2] + raw2[0, 0])).item()
+    assert b2 == pytest.approx(0.5 * b1 + 0.5 * raw2, abs=1e-5)
+    assert raw2 < b2 < b1  # smoothed, not jumping straight to the raw value
+
+
+def test_eacs_consensus_modulates_beta_when_lambda_below_one() -> None:
+    ctrl = _make_eacs(lambda_disambig=0.5)
+    logits = torch.tensor([[0.0, 0.0, 2.0, 0.0]])  # mildly favors y=2
+    gids = torch.tensor([1])
+    labels = torch.tensor([2])
+    # neighbors strongly disagree (consensus -> 0) -> beta drops vs consensus=1
+    t_low = ctrl.soft_targets(
+        logits, gids, labels, epoch=3, consensus=torch.tensor([1e-6])
+    )[0, 2].item()
+    ctrl2 = _make_eacs(lambda_disambig=0.5)
+    t_high = ctrl2.soft_targets(
+        logits, gids, labels, epoch=3, consensus=torch.tensor([1.0])
+    )[0, 2].item()
+    assert t_low < t_high
+
+
+def test_build_eacs_controller_with_precomputed_anchor_mask() -> None:
+    from graphslm_ids.offline.training.noise_consensus import build_eacs_controller
+
+    class _Art:  # minimal artifact stub: mask path never touches evidence
+        flow_y = np.array([0, 1, 1, 2, 1, 0])  # 0=Benign, 1=XSS, 2=other
+
+    label_mapping = {"Benign": 0, "XSS": 1, "Recon-OSScan": 2}
+    anchor = np.array([False, True, False, True, False, False])
+    ctrl = build_eacs_controller(
+        artifact=_Art(),
+        num_classes=3,
+        label_mapping=label_mapping,
+        suspect_classes=["XSS"],
+        anchor_mask=anchor,
+    )
+    # anchor applies only inside the suspect classes: flow1 (XSS, anchored);
+    # flow3 is anchored in the mask but not a suspect-class flow -> neither.
+    assert ctrl.anchor_mask.tolist() == [False, True, False, False, False, False]
+    assert ctrl.suspect_mask.tolist() == [False, False, True, False, True, False]
+
+
+def test_build_eacs_controller_anchor_mask_length_mismatch_raises() -> None:
+    from graphslm_ids.offline.training.noise_consensus import build_eacs_controller
+
+    class _Art:
+        flow_y = np.array([0, 1])
+
+    with pytest.raises(ValueError, match="anchor_mask"):
+        build_eacs_controller(
+            artifact=_Art(),
+            num_classes=2,
+            label_mapping={"Benign": 0, "XSS": 1},
+            suspect_classes=["XSS"],
+            anchor_mask=np.array([True]),
+        )

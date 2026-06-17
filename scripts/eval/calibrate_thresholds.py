@@ -129,6 +129,12 @@ def main() -> None:
     ap.add_argument("--cal-seed", type=int, default=42,
                     help="seed for the coordinate-ascent class order (deterministic)")
     ap.add_argument("--cal-rounds", type=int, default=12)
+    ap.add_argument("--clean-labels", type=Path, default=None,
+                    help="clean answer key .npy (LNL protocol). When given, a second "
+                         "bias is tuned on the CLEAN val labels (the same small-clean-"
+                         "val assumption already used for checkpoint selection) and "
+                         "test is additionally graded on the clean key, including a "
+                         "pooled binary web-attack detection metric.")
     args = ap.parse_args()
 
     device = torch.device(args.device)
@@ -224,6 +230,63 @@ def main() -> None:
           f"(delta {cal_test_macro - raw_test_macro:+.4f})  <-- HONEST (bias tuned on val)",
           flush=True)
 
+    # ── Optional LNL clean-key grading + clean-tuned calibration ───────────────
+    clean_block = None
+    if args.clean_labels is not None:
+        clean_all = np.asarray(np.load(args.clean_labels), dtype=np.int64)
+        val_clean = clean_all[val_idx]
+        test_clean = clean_all[test_idx]
+        web_ids = np.array(sorted(
+            cid for cid, name in label_names.items()
+            if name in ("CommandInjection", "XSS", "SqlInjection", "Uploading_Attack")
+        ))
+
+        def _grade(pred: np.ndarray, true: np.ndarray) -> dict[str, Any]:
+            f1, sup = er.per_class_f1_from_labels(true, pred, num_classes)
+            true_bin = np.isin(true, web_ids)
+            pred_bin = np.isin(pred, web_ids)
+            tp = int((true_bin & pred_bin).sum())
+            fp = int((~true_bin & pred_bin).sum())
+            fn = int((true_bin & ~pred_bin).sum())
+            prec = tp / (tp + fp) if (tp + fp) else 0.0
+            rec = tp / (tp + fn) if (tp + fn) else 0.0
+            return {
+                "macro_f1": er._macro_f1(f1, sup),  # support>0 classes only
+                "n_classes_present": int((sup > 0).sum()),
+                "web_binary": {
+                    "tp": tp, "fp": fp, "fn": fn,
+                    "precision": prec, "recall": rec,
+                    "f1": 2 * prec * rec / (prec + rec) if (prec + rec) else 0.0,
+                    "support": int(true_bin.sum()),
+                },
+            }
+
+        clean_raw_test = _grade(raw_test_pred, test_clean)
+        bias_c, cal_info_c = er.calibrate_bias_for_macro_f1(
+            val_logits, val_clean, num_classes,
+            n_rounds=int(args.cal_rounds), seed=int(args.cal_seed),
+        )
+        cal_test_pred_c = er.apply_bias(test_logits, bias_c)
+        clean_cal_test = _grade(cal_test_pred_c, test_clean)
+        print(f"[cal] CLEAN VAL macro-F1: raw={cal_info_c['macro_f1_raw']:.4f} -> "
+              f"calibrated={cal_info_c['macro_f1_calibrated']:.4f}", flush=True)
+        print(f"[cal] CLEAN TEST macro-F1: raw={clean_raw_test['macro_f1']:.4f} -> "
+              f"calibrated={clean_cal_test['macro_f1']:.4f}  "
+              f"web-binary F1 raw={clean_raw_test['web_binary']['f1']:.4f} -> "
+              f"cal={clean_cal_test['web_binary']['f1']:.4f}", flush=True)
+        clean_block = {
+            "clean_labels": str(args.clean_labels),
+            "bias_per_class_clean": {label_names[c]: float(bias_c[c]) for c in range(num_classes)},
+            "val": {"raw": cal_info_c["macro_f1_raw"],
+                    "calibrated": cal_info_c["macro_f1_calibrated"]},
+            "test_raw": clean_raw_test,
+            "test_calibrated": clean_cal_test,
+            "per_class_raw_clean": _per_class_table(
+                test_clean, raw_test_pred, num_classes, label_names),
+            "per_class_calibrated_clean": _per_class_table(
+                test_clean, cal_test_pred_c, num_classes, label_names),
+        }
+
     out = {
         "method": "per_class_additive_logit_bias (coordinate-ascent, macro-F1, tuned-on-val)",
         "num_classes": num_classes,
@@ -241,6 +304,7 @@ def main() -> None:
         "per_class_calibrated": _per_class_table(test_labels, cal_test_pred, num_classes, label_names),
         "calibration_info": cal_info,
         "self_check_vs_summary": check,
+        "clean": clean_block,
         "label_names": {str(k): v for k, v in label_names.items()},
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)
