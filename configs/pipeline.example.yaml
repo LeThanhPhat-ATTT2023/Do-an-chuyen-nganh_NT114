@@ -1,0 +1,36 @@
+hgt:
+  checkpoint: outputs/v3_ob_eacs_v2/hgt_flow_best.pt
+  graph_meta_json: outputs/v3_ob/graph.meta.json
+  device: cpu
+  packet_feature: ordered_byte
+  add_reverse_edges: true
+  num_layers: 2
+  standardize_flow_features: true
+  use_semantic_edge_weights: true
+fast_path:
+  payload_length: 256
+  mitre_embeddings: data/mitre/technique_embeddings.npy
+  techniques_csv: data/mitre/techniques.csv
+  technique_tactic_csv: data/mitre/technique_tactic.csv
+  pmi_table_path: outputs/v3_ob/pmi_table.parquet
+  stix_json_path: data/mitre/enterprise-attack.json
+  technique_family_map_path: data/mitre/technique_family_map.json
+policy:
+  alert_threshold: 0.70
+  alert_labels: []
+  benign_labels: [Benign]
+hot_graph:
+  ttl_seconds: 120
+  max_events: 100000
+  max_packets_per_flow: 64
+  max_techniques_per_node: 5
+graph_store:
+  enabled: false
+cold_store_path: outputs/runtime/cold_store.jsonl
+slm:
+  backend: ollama
+  endpoint: http://127.0.0.1:11434
+  model_name: qwen2.5:3b
+slow_path:
+  alert_threshold: 0.70
+  max_repair_attempts: 2
