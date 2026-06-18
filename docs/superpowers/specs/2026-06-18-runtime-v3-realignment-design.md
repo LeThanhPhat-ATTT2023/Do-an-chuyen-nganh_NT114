@@ -23,13 +23,24 @@ schema cũ thời student-CNN.
   và `HGTRuntime` đọc đúng các key đó. → checkpoint EACS **load vào runtime được**.
 - **4 chỗ TRÔI cần vá** (fast-path dựng từ schema cũ, train đã tiến hoá sang v3_ob/EACS):
   - **A1** — Gán technique-edge ONLINE chưa nối (`mitre_topk = []`, TODO).
-  - **A2** — **Tên edge-type runtime KHÔNG khớp v3** (lỗi nặng nhất): runtime phát
-    `matches_technique`/`belongs_to_tactic`; train v3 dùng 5 loại `evidence_<family>` +
-    `flow_technique` + `technique_tactic` + `has_subtechnique` + `burst_neighbor`. Model
-    **bỏ qua** edge tên lạ ⇒ runtime mất toàn bộ bằng chứng technique.
-  - **B** — `packet_feature` mặc định `"semantic"` nhưng model là **v3_ob = ordered-byte**.
+  - **A2** — **Schema subgraph runtime lệch SÂU so với v3** (lỗi nặng nhất, lớn hơn ước
+    tính ban đầu — cập nhật sau khi đào sâu):
+    - **Thiếu hẳn node `host`** + edge `from_host`/`to_host` (v3 là **5 node-type**:
+      flow/packet/host/technique/tactic, host feature 4-d). Runtime dựng **0 host node**.
+    - Tên edge technique sai: runtime `matches_technique`/`belongs_to_tactic`; v3 dùng 5
+      loại `evidence_<family>` + `flow_technique` + `technique_tactic` + `has_subtechnique`
+      + `burst_neighbor`. Tên containment v3 là `contain` (không phải `flow_contains_packet`).
+    - Model **bỏ qua** edge/node tên lạ ⇒ runtime mất bằng chứng technique + tín hiệu host.
+  - **B** — **packet_feature runtime là EMBEDDING 768-d** (`packet["embedding"]`, thời
+    student-CNN) — KHÔNG phải `compute_packet_payload_features` ordered-byte của v3_ob. Sai
+    cả **chiều** lẫn **nội dung** input packet so với model.
   - **C** — Không có config runtime nào (`configs/pipeline.example.yaml` không tồn tại).
   - **D** — Không có test integration fast-path → drift không bị bắt.
+
+  > **Mức độ thật:** đây KHÔNG phải "vá nhỏ" mà là **viết lại đáng kể phần dựng subgraph
+  > runtime** (thêm node host + 5+ edge-type + tái tạo feature ordered-byte + reverse edges)
+  > để khớp v3. Và **không thể verify end-to-end ở local** nếu chưa có artifact
+  > (graph.npz/checkpoint/pmi_table/STIX). Xem §8 — cân nhắc đường tắt offline-artifact.
 - **Nguyên tắc fix:** *tái dùng* đúng các hàm MSEE offline (không reimplement); *làm
   SubgraphBuilder schema-driven* (đọc edge-type từ checkpoint/meta thay vì hardcode).
 - **Trung thực:** schema + edge-assigner **test được bằng unit test không cần artifact**;
@@ -203,6 +214,35 @@ sinh được VG²R report. **Không cần artifact thật.**
 - **Chạy thật phụ thuộc artifact** chưa có local (checkpoint/graph.meta/pmi_table/STIX).
 - **packet_feature ordered-byte** phải khớp **bit-by-bit** cách offline dựng, nếu lệch →
   model nhận sai input; test so khớp trên payload mẫu là bắt buộc.
+
+---
+
+## 8. Hai đường thực thi — chọn theo mục tiêu
+
+Mục tiêu cuối của người dùng: **THẤY** end-to-end "flow tấn công → HGT phân loại → VG²R
+XAI". Có hai cách đạt được:
+
+### 8.A — Realign fast-path đầy đủ (spec §3) — đắt, đúng "online"
+Viết lại SubgraphBuilder cho khớp v3 (host node + 5 evidence edge + ordered-byte + reverse),
+nối RuntimeEdgeAssigner. Cho phép **replay PCAP live**. Nhưng: rewrite lớn, nhiều điểm có
+thể còn lệch, và **chỉ verify được end-to-end khi có artifact ở local**.
+
+### 8.B — Mô phỏng trên artifact offline — rẻ, đủ chứng minh luồng *(đề xuất nếu chỉ cần THẤY)*
+Đồ thị `graph.npz` **đã ở đúng schema v3** (host/packet ordered-byte/5 evidence edge…).
+Thay vì dựng subgraph online, **lấy thẳng subgraph của một flow tấn công thật từ `graph.npz`**
+→ `HGTRuntime.infer` (phân loại THẬT bằng checkpoint EACS) → nếu alert → `EvidenceBuilder`
++ VG²R. Một script `scripts/eval/vg2r_end_to_end_offline.py`:
+1. nạp `graph.npz` + checkpoint; chọn 1 flow test có nhãn tấn công;
+2. trích subgraph k-hop của flow đó (đã đủ technique/tactic edge);
+3. `HGTRuntime.infer` → nhãn + attention; PolicyEngine → alert;
+4. build EvidenceBundle từ subgraph → serialize → SLM → verify → in báo cáo VG²R.
+
+→ Phản ánh **đúng ngữ nghĩa** "model phân loại flow thật → XAI thật", với bằng chứng
+technique đầy đủ, **không cần** rewrite fast-path. Chỉ cần `graph.npz` + checkpoint ở local.
+Hạn chế: không có phần dựng-subgraph-từ-packet-live (đó là phần fast-path đang trôi).
+
+**Khuyến nghị:** nếu mục tiêu là *trình diễn/đồ án*, làm **8.B trước** (nhanh, dùng v3 thật).
+Để **8.A** lại như mục tiêu kỹ thuật riêng khi cần IDS chạy live trên PCAP.
 
 ---
 
