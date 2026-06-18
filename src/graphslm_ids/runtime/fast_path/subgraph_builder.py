@@ -5,6 +5,8 @@ from typing import Any
 
 import numpy as np
 
+from graphslm_ids.offline.preprocessing.payload_features import compute_packet_payload_features
+
 
 EdgeKey = tuple[str, str, str]
 
@@ -19,6 +21,7 @@ class Subgraph:
     technique_local_to_id: dict[int, str]
     tactic_local_to_id: dict[int, str]
     seed_flow_local_idx: int = 0
+    host_local_to_id: dict[int, str] | None = None  # set in build()
 
     def to_snapshot_dict(self) -> dict[str, Any]:
         return {
@@ -105,6 +108,7 @@ class SubgraphBuilder:
         packet_x = self._packet_features(packet_entries)
         technique_x = self._technique_features(technique_ids)
         tactic_x = self._tactic_features(tactic_ids)
+        host_x, host_ids, from_host_pairs, to_host_pairs = self._build_hosts(snapshot["flow"])
 
         flow_idx = {flow_id: idx for idx, flow_id in enumerate(flow_ids)}
         packet_idx = {packet_id: idx for idx, packet_id in enumerate(packet_ids)}
@@ -114,8 +118,8 @@ class SubgraphBuilder:
         edge_index: dict[EdgeKey, np.ndarray] = {}
         edge_weight: dict[EdgeKey, np.ndarray] = {}
 
-        contains = [(flow_idx[str(seed_flow_id)], packet_idx[pid]) for pid in packet_ids]
-        _set_edges(edge_index, edge_weight, ("flow", "contains", "packet"), contains)
+        contain = [(flow_idx[str(seed_flow_id)], packet_idx[pid]) for pid in packet_ids]
+        _set_edges(edge_index, edge_weight, ("flow", "contain", "packet"), contain)
 
         next_edges = [
             (idx, idx + 1)
@@ -127,53 +131,54 @@ class SubgraphBuilder:
             next_edges = next_edges[:next_limit]
         _set_edges(edge_index, edge_weight, ("packet", "next_packet", "packet"), next_edges)
 
-        packet_tech_edges: list[tuple[int, int]] = []
-        packet_tech_weights: list[float] = []
+        # Packet -> technique edges, routed by family to evidence_<family>.
+        evidence_by_family: dict[str, tuple[list[tuple[int, int]], list[float]]] = {}
         for packet in packet_entries:
             packet_id = str(packet["packet_id"])
-            pairs = self._select_score_pairs(
-                "packet__matches_technique__technique",
-                _score_pairs(packet.get("mitre_topk", [])),
-            )
-            for tech_id, score in pairs:
-                if tech_id in technique_idx:
-                    packet_tech_edges.append((packet_idx[packet_id], technique_idx[tech_id]))
-                    packet_tech_weights.append(float(score))
-        _set_edges(
-            edge_index,
-            edge_weight,
-            ("packet", "matches_technique", "technique"),
-            packet_tech_edges,
-            packet_tech_weights,
-        )
+            for tech_id, family, score in _triples(packet.get("mitre_topk", [])):
+                if tech_id not in technique_idx:
+                    continue
+                pairs, weights = evidence_by_family.setdefault(str(family), ([], []))
+                pairs.append((packet_idx[packet_id], technique_idx[tech_id]))
+                weights.append(float(score))
+        for family, (pairs, weights) in evidence_by_family.items():
+            _set_edges(edge_index, edge_weight, ("packet", f"evidence_{family}", "technique"),
+                       pairs, weights)
 
         flow_tech_edges: list[tuple[int, int]] = []
         flow_tech_weights: list[float] = []
-        flow_pairs = self._select_score_pairs(
-            "flow__matches_technique__technique",
-            _score_pairs(snapshot.get("flow_to_mitre", [])),
-        )
-        for tech_id, score in flow_pairs:
+        for tech_id, _family, score in _triples(snapshot.get("flow_to_mitre", [])):
             if tech_id in technique_idx:
                 flow_tech_edges.append((0, technique_idx[tech_id]))
                 flow_tech_weights.append(float(score))
-        _set_edges(
-            edge_index,
-            edge_weight,
-            ("flow", "matches_technique", "technique"),
-            flow_tech_edges,
-            flow_tech_weights,
-        )
+        _set_edges(edge_index, edge_weight, ("flow", "flow_technique", "technique"),
+                   flow_tech_edges, flow_tech_weights)
 
         tactic_edges: list[tuple[int, int]] = []
         for tech_id in technique_ids:
             tactic_id = technique_to_tactic.get(tech_id)
             if tactic_id in tactic_idx:
                 tactic_edges.append((technique_idx[tech_id], tactic_idx[tactic_id]))
-        tactic_limit = self._top_n("technique__belongs_to_tactic__tactic")
+        tactic_limit = self._top_n("technique__technique_tactic__tactic")
         if tactic_limit is not None:
             tactic_edges = tactic_edges[:tactic_limit]
-        _set_edges(edge_index, edge_weight, ("technique", "belongs_to_tactic", "tactic"), tactic_edges)
+        _set_edges(edge_index, edge_weight, ("technique", "technique_tactic", "tactic"), tactic_edges)
+
+        # has_subtechnique: T1190.001 -> parent T1190 (when both are present).
+        subtech_edges = []
+        for tech_id in technique_ids:
+            if "." in tech_id:
+                parent = tech_id.split(".")[0]
+                if parent in technique_idx:
+                    subtech_edges.append((technique_idx[parent], technique_idx[tech_id]))
+        _set_edges(edge_index, edge_weight, ("technique", "has_subtechnique", "technique"),
+                   subtech_edges)
+
+        host_bytes = float(snapshot["flow"].get("total_payload_bytes", 0.0))
+        _set_edges(edge_index, edge_weight, ("flow", "from_host", "host"), from_host_pairs,
+                   [host_bytes] * len(from_host_pairs))
+        _set_edges(edge_index, edge_weight, ("flow", "to_host", "host"), to_host_pairs,
+                   [host_bytes] * len(to_host_pairs))
 
         if self.add_reverse_edges:
             _add_reverse_edges(edge_index, edge_weight)
@@ -184,6 +189,7 @@ class SubgraphBuilder:
                 "packet": packet_x,
                 "technique": technique_x,
                 "tactic": tactic_x,
+                "host": host_x,
             },
             edge_index_dict=edge_index,
             edge_weight_dict=edge_weight,
@@ -192,6 +198,7 @@ class SubgraphBuilder:
             technique_local_to_id={idx: tech_id for tech_id, idx in technique_idx.items()},
             tactic_local_to_id={idx: tactic_id for tactic_id, idx in tactic_idx.items()},
             seed_flow_local_idx=0,
+            host_local_to_id={idx: host_id for idx, host_id in enumerate(host_ids)},
         )
 
     def to_snapshot_dict(self, sub: Subgraph) -> dict[str, Any]:
@@ -227,6 +234,23 @@ class SubgraphBuilder:
             float(flow.get("dst_port", 0.0)),
             float(protocol_id),
         ]
+
+    def _build_hosts(self, flow: dict[str, Any]):
+        """Two host nodes (src, dst) with 4-d [out_deg, in_deg, fwd_bytes, bwd_bytes]."""
+        src_ip = str(flow.get("src_ip", "unknown"))
+        dst_ip = str(flow.get("dst_ip", "unknown"))
+        total_bytes = float(flow.get("total_payload_bytes", 0.0))
+        host_ids = [src_ip, dst_ip]
+        host_x = np.asarray(
+            [
+                [1.0, 0.0, total_bytes, 0.0],  # src host: out-degree 1, fwd bytes
+                [0.0, 1.0, 0.0, total_bytes],  # dst host: in-degree 1, bwd bytes
+            ],
+            dtype=np.float32,
+        )
+        from_host_pairs = [(0, 0)]  # flow 0 -> src host (index 0)
+        to_host_pairs = [(0, 1)]    # flow 0 -> dst host (index 1)
+        return host_x, host_ids, from_host_pairs, to_host_pairs
 
     def _select_packet_entries(self, packets: list[dict[str, Any]]) -> list[dict[str, Any]]:
         limit = self._top_n("flow__contains__packet")
@@ -271,7 +295,7 @@ class SubgraphBuilder:
         return int(value)
 
     def _packet_semantic_score(self, packet: dict[str, Any]) -> float:
-        pairs = _score_pairs(packet.get("mitre_topk", []))
+        pairs = [(t, w) for t, _f, w in _triples(packet.get("mitre_topk", []))]
         if not pairs:
             return 0.0
         return max(float(score) for _, score in pairs)
@@ -294,16 +318,10 @@ class SubgraphBuilder:
         packet_entries: list[dict[str, Any]],
     ) -> list[str]:
         seen: dict[str, None] = {}
-        for tech_id, _ in self._select_score_pairs(
-            "flow__matches_technique__technique",
-            _score_pairs(snapshot.get("flow_to_mitre", [])),
-        ):
+        for tech_id, _family, _w in _triples(snapshot.get("flow_to_mitre", [])):
             seen.setdefault(tech_id, None)
         for packet in packet_entries:
-            for tech_id, _ in self._select_score_pairs(
-                "packet__matches_technique__technique",
-                _score_pairs(packet.get("mitre_topk", [])),
-            ):
+            for tech_id, _family, _w in _triples(packet.get("mitre_topk", [])):
                 seen.setdefault(tech_id, None)
         return list(seen.keys())
 
@@ -319,7 +337,18 @@ class SubgraphBuilder:
         return ((flow_x - mean_arr) / std_arr).astype(np.float32)
 
     def _packet_features(self, packet_entries: list[dict[str, Any]]) -> np.ndarray:
-        rows: list[np.ndarray] = []
+        if self.packet_feature == "ordered_byte":
+            rows: list[np.ndarray] = []
+            for packet in packet_entries:
+                payload = _payload_bytes(packet)
+                rows.append(compute_packet_payload_features(payload, len(payload)))
+            if rows:
+                return np.stack(rows, axis=0).astype(np.float32)
+            dim = int(compute_packet_payload_features(b"", 0).shape[0])
+            return np.empty((0, dim), dtype=np.float32)
+
+        # Legacy embedding path (kept for the on-disk store / semantic mode).
+        rows = []
         packet_embeddings = self._static_mapping("packet_embeddings")
         for packet in packet_entries:
             embedding = packet.get("embedding")
@@ -386,6 +415,30 @@ class SubgraphBuilder:
 
 def edge_key_to_name(edge_key: EdgeKey) -> str:
     return "__".join(edge_key)
+
+
+def _payload_bytes(packet: dict[str, Any]) -> bytes:
+    """Reconstruct raw payload bytes from a packet entry's stored hex preview."""
+    hexs = str(packet.get("payload_preview_hex") or packet.get("payload_hex") or "")
+    if not hexs:
+        return b""
+    try:
+        return bytes.fromhex(hexs)
+    except ValueError:
+        return b""
+
+
+def _triples(raw: Any) -> list[tuple[str, str, float]]:
+    """Coerce mitre_topk entries into (technique, family, weight) triples.
+
+    Accepts both new 3-tuples and legacy 2-tuples (family defaulted to '')."""
+    out: list[tuple[str, str, float]] = []
+    for item in raw or []:
+        if isinstance(item, (list, tuple)) and len(item) == 3:
+            out.append((str(item[0]), str(item[1]), float(item[2])))
+        elif isinstance(item, (list, tuple)) and len(item) == 2:
+            out.append((str(item[0]), "", float(item[1])))
+    return out
 
 
 def _score_pairs(value: Any) -> list[tuple[str, float]]:

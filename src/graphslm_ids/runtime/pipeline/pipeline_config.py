@@ -18,6 +18,10 @@ class FastPathCfg:
     mitre_topk: int = 5
     mitre_threshold: float | None = None
     payload_length: int = 256
+    # v3 online MSEE edge-assignment artifacts (empty => assigner disabled).
+    pmi_table_path: str = ""
+    stix_json_path: str = ""
+    technique_family_map_path: str = ""
 
 
 @dataclass
@@ -75,7 +79,7 @@ class HGTCfg:
     graph_meta_json: str
     device: str = "cpu"
     num_layers: int = 3
-    packet_feature: str = "semantic"
+    packet_feature: str = "ordered_byte"
     add_reverse_edges: bool = True
     standardize_flow_features: bool = True
     use_semantic_edge_weights: bool = True
@@ -146,6 +150,9 @@ class PipelineConfig:
                 fast_raw.get("mitre_threshold", mitre_raw.get("similarity_threshold"))
             ),
             payload_length=int(fast_raw.get("payload_length", data_raw.get("payload_length", 256))),
+            pmi_table_path=str(fast_raw.get("pmi_table_path", "")),
+            stix_json_path=str(fast_raw.get("stix_json_path", "")),
+            technique_family_map_path=str(fast_raw.get("technique_family_map_path", "")),
         )
 
         hgt = HGTCfg(
@@ -155,7 +162,7 @@ class PipelineConfig:
             ),
             device=str(hgt_raw.get("device", "cpu")),
             num_layers=int(hgt_raw.get("num_layers", 3)),
-            packet_feature=str(hgt_raw.get("packet_feature", "semantic")),
+            packet_feature=str(hgt_raw.get("packet_feature", "ordered_byte")),
             add_reverse_edges=bool(hgt_raw.get("add_reverse_edges", True)),
             standardize_flow_features=bool(hgt_raw.get("standardize_flow_features", True)),
             use_semantic_edge_weights=bool(hgt_raw.get("use_semantic_edge_weights", True)),
