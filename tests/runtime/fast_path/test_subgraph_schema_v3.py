@@ -44,3 +44,13 @@ def test_ordered_byte_packet_features_match_offline():
     expected = compute_packet_payload_features(payload, len(payload)).reshape(1, -1)
     assert got.shape == expected.shape
     assert np.allclose(got, expected, atol=1e-6)
+
+
+def test_host_nodes_and_edges_built():
+    builder = SubgraphBuilder(StubBuffer(_snapshot_one_packet(b"abc")), packet_feature="ordered_byte")
+    sub = builder.build("flow_1")
+    assert "host" in sub.node_features
+    host_x = np.asarray(sub.node_features["host"])
+    assert host_x.shape[0] == 2 and host_x.shape[1] == 4  # src + dst host, 4-d
+    assert ("flow", "from_host", "host") in sub.edge_index_dict
+    assert ("flow", "to_host", "host") in sub.edge_index_dict

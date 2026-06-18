@@ -21,6 +21,7 @@ class Subgraph:
     technique_local_to_id: dict[int, str]
     tactic_local_to_id: dict[int, str]
     seed_flow_local_idx: int = 0
+    host_local_to_id: dict[int, str] | None = None  # set in build()
 
     def to_snapshot_dict(self) -> dict[str, Any]:
         return {
@@ -107,6 +108,7 @@ class SubgraphBuilder:
         packet_x = self._packet_features(packet_entries)
         technique_x = self._technique_features(technique_ids)
         tactic_x = self._tactic_features(tactic_ids)
+        host_x, host_ids, from_host_pairs, to_host_pairs = self._build_hosts(snapshot["flow"])
 
         flow_idx = {flow_id: idx for idx, flow_id in enumerate(flow_ids)}
         packet_idx = {packet_id: idx for idx, packet_id in enumerate(packet_ids)}
@@ -177,6 +179,12 @@ class SubgraphBuilder:
             tactic_edges = tactic_edges[:tactic_limit]
         _set_edges(edge_index, edge_weight, ("technique", "belongs_to_tactic", "tactic"), tactic_edges)
 
+        host_bytes = float(snapshot["flow"].get("total_payload_bytes", 0.0))
+        _set_edges(edge_index, edge_weight, ("flow", "from_host", "host"), from_host_pairs,
+                   [host_bytes] * len(from_host_pairs))
+        _set_edges(edge_index, edge_weight, ("flow", "to_host", "host"), to_host_pairs,
+                   [host_bytes] * len(to_host_pairs))
+
         if self.add_reverse_edges:
             _add_reverse_edges(edge_index, edge_weight)
 
@@ -186,6 +194,7 @@ class SubgraphBuilder:
                 "packet": packet_x,
                 "technique": technique_x,
                 "tactic": tactic_x,
+                "host": host_x,
             },
             edge_index_dict=edge_index,
             edge_weight_dict=edge_weight,
@@ -194,6 +203,7 @@ class SubgraphBuilder:
             technique_local_to_id={idx: tech_id for tech_id, idx in technique_idx.items()},
             tactic_local_to_id={idx: tactic_id for tactic_id, idx in tactic_idx.items()},
             seed_flow_local_idx=0,
+            host_local_to_id={idx: host_id for idx, host_id in enumerate(host_ids)},
         )
 
     def to_snapshot_dict(self, sub: Subgraph) -> dict[str, Any]:
@@ -229,6 +239,23 @@ class SubgraphBuilder:
             float(flow.get("dst_port", 0.0)),
             float(protocol_id),
         ]
+
+    def _build_hosts(self, flow: dict[str, Any]):
+        """Two host nodes (src, dst) with 4-d [out_deg, in_deg, fwd_bytes, bwd_bytes]."""
+        src_ip = str(flow.get("src_ip", "unknown"))
+        dst_ip = str(flow.get("dst_ip", "unknown"))
+        total_bytes = float(flow.get("total_payload_bytes", 0.0))
+        host_ids = [src_ip, dst_ip]
+        host_x = np.asarray(
+            [
+                [1.0, 0.0, total_bytes, 0.0],  # src host: out-degree 1, fwd bytes
+                [0.0, 1.0, 0.0, total_bytes],  # dst host: in-degree 1, bwd bytes
+            ],
+            dtype=np.float32,
+        )
+        from_host_pairs = [(0, 0)]  # flow 0 -> src host (index 0)
+        to_host_pairs = [(0, 1)]    # flow 0 -> dst host (index 1)
+        return host_x, host_ids, from_host_pairs, to_host_pairs
 
     def _select_packet_entries(self, packets: list[dict[str, Any]]) -> list[dict[str, Any]]:
         limit = self._top_n("flow__contains__packet")
