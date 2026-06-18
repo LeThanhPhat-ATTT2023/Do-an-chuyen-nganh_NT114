@@ -51,6 +51,20 @@ class FastPathPipeline:
             cfg.fast_path.techniques_csv,
             cfg.fast_path.technique_tactic_csv,
         )
+        # v3 online MSEE edge-assignment (PMI + procedure ensemble). Built only
+        # when the PMI table + STIX artifacts are configured; otherwise stays
+        # None and on_packet emits no technique evidence.
+        from graphslm_ids.runtime.fast_path.edge_assigner import RuntimeEdgeAssigner
+        self.edge_assigner = None
+        if cfg.fast_path.pmi_table_path and cfg.fast_path.stix_json_path:
+            family_map: dict[str, str] = {}
+            if cfg.fast_path.technique_family_map_path:
+                family_map = read_json(Path(cfg.fast_path.technique_family_map_path))
+            self.edge_assigner = RuntimeEdgeAssigner(
+                pmi_table_path=cfg.fast_path.pmi_table_path,
+                stix_json_path=cfg.fast_path.stix_json_path,
+                technique_family_map=family_map,
+            )
         meta = read_json(Path(cfg.hgt.graph_meta_json)) if Path(cfg.hgt.graph_meta_json).exists() else {}
         self.graph_store = (
             PersistentGraphStore(
@@ -137,11 +151,16 @@ class FastPathPipeline:
         now = time.time()
         flow_state = self.flow_tracker.update(raw_pkt, now)
         extracted = self.payload_extractor.extract(raw_pkt)
-        # TODO(v3): replace with PMI-based technique assignment from v3 ensemble;
-        # student CNN embedding removed — mitre_topk now empty until v3 runtime
-        # edge-assignment is wired in.
+        # v3 online MSEE: resolve payload bytes -> (technique, family, weight)
+        # evidence via the offline PMI + procedure ensemble. Empty when no
+        # assigner is configured (artifacts absent).
         embedding: Any = None
-        mitre_topk: list[Any] = []
+        payload_bytes = bytes.fromhex(extracted.hex_64) if extracted.hex_64 else b""
+        mitre_topk: list[Any] = (
+            self.edge_assigner.assign_packet(payload_bytes)
+            if self.edge_assigner is not None
+            else []
+        )
 
         packet_id = self._make_packet_id(flow_state.flow_id)
         if self.graph_store is not None:
