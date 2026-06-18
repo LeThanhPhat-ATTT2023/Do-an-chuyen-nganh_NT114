@@ -138,7 +138,12 @@ def test_worker_uses_tier3_when_slm_backend_is_unavailable() -> None:
 
     assert result.fallback_tier == 3
     assert "[TEMPLATE FALLBACK]" in result.report
-    assert result.validation.overall_pass
+    # VG²R: the tier-3 template is the degraded fallback. It is graded by the
+    # graph verifier (a FaithfulnessRecord), which may not clear the strict
+    # by-construction gate (cgr==1.0, hr==0.0) — the tier itself signals that.
+    # The fallback must still be safe and carry a faithfulness record.
+    assert result.validation.repair_tier == 3
+    assert result.validation.safety_pass
 
 
 def test_worker_queue_consumes_job_persists_report_and_marks_done() -> None:

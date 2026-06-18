@@ -8,6 +8,8 @@ from graphslm_ids.runtime.slow_path.context_hydrator import ContextHydrator
 from graphslm_ids.runtime.slow_path.evidence_builder import EvidenceBuilder, EvidenceBuilderConfig
 from graphslm_ids.runtime.slow_path.evidence_ranker import EvidenceRanker, RankerConfig
 from graphslm_ids.runtime.slow_path.fallback_template import render_minimal, render_template
+from graphslm_ids.runtime.slow_path.graph_serializer import serialize_bundle
+from graphslm_ids.runtime.slow_path.graph_verifier import GraphVerifier, NliScorer, NullNliScorer, VerifierConfig
 from graphslm_ids.runtime.slow_path.report_generator import ReportGenerationError, ReportGenerator
 from graphslm_ids.runtime.slow_path.report_validator import ReportValidator, ValidatorConfig
 from graphslm_ids.runtime.slow_path.types import SlowPathJob
@@ -22,6 +24,7 @@ class SlowPathConfig:
     top_paths: int = 5
     alert_threshold: float = 0.70
     max_payload_preview_bytes: int = 64
+    max_repair_attempts: int = 2
 
 
 @dataclass
@@ -44,6 +47,8 @@ class SlowPathWorker:
         cold_store: Any | None = None,
         counterfactual_model: Any | None = None,
         label_to_index: Mapping[str, int] | None = None,
+        verifier_config: VerifierConfig | None = None,
+        nli_scorer: NliScorer | None = None,
     ) -> None:
         self.config = config or SlowPathConfig()
         self.context_hydrator = context_hydrator or ContextHydrator()
@@ -58,6 +63,7 @@ class SlowPathWorker:
         self.evidence_ranker = evidence_ranker or EvidenceRanker(RankerConfig())
         self.report_generator = report_generator or ReportGenerator()
         self.validator = validator or ReportValidator(ValidatorConfig())
+        self.verifier = GraphVerifier(verifier_config or VerifierConfig(), nli_scorer or NullNliScorer())
         self.cold_store = cold_store
 
     def process_job(
@@ -81,34 +87,42 @@ class SlowPathWorker:
                 top_paths=self.config.top_paths,
             )
 
-            tier1_result = None
+            # VG²R flow: serialize the subgraph -> SLM reads graph-text ->
+            # verify each claim against the graph -> bounded repair -> template.
+            graph_text = serialize_bundle(bundle)
+            report = None
+            record = None
             try:
-                tier1_report = self.report_generator.generate(bundle, tier=1)
-                tier1_result = self.validator.validate(tier1_report, bundle)
+                report = self.report_generator.generate_from_graphtext(graph_text, job.alert_id, tier=1)
+                record = self.verifier.verify(report, bundle, graph_text, repair_tier=1)
             except (ReportGenerationError, TimeoutError):
-                tier1_report = None
+                report = None
 
-            if tier1_result is not None and tier1_result.overall_pass:
-                final_report = tier1_report
-                final_validation = tier1_result
-                final_tier = 1
-            else:
-                mini_bundle = self.evidence_ranker.truncate_to_mini(bundle)
-                tier2_result = None
+            attempt = 0
+            while (
+                record is not None
+                and not record.overall_pass
+                and attempt < self.config.max_repair_attempts
+            ):
+                attempt += 1
+                failing = [
+                    v.text for v in record.claim_verdicts
+                    if v.label in ("unsupported", "contradicted")
+                ]
                 try:
-                    tier2_report = self.report_generator.generate(mini_bundle, tier=2)
-                    tier2_result = self.validator.validate(tier2_report, bundle)
+                    report = self.report_generator.regenerate_with_repair(graph_text, failing, tier=2)
+                    record = self.verifier.verify(report, bundle, graph_text, repair_tier=1 + attempt)
                 except (ReportGenerationError, TimeoutError):
-                    tier2_report = None
+                    break
 
-                if tier2_result is not None and tier2_result.overall_pass:
-                    final_report = tier2_report
-                    final_validation = tier2_result
-                    final_tier = 2
-                else:
-                    final_report = render_template(bundle, template_tag="TEMPLATE FALLBACK")
-                    final_validation = self.validator.validate(final_report, bundle)
-                    final_tier = 3
+            if record is not None and record.overall_pass:
+                final_report = report
+                final_validation = record
+                final_tier = 1 if attempt == 0 else 2
+            else:
+                final_report = render_template(bundle, template_tag="TEMPLATE FALLBACK")
+                final_validation = self.verifier.verify(final_report, bundle, graph_text, repair_tier=3)
+                final_tier = 3
 
             self._persist(job, bundle, final_report, final_validation, final_tier, store)
             return SlowPathResult(final_report, bundle, final_validation, final_tier)

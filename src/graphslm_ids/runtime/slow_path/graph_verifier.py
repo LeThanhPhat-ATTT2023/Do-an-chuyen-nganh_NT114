@@ -64,7 +64,7 @@ class VerifierConfig:
 
 _CITE_RE = re.compile(r"\[(E_[A-Z]+_\d{3}|E_ALERT|E_FLOW_\d{3})\]")
 _NUM_NEAR = re.compile(
-    r"(confidence|probability|attention weight|attention|cf_drop|counterfactual drop|drop|port)\D{0,12}(\d+(?:\.\d+)?)",
+    r"\b(confidence|probability|attention weight|attention|cf_drop|counterfactual drop|drop|port)\b\D{0,12}(\d+(?:\.\d+)?)",
     flags=re.IGNORECASE,
 )
 
