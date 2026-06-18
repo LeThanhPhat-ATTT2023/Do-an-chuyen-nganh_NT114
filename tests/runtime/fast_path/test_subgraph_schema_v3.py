@@ -54,3 +54,31 @@ def test_host_nodes_and_edges_built():
     assert host_x.shape[0] == 2 and host_x.shape[1] == 4  # src + dst host, 4-d
     assert ("flow", "from_host", "host") in sub.edge_index_dict
     assert ("flow", "to_host", "host") in sub.edge_index_dict
+
+
+def _snapshot_with_evidence():
+    snap = _snapshot_one_packet(b"select")
+    # mitre_topk now carries (tech, family, weight)
+    snap["packets"][0]["mitre_topk"] = [("T1190", "injection", 0.9)]
+    return snap
+
+
+class StubBufferTech(StubBuffer):
+    technique_to_tactic = {"T1190": "TA0001"}
+    tactic_metadata = {"TA0001": {"tactic_id": "TA0001"}}
+    technique_features = {"T1190": np.zeros(768, dtype=np.float32)}
+
+
+def test_v3_edge_type_names_emitted():
+    builder = SubgraphBuilder(
+        StubBufferTech(_snapshot_with_evidence()),
+        packet_feature="ordered_byte", always_include_all_tactics=False,
+    )
+    sub = builder.build("flow_1")
+    keys = set(sub.edge_index_dict.keys())
+    assert ("flow", "contain", "packet") in keys
+    assert ("packet", "evidence_injection", "technique") in keys
+    assert ("technique", "technique_tactic", "tactic") in keys
+    # old names must NOT appear
+    assert ("packet", "matches_technique", "technique") not in keys
+    assert ("technique", "belongs_to_tactic", "tactic") not in keys

@@ -118,8 +118,8 @@ class SubgraphBuilder:
         edge_index: dict[EdgeKey, np.ndarray] = {}
         edge_weight: dict[EdgeKey, np.ndarray] = {}
 
-        contains = [(flow_idx[str(seed_flow_id)], packet_idx[pid]) for pid in packet_ids]
-        _set_edges(edge_index, edge_weight, ("flow", "contains", "packet"), contains)
+        contain = [(flow_idx[str(seed_flow_id)], packet_idx[pid]) for pid in packet_ids]
+        _set_edges(edge_index, edge_weight, ("flow", "contain", "packet"), contain)
 
         next_edges = [
             (idx, idx + 1)
@@ -131,53 +131,48 @@ class SubgraphBuilder:
             next_edges = next_edges[:next_limit]
         _set_edges(edge_index, edge_weight, ("packet", "next_packet", "packet"), next_edges)
 
-        packet_tech_edges: list[tuple[int, int]] = []
-        packet_tech_weights: list[float] = []
+        # Packet -> technique edges, routed by family to evidence_<family>.
+        evidence_by_family: dict[str, tuple[list[tuple[int, int]], list[float]]] = {}
         for packet in packet_entries:
             packet_id = str(packet["packet_id"])
-            pairs = self._select_score_pairs(
-                "packet__matches_technique__technique",
-                _score_pairs(packet.get("mitre_topk", [])),
-            )
-            for tech_id, score in pairs:
-                if tech_id in technique_idx:
-                    packet_tech_edges.append((packet_idx[packet_id], technique_idx[tech_id]))
-                    packet_tech_weights.append(float(score))
-        _set_edges(
-            edge_index,
-            edge_weight,
-            ("packet", "matches_technique", "technique"),
-            packet_tech_edges,
-            packet_tech_weights,
-        )
+            for tech_id, family, score in _triples(packet.get("mitre_topk", [])):
+                if tech_id not in technique_idx:
+                    continue
+                pairs, weights = evidence_by_family.setdefault(str(family), ([], []))
+                pairs.append((packet_idx[packet_id], technique_idx[tech_id]))
+                weights.append(float(score))
+        for family, (pairs, weights) in evidence_by_family.items():
+            _set_edges(edge_index, edge_weight, ("packet", f"evidence_{family}", "technique"),
+                       pairs, weights)
 
         flow_tech_edges: list[tuple[int, int]] = []
         flow_tech_weights: list[float] = []
-        flow_pairs = self._select_score_pairs(
-            "flow__matches_technique__technique",
-            _score_pairs(snapshot.get("flow_to_mitre", [])),
-        )
-        for tech_id, score in flow_pairs:
+        for tech_id, _family, score in _triples(snapshot.get("flow_to_mitre", [])):
             if tech_id in technique_idx:
                 flow_tech_edges.append((0, technique_idx[tech_id]))
                 flow_tech_weights.append(float(score))
-        _set_edges(
-            edge_index,
-            edge_weight,
-            ("flow", "matches_technique", "technique"),
-            flow_tech_edges,
-            flow_tech_weights,
-        )
+        _set_edges(edge_index, edge_weight, ("flow", "flow_technique", "technique"),
+                   flow_tech_edges, flow_tech_weights)
 
         tactic_edges: list[tuple[int, int]] = []
         for tech_id in technique_ids:
             tactic_id = technique_to_tactic.get(tech_id)
             if tactic_id in tactic_idx:
                 tactic_edges.append((technique_idx[tech_id], tactic_idx[tactic_id]))
-        tactic_limit = self._top_n("technique__belongs_to_tactic__tactic")
+        tactic_limit = self._top_n("technique__technique_tactic__tactic")
         if tactic_limit is not None:
             tactic_edges = tactic_edges[:tactic_limit]
-        _set_edges(edge_index, edge_weight, ("technique", "belongs_to_tactic", "tactic"), tactic_edges)
+        _set_edges(edge_index, edge_weight, ("technique", "technique_tactic", "tactic"), tactic_edges)
+
+        # has_subtechnique: T1190.001 -> parent T1190 (when both are present).
+        subtech_edges = []
+        for tech_id in technique_ids:
+            if "." in tech_id:
+                parent = tech_id.split(".")[0]
+                if parent in technique_idx:
+                    subtech_edges.append((technique_idx[parent], technique_idx[tech_id]))
+        _set_edges(edge_index, edge_weight, ("technique", "has_subtechnique", "technique"),
+                   subtech_edges)
 
         host_bytes = float(snapshot["flow"].get("total_payload_bytes", 0.0))
         _set_edges(edge_index, edge_weight, ("flow", "from_host", "host"), from_host_pairs,
@@ -300,7 +295,7 @@ class SubgraphBuilder:
         return int(value)
 
     def _packet_semantic_score(self, packet: dict[str, Any]) -> float:
-        pairs = _score_pairs(packet.get("mitre_topk", []))
+        pairs = [(t, w) for t, _f, w in _triples(packet.get("mitre_topk", []))]
         if not pairs:
             return 0.0
         return max(float(score) for _, score in pairs)
@@ -323,16 +318,10 @@ class SubgraphBuilder:
         packet_entries: list[dict[str, Any]],
     ) -> list[str]:
         seen: dict[str, None] = {}
-        for tech_id, _ in self._select_score_pairs(
-            "flow__matches_technique__technique",
-            _score_pairs(snapshot.get("flow_to_mitre", [])),
-        ):
+        for tech_id, _family, _w in _triples(snapshot.get("flow_to_mitre", [])):
             seen.setdefault(tech_id, None)
         for packet in packet_entries:
-            for tech_id, _ in self._select_score_pairs(
-                "packet__matches_technique__technique",
-                _score_pairs(packet.get("mitre_topk", [])),
-            ):
+            for tech_id, _family, _w in _triples(packet.get("mitre_topk", [])):
                 seen.setdefault(tech_id, None)
         return list(seen.keys())
 
@@ -437,6 +426,19 @@ def _payload_bytes(packet: dict[str, Any]) -> bytes:
         return bytes.fromhex(hexs)
     except ValueError:
         return b""
+
+
+def _triples(raw: Any) -> list[tuple[str, str, float]]:
+    """Coerce mitre_topk entries into (technique, family, weight) triples.
+
+    Accepts both new 3-tuples and legacy 2-tuples (family defaulted to '')."""
+    out: list[tuple[str, str, float]] = []
+    for item in raw or []:
+        if isinstance(item, (list, tuple)) and len(item) == 3:
+            out.append((str(item[0]), str(item[1]), float(item[2])))
+        elif isinstance(item, (list, tuple)) and len(item) == 2:
+            out.append((str(item[0]), "", float(item[1])))
+    return out
 
 
 def _score_pairs(value: Any) -> list[tuple[str, float]]:

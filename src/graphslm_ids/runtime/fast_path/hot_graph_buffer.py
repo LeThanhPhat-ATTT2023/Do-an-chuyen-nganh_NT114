@@ -35,7 +35,7 @@ class HotGraphBuffer:
 
         self.flow_features: dict[str, dict[str, Any]] = {}
         self.flow_to_packets: dict[str, list[str]] = {}
-        self.flow_to_mitre: dict[str, list[tuple[str, float]]] = {}
+        self.flow_to_mitre: dict[str, list[tuple[str, str, float]]] = {}
 
         self.packet_metadata: dict[str, dict[str, Any]] = {}
         self.packet_payload_text: dict[str, str] = {}
@@ -45,7 +45,7 @@ class HotGraphBuffer:
         self.packet_attention: dict[str, float] = {}
         self.packet_counterfactual_drop: dict[str, float] = {}
         self.packet_to_flow: dict[str, str] = {}
-        self.packet_to_mitre: dict[str, list[tuple[str, float]]] = {}
+        self.packet_to_mitre: dict[str, list[tuple[str, str, float]]] = {}
         self.packet_embeddings: dict[str, np.ndarray] = {}
 
         self.technique_features: dict[str, np.ndarray] = {}
@@ -77,7 +77,7 @@ class HotGraphBuffer:
         src_port: int,
         dst_port: int,
         protocol: str,
-        mitre_topk: list[tuple[str, float]],
+        mitre_topk: list[tuple[str, str, float]],
     ) -> None:
         packet_id = str(packet_id)
         flow_id = str(flow_id)
@@ -85,8 +85,8 @@ class HotGraphBuffer:
         with self._lock:
             self._event_queue.append(_Event(timestamp, packet_id, flow_id))
             topk = [
-                (str(tech_id), float(score))
-                for tech_id, score in mitre_topk[: self.max_techniques_per_node]
+                (str(t[0]), str(t[1]), float(t[2])) if len(t) == 3 else (str(t[0]), "", float(t[1]))
+                for t in mitre_topk[: self.max_techniques_per_node]
             ]
             metadata = {
                 "packet_id": packet_id,
@@ -290,13 +290,16 @@ class HotGraphBuffer:
         }
 
     def _refresh_flow_to_mitre(self, flow_id: str) -> None:
-        pooled: dict[str, float] = {}
+        pooled: dict[str, tuple[str, float]] = {}
         for packet_id in self.flow_to_packets.get(flow_id, []):
-            for tech_id, score in self.packet_to_mitre.get(packet_id, []):
-                pooled[tech_id] = max(pooled.get(tech_id, float("-inf")), float(score))
-        top = sorted(pooled.items(), key=lambda item: item[1], reverse=True)[
+            for entry in self.packet_to_mitre.get(packet_id, []):
+                tech_id, family, score = entry if len(entry) == 3 else (entry[0], "", entry[1])
+                prev = pooled.get(tech_id)
+                if prev is None or float(score) > prev[1]:
+                    pooled[tech_id] = (str(family), float(score))
+        top = sorted(pooled.items(), key=lambda kv: kv[1][1], reverse=True)[
             : self.max_techniques_per_node
         ]
-        self.flow_to_mitre[flow_id] = top
+        self.flow_to_mitre[flow_id] = [(t, fam_sc[0], fam_sc[1]) for t, fam_sc in top]
         if flow_id in self.flow_features:
-            self.flow_features[flow_id]["mitre_topk"] = list(top)
+            self.flow_features[flow_id]["mitre_topk"] = list(self.flow_to_mitre[flow_id])
