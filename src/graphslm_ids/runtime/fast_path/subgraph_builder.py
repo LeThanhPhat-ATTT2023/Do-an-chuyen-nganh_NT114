@@ -5,6 +5,8 @@ from typing import Any
 
 import numpy as np
 
+from graphslm_ids.offline.preprocessing.payload_features import compute_packet_payload_features
+
 
 EdgeKey = tuple[str, str, str]
 
@@ -319,7 +321,18 @@ class SubgraphBuilder:
         return ((flow_x - mean_arr) / std_arr).astype(np.float32)
 
     def _packet_features(self, packet_entries: list[dict[str, Any]]) -> np.ndarray:
-        rows: list[np.ndarray] = []
+        if self.packet_feature == "ordered_byte":
+            rows: list[np.ndarray] = []
+            for packet in packet_entries:
+                payload = _payload_bytes(packet)
+                rows.append(compute_packet_payload_features(payload, len(payload)))
+            if rows:
+                return np.stack(rows, axis=0).astype(np.float32)
+            dim = int(compute_packet_payload_features(b"", 0).shape[0])
+            return np.empty((0, dim), dtype=np.float32)
+
+        # Legacy embedding path (kept for the on-disk store / semantic mode).
+        rows = []
         packet_embeddings = self._static_mapping("packet_embeddings")
         for packet in packet_entries:
             embedding = packet.get("embedding")
@@ -386,6 +399,17 @@ class SubgraphBuilder:
 
 def edge_key_to_name(edge_key: EdgeKey) -> str:
     return "__".join(edge_key)
+
+
+def _payload_bytes(packet: dict[str, Any]) -> bytes:
+    """Reconstruct raw payload bytes from a packet entry's stored hex preview."""
+    hexs = str(packet.get("payload_preview_hex") or packet.get("payload_hex") or "")
+    if not hexs:
+        return b""
+    try:
+        return bytes.fromhex(hexs)
+    except ValueError:
+        return b""
 
 
 def _score_pairs(value: Any) -> list[tuple[str, float]]:
