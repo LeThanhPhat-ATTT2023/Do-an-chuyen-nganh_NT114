@@ -13,11 +13,28 @@ from typing import Protocol
 
 from graphslm_ids.runtime.slow_path.evidence_bundle import EvidenceBundle
 
-# Reuse the existing sentence/claim/citation/safety helpers — one definition.
+# Reuse the existing claim/citation/safety helpers — one definition.
 from graphslm_ids.runtime.slow_path.report_validator import (
     _check_safety, _collect_evidence_ids, _collect_valid_entities,
-    _has_valid_citation, _is_key_claim, _split_sentences,
+    _has_valid_citation, _is_key_claim,
 )
+
+
+# Sentence splitter for claim grounding. Unlike the report-validator's splitter,
+# it splits ONLY on sentence-ending punctuation, NOT after "]". SLMs frequently
+# cite mid-sentence ("the flow [E_FLOW_001] triggered ..."); splitting at "]"
+# would orphan the rest of the sentence into a spurious uncited claim.
+_EVIDENCE_REF = r"(?:E_[A-Z]+_\d{3}|E_ALERT|E_FLOW_\d{3})"
+_PROTECT_CITE = re.compile(rf"([.!?])\s+(\[{_EVIDENCE_REF}\])")
+_SENT_SPLIT = re.compile(r"(?<=[.!?])\s+")
+
+
+def _split_claims(text: str) -> list[str]:
+    # Protect "claim. [E_ID]" so the trailing citation (and the decimal point in
+    # values like "0.88. [E_ALERT]") stays attached to its sentence.
+    protected = _PROTECT_CITE.sub(r"\1@@CITE@@\2", text.strip())
+    parts = _SENT_SPLIT.split(protected)
+    return [part.replace("@@CITE@@", " ").strip() for part in parts if part.strip()]
 
 
 class NliScorer(Protocol):
@@ -104,7 +121,7 @@ class GraphVerifier:
         evidence_ids = _collect_evidence_ids(bundle)
         valid_entities = _collect_valid_entities(bundle)
         valid_numbers = _bundle_numeric_values(bundle)
-        sentences = _split_sentences(report)
+        sentences = _split_claims(report)
         key_claims = [s for s in sentences if _is_key_claim(s)]
 
         verdicts: list[ClaimVerdict] = []
@@ -183,9 +200,15 @@ class GraphVerifier:
     def _numeric_ok(self, claim: str, valid_numbers: list[float]) -> tuple[bool, int, int]:
         checked = 0
         ok = 0
+        tol = self.config.numeric_tolerance
         for _kw, raw in _NUM_NEAR.findall(claim):
             value = float(raw)
             checked += 1
-            if any(abs(value - v) <= self.config.numeric_tolerance for v in valid_numbers):
+            # Accept either the literal value or its percentage form (88 == 0.88),
+            # since SLMs often render a graph fraction 0.88 as "88%".
+            if any(
+                abs(value - v) <= tol or abs(value / 100.0 - v) <= tol
+                for v in valid_numbers
+            ):
                 ok += 1
         return (ok == checked, checked, ok)

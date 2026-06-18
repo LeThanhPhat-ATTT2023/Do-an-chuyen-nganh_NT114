@@ -104,6 +104,44 @@ def test_uncited_key_claim_lowers_grounding():
     assert rec.citation_grounding_rate < 1.0
 
 
+def test_midsentence_citation_counts_as_grounded():
+    # SLMs often cite mid-sentence ("the flow [E_FLOW_001] triggered ...").
+    # The whole sentence must count as ONE grounded claim, not split at the ].
+    bundle = make_bundle()
+    report = (
+        "# XAI Report - A_001\n"
+        "The flow [E_FLOW_001] triggered SqlInjection at confidence 0.88 with 14 packets.\n"
+    )
+    rec = _verifier().verify(report, bundle, serialize_bundle(bundle))
+    assert rec.citation_grounding_rate == 1.0
+    assert rec.hallucination_rate == 0.0
+
+
+def test_numeric_accepts_percentage_form():
+    # SLMs often write 88% instead of 0.88; that is still faithful to the graph.
+    bundle = make_bundle()
+    report = (
+        "# XAI Report - A_001\n"
+        "Flow flow_42 flagged as SqlInjection with confidence 88%. [E_ALERT]\n"
+        "Packet pkt_flow_42_00000003 had attention weight 82%. [E_PKT_001]\n"
+    )
+    rec = _verifier().verify(report, bundle, serialize_bundle(bundle))
+    assert rec.numeric_accuracy == 1.0
+    assert not any(v.label == "contradicted" for v in rec.claim_verdicts)
+
+
+def test_percentage_form_still_rejects_wrong_value():
+    # 10% -> 0.10 is not any graph value; must still be flagged.
+    bundle = make_bundle()
+    report = (
+        "# XAI Report - A_001\n"
+        "Flow flow_42 flagged with confidence 10%. [E_ALERT]\n"
+    )
+    rec = _verifier().verify(report, bundle, serialize_bundle(bundle))
+    assert rec.numeric_accuracy < 1.0
+    assert any(v.label == "contradicted" for v in rec.claim_verdicts)
+
+
 def test_nli_tier_marks_unsupported_when_scorer_low():
     bundle = make_bundle()
 
