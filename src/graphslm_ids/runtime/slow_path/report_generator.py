@@ -51,7 +51,21 @@ class ReportGenerator:
         user_prompt = build_user_prompt(bundle)
         if tier >= 2:
             user_prompt += "\n\nBe concise. Cite every claim with [evidence_id]."
+        return self._dispatch(system_prompt, user_prompt, tier)
 
+    def generate_from_graphtext(self, graph_text: str, alert_id: str, tier: int = 1) -> str:
+        system_prompt = build_system_prompt()
+        user_prompt = build_user_prompt_from_graphtext(graph_text, alert_id)
+        if tier >= 2:
+            user_prompt += "\n\nBe concise. Cite every claim with a [handle]."
+        return self._dispatch(system_prompt, user_prompt, tier)
+
+    def regenerate_with_repair(self, graph_text: str, failing_claims: list[str], tier: int = 1) -> str:
+        system_prompt = build_system_prompt()
+        user_prompt = build_repair_prompt(graph_text, failing_claims)
+        return self._dispatch(system_prompt, user_prompt, tier)
+
+    def _dispatch(self, system_prompt: str, user_prompt: str, tier: int) -> str:
         if self.slm_callable is not None:
             return self.slm_callable(system_prompt, user_prompt)
 
@@ -121,4 +135,34 @@ def build_user_prompt(bundle: EvidenceBundle) -> str:
         "## 6. Recommended Analyst Actions\n"
         "[3-5 concrete, generic actions the analyst can take. No specific exploits. Ground "
         "in evidence. Cite relevant evidence_ids.]"
+    )
+
+
+def build_user_prompt_from_graphtext(graph_text: str, alert_id: str) -> str:
+    return (
+        "Generate an English XAI report for the following network intrusion alert.\n"
+        "The SUBGRAPH below is the only allowed source. Every entity is tagged with a\n"
+        "handle in square brackets (e.g. [E_PKT_001]); cite the handle for every claim.\n\n"
+        "<subgraph>\n```\n"
+        f"{graph_text}\n"
+        "```\n</subgraph>\n\n"
+        "Output format (strict Markdown):\n\n"
+        f"# XAI Report - {alert_id}\n\n"
+        "## 1. Alert Summary\n[1-2 sentences; cite [E_ALERT] and [E_FLOW_001].]\n\n"
+        "## 2. Key Evidence\n[3-5 bullets, each ending with a handle like [E_PKT_001].]\n\n"
+        "## 3. Graph-Based Explanation\n[Explain the flow->packet->technique->tactic path(s). Cite [E_PATH_*].]\n\n"
+        "## 4. MITRE ATT&CK Interpretation\n[Per technique: id, name, tactic, cosine; state the link "
+        "is embedding cosine similarity. Cite [E_TECH_*].]\n\n"
+        "## 5. Confidence and Limitations\n[HGT confidence + limitations. Cite [E_ALERT].]\n\n"
+        "## 6. Recommended Analyst Actions\n[3-5 generic actions grounded in cited evidence.]"
+    )
+
+
+def build_repair_prompt(graph_text: str, failing_claims: list[str]) -> str:
+    bullets = "\n".join(f"- {c}" for c in failing_claims)
+    return (
+        "Your previous report contained claims NOT grounded in the subgraph. "
+        "Remove or correct EACH of these claims, keeping everything else; cite a handle "
+        "for every claim.\n\nUngrounded claims:\n"
+        f"{bullets}\n\n<subgraph>\n```\n{graph_text}\n```\n</subgraph>"
     )
