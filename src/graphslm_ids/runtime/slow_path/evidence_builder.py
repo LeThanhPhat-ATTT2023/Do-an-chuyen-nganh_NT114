@@ -17,7 +17,8 @@ from graphslm_ids.runtime.slow_path.types import GraphContext, SlowPathJob
 
 
 DEFAULT_LIMITATIONS = [
-    "MITRE mapping uses embedding cosine similarity, not deterministic signature matching.",
+    "MITRE mapping is from the v3 MSEE ensemble (PMI token votes + procedure "
+    "literal matches), a statistical evidence vote, not a deterministic signature.",
     "Payload preview is truncated. Full payload content is not available.",
     "HGT confidence is a probabilistic model output, not forensic proof.",
     "Counterfactual scores are approximations computed by zeroing packet embeddings.",
@@ -124,8 +125,6 @@ class EvidenceBuilder:
             )
             cf_drop = packet.counterfactual_drop or 0.0
             attn = packet.attention_weight or 0.0
-            mitre_scores = packet.mitre_cosine_scores
-            mitre_max = max(mitre_scores.values(), default=0.0)
 
             if cf_drop > 0:
                 reason = f"Masking this packet reduced malicious confidence by {cf_drop:.2f}"
@@ -143,7 +142,7 @@ class EvidenceBuilder:
                     payload_len_raw=packet.payload_len_raw,
                     payload_preview_hex=payload_hex,
                     payload_preview_ascii=payload_ascii,
-                    linked_techniques=sorted(packet.mitre_cosine_scores.keys()),
+                    linked_techniques=sorted(packet.mitre_evidence.keys()),
                     importance_score=0.0,
                     importance_sources={
                         "counterfactual_drop": cf_drop,
@@ -151,7 +150,6 @@ class EvidenceBuilder:
                         "combined_score": 0.0,
                     },
                     importance_reason=reason,
-                    mitre_max_cosine=mitre_max,
                 )
             )
         return packet_evidence
@@ -342,43 +340,34 @@ class EvidenceBuilder:
         packet_evidence: list[PacketEvidence],
     ) -> list[MitreEvidence]:
         candidate: dict[str, dict[str, object]] = {}
-        packet_map = {packet.packet_id: packet for packet in context.packets}
 
-        for packet in packet_evidence:
-            source = packet_map.get(packet.packet_id)
-            if source is None:
-                continue
-            for technique_id, cosine in source.mitre_cosine_scores.items():
-                entry = candidate.setdefault(
-                    technique_id,
-                    {
-                        "max_cosine": float(cosine),
-                        "supporting_packets": set(),
-                        "matched_from": set(),
-                    },
-                )
-                entry["max_cosine"] = max(float(entry["max_cosine"]), float(cosine))
-                entry["supporting_packets"].add(packet.packet_id)
-                entry["matched_from"].add(packet.packet_id)
+        def _acc(tech_id: str, edge, origin: str) -> None:
+            entry = candidate.setdefault(tech_id, {
+                "family": edge.family, "weight": float(edge.weight),
+                "source": set(), "tokens": set(), "literals": set(),
+                "supporting": set(), "matched_from": set(),
+            })
+            entry["weight"] = max(float(entry["weight"]), float(edge.weight))
+            if edge.family:
+                entry["family"] = edge.family
+            if edge.source:
+                entry["source"].add(edge.source)
+            entry["tokens"].update(edge.tokens)
+            entry["literals"].update(edge.literals)
+            entry["matched_from"].add(origin)
 
-        for technique_id, cosine in context.flow_mitre_scores.items():
-            entry = candidate.setdefault(
-                technique_id,
-                {
-                    "max_cosine": float(cosine),
-                    "supporting_packets": set(),
-                    "matched_from": set(),
-                },
-            )
-            entry["max_cosine"] = max(float(entry["max_cosine"]), float(cosine))
-            entry["matched_from"].add(context.flow.flow_id)
+        for packet in context.packets:
+            for tech_id, edge in packet.mitre_evidence.items():
+                _acc(tech_id, edge, packet.packet_id)
+                candidate[tech_id]["supporting"].add(packet.packet_id)
+        for tech_id, edge in context.flow_mitre_evidence.items():
+            _acc(tech_id, edge, context.flow.flow_id)
 
         evidence: list[MitreEvidence] = []
         for idx, (technique_id, data) in enumerate(candidate.items(), start=1):
             metadata = context.mitre_metadata.get(technique_id)
             if metadata is None:
                 continue
-            matched_from = sorted(str(item) for item in data["matched_from"])
             evidence.append(
                 MitreEvidence(
                     evidence_id=f"E_TECH_{idx:03d}",
@@ -386,11 +375,13 @@ class EvidenceBuilder:
                     technique_name=metadata.technique_name,
                     tactic=metadata.tactic,
                     tactic_id=metadata.tactic_id,
-                    cosine_score=float(data["max_cosine"]),
-                    matched_from=matched_from,
-                    supporting_packet_count=len(data["supporting_packets"]),
-                    mapping_type=metadata.mapping_type,
-                    mapping_caution=metadata.mapping_caution,
+                    family=str(data["family"]),
+                    evidence_weight=float(data["weight"]),
+                    source="+".join(sorted(data["source"])) if data["source"] else "",
+                    matched_tokens=sorted(str(t) for t in data["tokens"]),
+                    matched_literals=sorted(str(lit) for lit in data["literals"]),
+                    supporting_packet_count=len(data["supporting"]),
+                    matched_from=sorted(str(m) for m in data["matched_from"]),
                 )
             )
         return evidence
@@ -424,12 +415,12 @@ class EvidenceBuilder:
             source = packet_map.get(packet.packet_id)
             if source is None:
                 continue
-            for technique_id, cosine in source.mitre_cosine_scores.items():
+            for technique_id, edge in source.mitre_evidence.items():
                 mitre_item = mitre_map.get(technique_id)
                 if mitre_item is None:
                     continue
                 attention = packet.importance_sources.get("hgt_attention_weight", 0.0)
-                path_score = float(cosine) * float(attention)
+                path_score = float(edge.weight) * float(attention)
                 if math.isfinite(path_score) is False:
                     path_score = 0.0
 
@@ -442,7 +433,7 @@ class EvidenceBuilder:
                             {"id": mitre_item.technique_id, "type": "technique"},
                             {"id": mitre_item.tactic_id, "type": "tactic"},
                         ],
-                        path_edges=["contains", "matches_technique", "belongs_to_tactic"],
+                        path_edges=["contain", f"evidence_{edge.family}", "technique_tactic"],
                         path_score=path_score,
                         attention_weight=float(attention),
                     )

@@ -136,3 +136,34 @@ def test_mitre_evidence_v3_fields():
     d = m.to_dict()
     assert d["family"] == "injection" and d["evidence_weight"] == 0.9
     assert "cosine_score" not in d and "mapping_type" not in d
+
+
+from graphslm_ids.runtime.slow_path.evidence_builder import EvidenceBuilder  # noqa: E402
+from graphslm_ids.runtime.slow_path.types import (  # noqa: E402
+    FlowContext, MitreMetadata, SlowPathJob,
+)
+
+
+def _ctx():
+    flow = FlowContext(flow_id="f1", src_ip="10.0.0.1", dst_ip="10.0.0.2",
+                       src_port=1, dst_port=80, protocol="TCP",
+                       duration_seconds=0.0, packet_count=1, total_payload_bytes=2)
+    pkt = PacketContext(packet_id="p1", order_in_flow=0, timestamp=0.0,
+                        payload_len_raw=2, payload_preview_hex="6162",
+                        payload_preview_ascii="ab",
+                        mitre_evidence={"T1190": MitreEdge("injection", 0.9, "pmi", ["t:select"], [])})
+    meta = {"T1190": MitreMetadata("T1190", "Exploit Public-Facing App", "Initial Access", "TA0001")}
+    return GraphContext(flow=flow, packets=[pkt], mitre_metadata=meta,
+                        flow_mitre_evidence={})
+
+
+def test_builder_emits_v3_mitre_evidence():
+    job = SlowPathJob(alert_id="A1", flow_id="f1", predicted_label="SqlInjection",
+                      confidence=0.9, alert_threshold=0.7)
+    bundle = EvidenceBuilder().build(job, _ctx())
+    assert bundle.mitre_evidence
+    me = bundle.mitre_evidence[0]
+    assert me.family == "injection" and me.source == "pmi"
+    assert me.matched_tokens == ["t:select"]
+    if bundle.graph_paths:
+        assert bundle.graph_paths[0].path_edges == ["contain", "evidence_injection", "technique_tactic"]
