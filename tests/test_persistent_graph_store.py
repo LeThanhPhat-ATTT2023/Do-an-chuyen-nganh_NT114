@@ -55,7 +55,8 @@ def test_persistent_graph_store_round_trip_context(tmp_path) -> None:
     assert context.flow.flow_id == "flow_1"
     assert context.flow.packet_count == 1
     assert context.packets[0].payload_preview_ascii == "GET "
-    assert context.packets[0].mitre_cosine_scores == {"T1001": 0.91}
+    edge = context.packets[0].mitre_evidence["T1001"]
+    assert edge.weight == 0.91
     assert context.mitre_metadata["T1001"].tactic_id == "initial-access"
 
 

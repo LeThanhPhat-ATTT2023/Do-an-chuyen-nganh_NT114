@@ -4,7 +4,9 @@ import binascii
 import math
 from typing import Any, Iterable, Mapping, Sequence
 
-from graphslm_ids.runtime.slow_path.types import FlowContext, GraphContext, MitreMetadata, PacketContext
+from graphslm_ids.runtime.slow_path.types import (
+    FlowContext, GraphContext, MitreEdge, MitreMetadata, PacketContext,
+)
 
 
 class HotBufferAdapter:
@@ -40,16 +42,16 @@ class HotBufferAdapter:
             packet_contexts = packet_contexts[: self.max_packets]
 
         flow_context = self._build_flow_context(flow_id, flow_record, packet_contexts, packet_records)
-        flow_mitre_scores = self._resolve_flow_mitre_scores(
+        flow_mitre_evidence = self._resolve_flow_mitre_evidence(
             flow_id, flow_record, packet_records, packet_contexts
         )
-        mitre_metadata = self._resolve_mitre_metadata(flow_mitre_scores, packet_contexts)
+        mitre_metadata = self._resolve_mitre_metadata(flow_mitre_evidence, packet_contexts)
 
         return GraphContext(
             flow=flow_context,
             packets=packet_contexts,
             mitre_metadata=mitre_metadata,
-            flow_mitre_scores=flow_mitre_scores,
+            flow_mitre_evidence=flow_mitre_evidence,
         )
 
     def _resolve_flow_record(self, flow_id: str) -> Mapping[str, Any] | None:
@@ -176,11 +178,12 @@ class HotBufferAdapter:
                 payload_len_raw,
             )
 
-            mitre_scores = self._coerce_mitre_scores(
-                self._get_field(record, "mitre_cosine_scores", "mitre_scores", "mitre_topk")
+            mitre_evidence = self._coerce_mitre_evidence(
+                self._get_field(record, "mitre_topk", "mitre_cosine_scores", "mitre_scores"),
+                self._get_field(record, "mitre_provenance"),
             )
-            if not mitre_scores:
-                mitre_scores = self._coerce_mitre_scores(packet_to_mitre.get(packet_id))
+            if not mitre_evidence:
+                mitre_evidence = self._coerce_mitre_evidence(packet_to_mitre.get(packet_id))
 
             attention_weight = self._safe_float(self._get_field(record, "attention_weight"))
             counterfactual_drop = self._safe_float(self._get_field(record, "counterfactual_drop"))
@@ -193,7 +196,7 @@ class HotBufferAdapter:
                     payload_len_raw=payload_len_raw,
                     payload_preview_hex=payload_hex,
                     payload_preview_ascii=payload_ascii,
-                    mitre_cosine_scores=mitre_scores,
+                    mitre_evidence=mitre_evidence,
                     attention_weight=attention_weight,
                     counterfactual_drop=counterfactual_drop,
                 )
@@ -291,14 +294,14 @@ class HotBufferAdapter:
 
         return stats
 
-    def _resolve_flow_mitre_scores(
+    def _resolve_flow_mitre_evidence(
         self,
         flow_id: str,
         flow_record: Mapping[str, Any] | None,
         packet_records: Sequence[Mapping[str, Any]],
         packet_contexts: Sequence[PacketContext],
-    ) -> dict[str, float]:
-        flow_scores = self._coerce_mitre_scores(
+    ) -> dict[str, "MitreEdge"]:
+        flow_scores = self._coerce_mitre_evidence(
             self._get_field(flow_record, "flow_mitre_scores", "mitre_scores", "mitre_topk")
         )
         if flow_scores:
@@ -306,15 +309,15 @@ class HotBufferAdapter:
 
         flow_to_mitre = self._first_mapping("flow_to_mitre", "flow_mitre", "flow_to_technique")
         if flow_to_mitre:
-            flow_scores = self._coerce_mitre_scores(flow_to_mitre.get(flow_id))
+            flow_scores = self._coerce_mitre_evidence(flow_to_mitre.get(flow_id))
             if flow_scores:
                 return flow_scores
 
-        aggregated: dict[str, float] = {}
+        aggregated: dict[str, MitreEdge] = {}
         for packet in packet_contexts:
-            for tech_id, score in packet.mitre_cosine_scores.items():
-                if tech_id not in aggregated or score > aggregated[tech_id]:
-                    aggregated[tech_id] = score
+            for tech_id, edge in packet.mitre_evidence.items():
+                if tech_id not in aggregated or edge.weight > aggregated[tech_id].weight:
+                    aggregated[tech_id] = edge
         return aggregated
 
     def _resolve_mitre_metadata(
@@ -322,7 +325,7 @@ class HotBufferAdapter:
     ) -> dict[str, MitreMetadata]:
         technique_ids: set[str] = set(flow_mitre_scores.keys())
         for packet in packet_contexts:
-            technique_ids.update(packet.mitre_cosine_scores.keys())
+            technique_ids.update(packet.mitre_evidence.keys())
 
         catalog = self._get_mitre_catalog()
         metadata: dict[str, MitreMetadata] = {}
@@ -398,10 +401,11 @@ class HotBufferAdapter:
             tactic_name = str(tactic_id)
 
         technique_name = raw.get("technique_name") or raw.get("name") or technique_id
-        mapping_type = raw.get("mapping_type", "embedding_cosine_similarity")
+        source = raw.get("source", "msee_ensemble")
         mapping_caution = raw.get(
             "mapping_caution",
-            "This link is based on semantic similarity, not deterministic signature matching.",
+            "This link is from the v3 MSEE ensemble (PMI + procedure matcher), "
+            "a statistical evidence vote, not forensic proof.",
         )
 
         return MitreMetadata(
@@ -409,9 +413,45 @@ class HotBufferAdapter:
             technique_name=str(technique_name),
             tactic=str(tactic_name or "unknown"),
             tactic_id=str(tactic_id or ""),
-            mapping_type=str(mapping_type),
+            source=str(source),
             mapping_caution=str(mapping_caution),
         )
+
+    def _coerce_mitre_evidence(
+        self, value: Any, provenance: Mapping[str, Any] | None = None,
+    ) -> dict[str, "MitreEdge"]:
+        prov = dict(provenance or {})
+        out: dict[str, MitreEdge] = {}
+        if isinstance(value, Mapping):
+            # Legacy ``{technique_id: weight}`` form (no family/provenance).
+            for tech, weight in value.items():
+                if weight is None:
+                    continue
+                p = prov.get(str(tech), {})
+                out[str(tech)] = MitreEdge(
+                    family="", weight=float(weight),
+                    source=str(p.get("source", "")),
+                    tokens=[str(t) for t in p.get("tokens", [])],
+                    literals=[str(lit) for lit in p.get("literals", [])],
+                )
+            return out
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+            for item in value:
+                if isinstance(item, Sequence) and not isinstance(item, (str, bytes, bytearray)):
+                    if len(item) == 3:
+                        tech, family, weight = str(item[0]), str(item[1]), float(item[2])
+                    elif len(item) == 2:
+                        tech, family, weight = str(item[0]), "", float(item[1])
+                    else:
+                        continue
+                    p = prov.get(tech, {})
+                    out[tech] = MitreEdge(
+                        family=family, weight=weight,
+                        source=str(p.get("source", "")),
+                        tokens=[str(t) for t in p.get("tokens", [])],
+                        literals=[str(lit) for lit in p.get("literals", [])],
+                    )
+        return out
 
     def _coerce_mitre_scores(self, value: Any) -> dict[str, float]:
         if isinstance(value, Mapping):

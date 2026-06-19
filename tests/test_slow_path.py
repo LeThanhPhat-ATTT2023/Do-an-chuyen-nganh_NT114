@@ -16,6 +16,7 @@ from graphslm_ids.runtime.slow_path import (
     SlowPathJob,
     SlowPathWorker,
 )
+from graphslm_ids.runtime.slow_path.types import MitreEdge
 
 
 def _sample_context(with_mitre: bool = True) -> GraphContext:
@@ -27,7 +28,7 @@ def _sample_context(with_mitre: bool = True) -> GraphContext:
             payload_len_raw=4,
             payload_preview_hex="47455420",
             payload_preview_ascii="GET ",
-            mitre_cosine_scores={"T1190": 0.86} if with_mitre else {},
+            mitre_evidence={"T1190": MitreEdge("injection", 0.86, "pmi", ["t:get"], [])} if with_mitre else {},
         ),
         PacketContext(
             packet_id="pkt_b",
@@ -36,7 +37,7 @@ def _sample_context(with_mitre: bool = True) -> GraphContext:
             payload_len_raw=4,
             payload_preview_hex="2f61646d",
             payload_preview_ascii="/adm",
-            mitre_cosine_scores={"T1190": 0.74} if with_mitre else {},
+            mitre_evidence={"T1190": MitreEdge("injection", 0.74, "pmi", ["t:adm"], [])} if with_mitre else {},
         ),
     ]
     metadata = {}
@@ -61,7 +62,7 @@ def _sample_context(with_mitre: bool = True) -> GraphContext:
         ),
         packets=packets,
         mitre_metadata=metadata,
-        flow_mitre_scores={"T1190": 0.86} if with_mitre else {},
+        flow_mitre_evidence={"T1190": MitreEdge("injection", 0.86, "pmi", ["t:get"], [])} if with_mitre else {},
     )
 
 

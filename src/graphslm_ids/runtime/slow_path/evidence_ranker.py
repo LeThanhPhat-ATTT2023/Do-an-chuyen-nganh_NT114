@@ -87,9 +87,13 @@ class EvidenceRanker:
         total_packets = bundle.flow_evidence.packet_count or len(packets)
         denom = max(total_packets - 1, 1)
 
+        weight_by_ev = {t.evidence_id: float(t.evidence_weight) for t in bundle.mitre_evidence}
         cf_values = [p.importance_sources.get("counterfactual_drop", 0.0) for p in packets]
         attn_values = [p.importance_sources.get("hgt_attention_weight", 0.0) for p in packets]
-        cos_values = [p.mitre_max_cosine for p in packets]
+        cos_values = [
+            max((weight_by_ev.get(ev, 0.0) for ev in p.linked_techniques), default=0.0)
+            for p in packets
+        ]
         temp_values = [1.0 - (p.order_in_flow / denom) for p in packets]
 
         cf_norm = _min_max_norm(cf_values)
@@ -111,17 +115,17 @@ class EvidenceRanker:
         if not bundle.mitre_evidence:
             return {}
 
-        cosine_vals = [tech.cosine_score for tech in bundle.mitre_evidence]
+        weight_vals = [tech.evidence_weight for tech in bundle.mitre_evidence]
         support_vals = [tech.supporting_packet_count for tech in bundle.mitre_evidence]
         cf_vals = [self._sum_cf_drop(bundle, tech.technique_id) for tech in bundle.mitre_evidence]
 
-        cosine_norm = _min_max_norm(cosine_vals)
+        weight_norm = _min_max_norm(weight_vals)
         support_norm = _min_max_norm(support_vals)
         cf_norm = _min_max_norm(cf_vals)
 
         scores: dict[str, float] = {}
         for idx, tech in enumerate(bundle.mitre_evidence):
-            score = 0.50 * cosine_norm[idx] + 0.30 * support_norm[idx] + 0.20 * cf_norm[idx]
+            score = 0.50 * weight_norm[idx] + 0.30 * support_norm[idx] + 0.20 * cf_norm[idx]
             scores[tech.technique_id] = float(score)
         return scores
 

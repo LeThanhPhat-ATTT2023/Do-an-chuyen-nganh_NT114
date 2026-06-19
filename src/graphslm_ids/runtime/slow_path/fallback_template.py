@@ -74,14 +74,20 @@ def render_template(bundle: EvidenceBundle, template_tag: str = "TEMPLATE FALLBA
     lines.append("## 4. MITRE ATT&CK Interpretation")
     if bundle.mitre_evidence:
         for tech in bundle.mitre_evidence:
+            prov = tech.matched_tokens or tech.matched_literals
+            prov_str = f" (matched: {', '.join(prov[:5])})" if prov else ""
             lines.append(
-                "- **{tech_id}** ({tech_name}), tactic: {tactic}, cosine score: {score:.2f}. "
-                "This link is based on embedding cosine similarity and should be treated as "
-                "semantic indicator, not deterministic signature matching. [{evidence}]".format(
+                "- **{tech_id}** ({tech_name}), tactic: {tactic}, family: {family}, "
+                "evidence weight: {score:.2f} (source: {source}){prov}. "
+                "This link is from the v3 MSEE ensemble (PMI + procedure matcher), a "
+                "statistical evidence vote, not a deterministic signature. [{evidence}]".format(
                     tech_id=tech.technique_id,
                     tech_name=tech.technique_name,
                     tactic=tech.tactic,
-                    score=tech.cosine_score,
+                    family=tech.family,
+                    score=tech.evidence_weight,
+                    source=tech.source or "n/a",
+                    prov=prov_str,
                     evidence=tech.evidence_id,
                 )
             )

@@ -23,19 +23,18 @@ def make_bundle() -> EvidenceBundle:
         linked_techniques=["E_TECH_001"], importance_score=0.91,
         importance_sources={"counterfactual_drop": 0.31, "hgt_attention_weight": 0.82, "combined_score": 0.91},
         importance_reason="Packet received high attention weight in the HGT model",
-        mitre_max_cosine=0.71,
     )
     tech = MitreEvidence(
         evidence_id="E_TECH_001", technique_id="T1190", technique_name="Exploit Public-Facing Application",
-        tactic="Initial Access", tactic_id="TA0001", cosine_score=0.71,
-        matched_from=["pkt_flow_42_00000003"], supporting_packet_count=1,
-        mapping_type="pmi+procedure", mapping_caution="Mapping uses embedding cosine similarity, semantic only.",
+        tactic="Initial Access", tactic_id="TA0001", family="injection",
+        evidence_weight=0.71, source="pmi+procedure", matched_tokens=["t:select"],
+        matched_literals=[], supporting_packet_count=1, matched_from=["pkt_flow_42_00000003"],
     )
     path = GraphPathEvidence(
         evidence_id="E_PATH_001",
         path_nodes=[{"id": "flow_42", "type": "flow"}, {"id": "pkt_flow_42_00000003", "type": "packet"},
                     {"id": "T1190", "type": "technique"}, {"id": "TA0001", "type": "tactic"}],
-        path_edges=["contains", "matches_technique", "belongs_to_tactic"],
+        path_edges=["contain", "evidence_injection", "technique_tactic"],
         path_score=0.58, attention_weight=0.82,
     )
     cf = CounterfactualEvidence(

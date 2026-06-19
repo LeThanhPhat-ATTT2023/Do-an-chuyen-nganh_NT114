@@ -147,12 +147,10 @@ def _count_hallucinated_entities(report: str, bundle: EvidenceBundle) -> int:
 
 
 def _requires_mitre_caution(bundle: EvidenceBundle) -> bool:
-    return any(
-        "embedding" in tech.mapping_type.lower()
-        or "cosine" in tech.mapping_type.lower()
-        or "semantic" in tech.mapping_caution.lower()
-        for tech in bundle.mitre_evidence
-    )
+    # v3 MITRE links come from the MSEE ensemble (PMI + procedure), a statistical
+    # evidence vote — never a deterministic signature — so any MITRE evidence at
+    # all warrants a caution statement in the report.
+    return bool(bundle.mitre_evidence)
 
 
 def _has_mitre_caution(report: str) -> bool:
@@ -160,6 +158,8 @@ def _has_mitre_caution(report: str) -> bool:
         "embedding similarity",
         "cosine similarity",
         "semantic similarity",
+        "statistical evidence",
+        "deterministic signature",
         "not deterministic",
         "not a signature",
     )

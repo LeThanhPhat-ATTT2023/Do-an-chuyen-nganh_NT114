@@ -27,7 +27,7 @@ def serialize_bundle(bundle: EvidenceBundle) -> str:
     alert = bundle.alert
     flow = bundle.flow_evidence
     packets = sorted(bundle.packet_evidence, key=lambda p: (-_packet_attn(p), p.evidence_id))
-    techs = sorted(bundle.mitre_evidence, key=lambda t: (-t.cosine_score, t.evidence_id))
+    techs = sorted(bundle.mitre_evidence, key=lambda t: (-t.evidence_weight, t.evidence_id))
     paths = sorted(bundle.graph_paths, key=lambda p: (-p.path_score, p.evidence_id))
 
     lines: list[str] = []
@@ -57,9 +57,14 @@ def serialize_bundle(bundle: EvidenceBundle) -> str:
             f'payload_ascii="{pkt.payload_preview_ascii}"'
         )
     for tech in techs:
+        toks = ",".join(tech.matched_tokens[:5])
+        lits = ",".join(tech.matched_literals[:5])
+        prov = f' tokens="{toks}"' if toks else ""
+        prov += f' literals="{lits}"' if lits else ""
         lines.append(
-            f"tech [{tech.evidence_id}] id={tech.technique_id} cosine={tech.cosine_score:.2f} "
-            f"mapping={tech.mapping_type} name=\"{tech.technique_name}\""
+            f"tech [{tech.evidence_id}] id={tech.technique_id} family={tech.family} "
+            f"w={tech.evidence_weight:.2f} src={tech.source}{prov} "
+            f'name="{tech.technique_name}"'
         )
     seen_tactics: set[str] = set()
     for tech in techs:
@@ -67,6 +72,11 @@ def serialize_bundle(bundle: EvidenceBundle) -> str:
             continue
         seen_tactics.add(tech.tactic_id)
         lines.append(f"tactic id={tech.tactic_id} name=\"{tech.tactic}\"")
+    lines.append("")
+
+    # Host nodes (v3 schema): flow endpoints.
+    lines.append(f"host id={flow.src_ip} role=src")
+    lines.append(f"host id={flow.dst_ip} role=dst")
     lines.append("")
 
     # Edge list
@@ -78,10 +88,10 @@ def serialize_bundle(bundle: EvidenceBundle) -> str:
             src = nodes[i].get("id")
             dst = nodes[i + 1].get("id")
             prov = ""
-            if edges[i] == "matches_technique":
+            if edges[i].startswith("evidence_"):
                 match = next((t for t in techs if t.technique_id == dst), None)
                 if match is not None:
-                    prov = f" src={match.mapping_type} w={match.cosine_score:.2f}"
+                    prov = f" src={match.source} w={match.evidence_weight:.2f}"
             lines.append(f"{src} -{edges[i]}-> {dst}{prov} [{path.evidence_id}]")
     lines.append("")
 

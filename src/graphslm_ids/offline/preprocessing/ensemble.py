@@ -129,6 +129,42 @@ def lookup_pmi_per_packet(
     return out
 
 
+def lookup_pmi_per_packet_with_tokens(
+    payload: bytes,
+    pmi_lookup: PmiLookup,
+) -> dict[str, tuple[str, float, list[str]]]:
+    """Same as :func:`lookup_pmi_per_packet` but also returns the matched tokens.
+
+    Returns ``{technique_id: (family, summed_weight_clipped, [matched_tokens])}``.
+    Token order is the first-seen order; duplicates are de-duplicated. Empty
+    payload / no tokens / no hits all return ``{}``.
+    """
+    if not payload:
+        return {}
+    tokens = tokenize_payload(payload)
+    if not tokens:
+        return {}
+    accum: dict[str, list] = {}  # tech -> [family, weight, [tokens]]
+    for tok in tokens:
+        rows = pmi_lookup.get(tok)
+        if not rows:
+            continue
+        for tech, family, w in rows:
+            existing = accum.get(tech)
+            if existing is None:
+                accum[tech] = [family, w, [tok]]
+            else:
+                existing[1] += w
+                if tok not in existing[2]:
+                    existing[2].append(tok)
+    out: dict[str, tuple[str, float, list[str]]] = {}
+    for tech, (family, w, toks) in accum.items():
+        if w > 1.0:
+            w = 1.0
+        out[tech] = (family, float(w), list(toks))
+    return out
+
+
 def aggregate_evidence(
     packet_pmi_hits: dict[str, tuple[str, float]],
     packet_proc_hits: dict[str, float],
