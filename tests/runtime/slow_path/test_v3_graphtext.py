@@ -181,3 +181,16 @@ def test_serializer_v3_graphtext():
     assert "w=0.90" in text or "w=0.9" in text
     assert "src=pmi" in text
     assert "cosine=" not in text and "matches_technique" not in text
+
+
+from graphslm_ids.runtime.slow_path.graph_verifier import GraphVerifier, VerifierConfig  # noqa: E402
+
+
+def test_verifier_passes_v3_grounded_claim():
+    job = SlowPathJob(alert_id="A1", flow_id="f1", predicted_label="SqlInjection",
+                      confidence=0.9, alert_threshold=0.7)
+    bundle = EvidenceBuilder().build(job, _ctx())
+    graph_text = serialize_bundle(bundle)
+    report = "Packet evidence supports T1190 via injection family w=0.90 [E_TECH_001]."
+    record = GraphVerifier(VerifierConfig()).verify(report, bundle, graph_text, repair_tier=1)
+    assert record.numeric_accuracy == 1.0
