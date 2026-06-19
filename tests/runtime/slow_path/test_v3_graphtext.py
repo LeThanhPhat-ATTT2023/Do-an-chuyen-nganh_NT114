@@ -121,3 +121,18 @@ def test_adapter_builds_mitre_evidence_from_triples():
     edge = pcs[0].mitre_evidence["T1190"]
     assert edge.family == "injection" and edge.weight == 0.9
     assert edge.source == "pmi" and edge.tokens == ["t:select"]
+
+
+from graphslm_ids.runtime.slow_path.evidence_bundle import MitreEvidence  # noqa: E402
+
+
+def test_mitre_evidence_v3_fields():
+    m = MitreEvidence(
+        evidence_id="E_TECH_001", technique_id="T1190", technique_name="X",
+        tactic="Initial Access", tactic_id="TA0001", family="injection",
+        evidence_weight=0.9, source="pmi", matched_tokens=["t:select"],
+        matched_literals=[], supporting_packet_count=1, matched_from=["p1"],
+    )
+    d = m.to_dict()
+    assert d["family"] == "injection" and d["evidence_weight"] == 0.9
+    assert "cosine_score" not in d and "mapping_type" not in d

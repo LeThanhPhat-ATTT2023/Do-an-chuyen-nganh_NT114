@@ -82,7 +82,6 @@ class PacketEvidence:
     importance_score: float
     importance_sources: dict[str, float]
     importance_reason: str
-    mitre_max_cosine: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -107,11 +106,13 @@ class MitreEvidence:
     technique_name: str
     tactic: str
     tactic_id: str
-    cosine_score: float
-    matched_from: list[str]
+    family: str
+    evidence_weight: float
+    source: str
+    matched_tokens: list[str]
+    matched_literals: list[str]
     supporting_packet_count: int
-    mapping_type: str
-    mapping_caution: str
+    matched_from: list[str]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -120,11 +121,13 @@ class MitreEvidence:
             "technique_name": self.technique_name,
             "tactic": self.tactic,
             "tactic_id": self.tactic_id,
-            "cosine_score": self.cosine_score,
-            "matched_from": self.matched_from,
+            "family": self.family,
+            "evidence_weight": self.evidence_weight,
+            "source": self.source,
+            "matched_tokens": self.matched_tokens,
+            "matched_literals": self.matched_literals,
             "supporting_packet_count": self.supporting_packet_count,
-            "mapping_type": self.mapping_type,
-            "mapping_caution": self.mapping_caution,
+            "matched_from": self.matched_from,
         }
 
 
