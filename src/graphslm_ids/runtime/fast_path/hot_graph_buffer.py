@@ -46,6 +46,7 @@ class HotGraphBuffer:
         self.packet_counterfactual_drop: dict[str, float] = {}
         self.packet_to_flow: dict[str, str] = {}
         self.packet_to_mitre: dict[str, list[tuple[str, str, float]]] = {}
+        self.packet_to_provenance: dict[str, dict] = {}
         self.packet_embeddings: dict[str, np.ndarray] = {}
 
         self.technique_features: dict[str, np.ndarray] = {}
@@ -78,6 +79,7 @@ class HotGraphBuffer:
         dst_port: int,
         protocol: str,
         mitre_topk: list[tuple[str, str, float]],
+        mitre_provenance: dict[str, dict] | None = None,
     ) -> None:
         packet_id = str(packet_id)
         flow_id = str(flow_id)
@@ -107,6 +109,7 @@ class HotGraphBuffer:
             self.packet_len_raw[packet_id] = int(payload_len_raw)
             self.packet_to_flow[packet_id] = flow_id
             self.packet_to_mitre[packet_id] = topk
+            self.packet_to_provenance[packet_id] = dict(mitre_provenance or {})
             self.packet_embeddings[packet_id] = np.asarray(embedding, dtype=np.float32).copy()
 
             packet_ids = self.flow_to_packets.setdefault(flow_id, [])
@@ -147,6 +150,7 @@ class HotGraphBuffer:
                 record["payload_preview_ascii"] = self.packet_payload_ascii.get(packet_id, "")
                 record["payload_len_raw"] = self.packet_len_raw.get(packet_id, 0)
                 record["mitre_topk"] = list(self.packet_to_mitre.get(packet_id, []))
+                record["mitre_provenance"] = dict(self.packet_to_provenance.get(packet_id, {}))
                 record["attention_weight"] = self.packet_attention.get(packet_id)
                 record["counterfactual_drop"] = self.packet_counterfactual_drop.get(packet_id)
                 packets.append(record)
@@ -187,6 +191,7 @@ class HotGraphBuffer:
                         "payload_len_raw": self.packet_len_raw.get(packet_id, 0),
                         "embedding": embedding.copy() if embedding is not None else None,
                         "mitre_topk": list(self.packet_to_mitre.get(packet_id, [])),
+                        "mitre_provenance": dict(self.packet_to_provenance.get(packet_id, {})),
                         "attention_weight": self.packet_attention.get(packet_id),
                         "counterfactual_drop": self.packet_counterfactual_drop.get(packet_id),
                     }
@@ -240,6 +245,7 @@ class HotGraphBuffer:
         self.packet_attention.pop(packet_id, None)
         self.packet_counterfactual_drop.pop(packet_id, None)
         self.packet_to_mitre.pop(packet_id, None)
+        self.packet_to_provenance.pop(packet_id, None)
         self.packet_embeddings.pop(packet_id, None)
 
     def _purge_flow(self, flow_id: str) -> None:

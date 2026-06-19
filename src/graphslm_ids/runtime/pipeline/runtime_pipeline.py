@@ -156,11 +156,12 @@ class FastPathPipeline:
         # assigner is configured (artifacts absent).
         embedding: Any = None
         payload_bytes = bytes.fromhex(extracted.hex_64) if extracted.hex_64 else b""
-        mitre_topk: list[Any] = (
-            self.edge_assigner.assign_packet(payload_bytes)
-            if self.edge_assigner is not None
-            else []
-        )
+        mitre_topk: list[Any] = []
+        mitre_provenance: dict[str, dict] = {}
+        if self.edge_assigner is not None:
+            mitre_topk, mitre_provenance = self.edge_assigner.assign_packet(
+                payload_bytes, return_provenance=True
+            )
 
         packet_id = self._make_packet_id(flow_state.flow_id)
         if self.graph_store is not None:
@@ -193,6 +194,7 @@ class FastPathPipeline:
             dst_port=extracted.dst_port,
             protocol=extracted.protocol,
             mitre_topk=mitre_topk,
+            mitre_provenance=mitre_provenance,
         )
 
         subgraph = self.subgraph_builder.build(flow_state.flow_id)

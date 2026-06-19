@@ -68,3 +68,20 @@ def test_assign_packet_returns_provenance():
 
 
 import pytest  # noqa: E402
+
+
+import numpy as np  # noqa: E402
+from graphslm_ids.runtime.fast_path.hot_graph_buffer import HotGraphBuffer  # noqa: E402
+
+
+def test_hot_buffer_round_trips_provenance():
+    buf = HotGraphBuffer(ttl_seconds=999)
+    buf.add_packet(
+        packet_id="p1", flow_id="f1", embedding=np.zeros(1, dtype=np.float32),
+        payload_hex="6162", payload_ascii="ab", payload_len_raw=2, timestamp=0.0,
+        src_ip="10.0.0.1", dst_ip="10.0.0.2", src_port=1, dst_port=80, protocol="TCP",
+        mitre_topk=[("T1190", "injection", 0.9)],
+        mitre_provenance={"T1190": {"source": "pmi", "tokens": ["t:select"], "literals": []}},
+    )
+    pkts = buf.get_packets("f1")
+    assert pkts[0]["mitre_provenance"]["T1190"]["tokens"] == ["t:select"]
