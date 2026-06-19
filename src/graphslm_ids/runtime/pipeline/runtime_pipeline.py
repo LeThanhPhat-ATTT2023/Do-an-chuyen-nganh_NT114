@@ -156,9 +156,14 @@ class FastPathPipeline:
         self._packet_counter = 0
 
     def on_packet(self, raw_pkt: Any) -> DetectionResult:
-        now = time.time()
-        flow_state = self.flow_tracker.update(raw_pkt, now)
         extracted = self.payload_extractor.extract(raw_pkt)
+        # Drive the flow/TTL clock from the packet's own timestamp. PCAP replay
+        # carries historical capture times; using wall-clock now would make
+        # evict_expired drop every packet instantly (now - pcap_ts >> ttl),
+        # leaving each flow with a single packet and no evidence accumulation.
+        # Falls back to wall clock for live packets that lack a timestamp.
+        now = float(extracted.timestamp) if extracted.timestamp else time.time()
+        flow_state = self.flow_tracker.update(raw_pkt, now)
         # v3 online MSEE: resolve payload bytes -> (technique, family, weight)
         # evidence via the offline PMI + procedure ensemble. Empty when no
         # assigner is configured (artifacts absent).
