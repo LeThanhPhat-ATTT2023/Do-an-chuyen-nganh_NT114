@@ -45,7 +45,13 @@ class FastPathPipeline:
     def __init__(self, cfg: PipelineConfig) -> None:
         self.cfg = cfg
         self.flow_tracker = FlowTracker(cfg.hot_graph.ttl_seconds)
-        self.payload_extractor = PayloadExtractor(cfg.fast_path.payload_length)
+        # preview_bytes == payload_length so the stored payload hex covers the full
+        # window the offline packet features + PMI/procedure edge-assigner used
+        # (offline payload_length=256); the slow path re-truncates for display.
+        self.payload_extractor = PayloadExtractor(
+            cfg.fast_path.payload_length,
+            preview_bytes=cfg.fast_path.payload_length,
+        )
         self.mitre_index = MitreIndex(
             cfg.fast_path.mitre_embeddings,
             cfg.fast_path.techniques_csv,

@@ -16,11 +16,65 @@ def parse_args() -> argparse.Namespace:
 
 
 def iter_packets(path: str | Path):
-    from scapy.utils import PcapReader
+    """Yield per-packet dicts decoded with dpkt — the SAME decoder the offline
+    extractor uses. Scapy's PcapReader mis-handles these captures' link layer
+    ("unknown LL type") and falls back to Raw, which strips IP/TCP/payload and
+    collapses everything into one bogus flow. dpkt + _decode_ip handles the DLT
+    correctly, so the runtime sees the same packets the model trained on.
+    """
+    import socket
 
-    with PcapReader(str(path)) as reader:
-        for packet in reader:
-            yield packet
+    import dpkt
+
+    from graphslm_ids.offline.preprocessing.extractor import _decode_ip
+
+    with open(path, "rb") as handle:
+        try:
+            reader = dpkt.pcap.Reader(handle)
+            dlt = reader.datalink()
+        except (ValueError, dpkt.dpkt.NeedData):
+            return
+        for ts, buf in reader:
+            ip = _decode_ip(buf, dlt)
+            if not isinstance(ip, dpkt.ip.IP):
+                continue
+            transport = ip.data
+            src_port = 0
+            dst_port = 0
+            flags = 0
+            if isinstance(transport, dpkt.tcp.TCP):
+                protocol = "TCP"
+                src_port = int(transport.sport)
+                dst_port = int(transport.dport)
+                flags = int(transport.flags)
+                payload = bytes(transport.data)
+            elif isinstance(transport, dpkt.udp.UDP):
+                protocol = "UDP"
+                src_port = int(transport.sport)
+                dst_port = int(transport.dport)
+                payload = bytes(transport.data)
+            elif isinstance(transport, dpkt.icmp.ICMP):
+                protocol = "ICMP"
+                payload = bytes(transport.data)
+            else:
+                protocol = "OTHER"
+                payload = b""
+            try:
+                src_ip = socket.inet_ntoa(ip.src)
+                dst_ip = socket.inet_ntoa(ip.dst)
+            except (OSError, ValueError):
+                continue
+            yield {
+                "src_ip": src_ip,
+                "dst_ip": dst_ip,
+                "src_port": src_port,
+                "dst_port": dst_port,
+                "protocol": protocol,
+                "timestamp": float(ts),
+                "ip_len": int(getattr(ip, "len", 0) or 0),
+                "tcp_flags": flags,
+                "payload": payload,
+            }
 
 
 def main() -> None:
