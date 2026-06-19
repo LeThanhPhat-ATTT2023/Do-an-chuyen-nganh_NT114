@@ -45,8 +45,18 @@ class HGTRuntime:
         self.flow_feature_stats = self.payload.get("flow_feature_stats") or {}
 
         model_config = (self.payload.get("config") or {}).get("model", {})
+        node_input_dims = {str(k): int(v) for k, v in self.payload["node_input_dims"].items()}
+        # Reconstruct the full node-type set from the checkpoint. The model
+        # defaults to ["flow", "packet", "technique", "tactic"] when node_types is
+        # omitted, which silently drops any extra projected type (e.g. v3 "host")
+        # and breaks state_dict loading. Derive it from node_input_dims (+ the
+        # id-only "tactic" node, which never carries an input dim).
+        node_types = list(node_input_dims)
+        if "tactic" not in node_types:
+            node_types.append("tactic")
         self.model = HeteroGraphTransformer(
-            node_input_dims={str(k): int(v) for k, v in self.payload["node_input_dims"].items()},
+            node_input_dims=node_input_dims,
+            node_types=node_types,
             edge_types=self.edge_types,
             num_classes=int(self.payload["num_classes"]),
             num_tactics=int(self.payload["num_tactics"]),
