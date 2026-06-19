@@ -80,6 +80,8 @@ class HotGraphBuffer:
         protocol: str,
         mitre_topk: list[tuple[str, str, float]],
         mitre_provenance: dict[str, dict] | None = None,
+        ip_len: int = 0,
+        tcp_flags: int = 0,
     ) -> None:
         packet_id = str(packet_id)
         flow_id = str(flow_id)
@@ -100,6 +102,8 @@ class HotGraphBuffer:
                 "protocol": str(protocol).upper(),
                 "timestamp": timestamp,
                 "payload_len_raw": int(payload_len_raw),
+                "ip_len": int(ip_len),
+                "tcp_flags": int(tcp_flags),
                 "mitre_topk": list(topk),
             }
             self.packet_metadata[packet_id] = metadata
@@ -155,6 +159,37 @@ class HotGraphBuffer:
                 record["counterfactual_drop"] = self.packet_counterfactual_drop.get(packet_id)
                 packets.append(record)
             return packets
+
+    def packet_frame_records(self) -> list[dict[str, Any]]:
+        """Per-packet rows across ALL buffered flows, in arrival order.
+
+        Consumed by the online flow-feature builder so it can call the offline
+        ``build_flow_features`` (CICFlowMeter parity) — including the per-source
+        time-windowed ``fan_*`` features, which need other flows' packets sharing
+        the same ``src_ip`` within the TTL window.
+        """
+        with self._lock:
+            records: list[dict[str, Any]] = []
+            for event in self._event_queue:
+                packet_id = event.packet_id
+                meta = self.packet_metadata.get(packet_id)
+                if meta is None:
+                    continue
+                records.append(
+                    {
+                        "flow_id": meta.get("flow_id", event.flow_id),
+                        "ts": self.packet_timestamps.get(packet_id, meta.get("timestamp", 0.0)),
+                        "src_ip": meta.get("src_ip", "unknown"),
+                        "dst_ip": meta.get("dst_ip", "unknown"),
+                        "src_port": int(meta.get("src_port", 0)),
+                        "dst_port": int(meta.get("dst_port", 0)),
+                        "protocol": str(meta.get("protocol", "OTHER")).upper(),
+                        "ip_len": int(meta.get("ip_len", 0)),
+                        "payload_len": int(self.packet_len_raw.get(packet_id, meta.get("payload_len_raw", 0))),
+                        "flags": int(meta.get("tcp_flags", 0)),
+                    }
+                )
+            return records
 
     def evict_expired(self, now: float) -> list[str]:
         evicted_flows: list[str] = []

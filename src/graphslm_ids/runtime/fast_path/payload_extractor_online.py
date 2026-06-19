@@ -19,6 +19,10 @@ class ExtractedPayload:
     dst_port: int
     protocol: str
     timestamp: float
+    # v3 CICFlowMeter parity: IP total length + raw TCP flag bits, needed so the
+    # online flow-feature builder reproduces the 79-dim offline vector.
+    ip_len: int = 0
+    tcp_flags: int = 0
 
 
 class PayloadExtractor:
@@ -44,6 +48,8 @@ class PayloadExtractor:
             dst_port=int(meta["dst_port"]),
             protocol=str(meta["protocol"]).upper(),
             timestamp=float(meta["timestamp"]),
+            ip_len=int(meta.get("ip_len", 0) or 0),
+            tcp_flags=int(meta.get("tcp_flags", 0) or 0),
         )
 
 
@@ -56,6 +62,8 @@ def _extract_metadata(pkt: Any) -> dict[str, Any]:
             "dst_port": pkt.get("dst_port", pkt.get("dport", 0)),
             "protocol": pkt.get("protocol", pkt.get("proto", "OTHER")),
             "timestamp": pkt.get("timestamp", pkt.get("time", 0.0)),
+            "ip_len": pkt.get("ip_len", 0),
+            "tcp_flags": pkt.get("tcp_flags", pkt.get("flags", 0)),
         }
 
     try:
@@ -75,14 +83,20 @@ def _extract_metadata(pkt: Any) -> dict[str, Any]:
     protocol = "OTHER"
     src_port = 0
     dst_port = 0
+    ip_len = 0
+    tcp_flags = 0
     if IP in pkt:
         ip_layer = pkt[IP]
         src_ip = str(ip_layer.src)
         dst_ip = str(ip_layer.dst)
+        ip_len = int(getattr(ip_layer, "len", 0) or 0)
     if TCP in pkt:
         protocol = "TCP"
         src_port = int(pkt[TCP].sport)
         dst_port = int(pkt[TCP].dport)
+        # int(FlagValue) yields standard bits FIN=1 SYN=2 RST=4 PSH=8 ACK=16 URG=32,
+        # matching the dpkt masks the offline flow builder uses.
+        tcp_flags = int(pkt[TCP].flags)
     elif UDP in pkt:
         protocol = "UDP"
         src_port = int(pkt[UDP].sport)
@@ -95,6 +109,8 @@ def _extract_metadata(pkt: Any) -> dict[str, Any]:
         "dst_port": dst_port,
         "protocol": protocol,
         "timestamp": float(getattr(pkt, "time", getattr(pkt, "timestamp", 0.0))),
+        "ip_len": ip_len,
+        "tcp_flags": tcp_flags,
     }
 
 

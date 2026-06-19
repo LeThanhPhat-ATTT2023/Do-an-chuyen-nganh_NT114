@@ -120,6 +120,8 @@ class FastPathPipeline:
             dlg_top_n_enabled=cfg.subgraph_builder.dlg_ids_top_n.enabled,
             dlg_top_n_per_seed=cfg.subgraph_builder.dlg_ids_top_n.top_n_per_seed,
             dlg_sort_by=cfg.subgraph_builder.dlg_ids_top_n.sort_by,
+            flow_feature_names=meta.get("flow_feature_names"),
+            family_to_idx=meta.get("family_to_idx"),
         )
         self.policy = PolicyEngine(
             self.hgt_runtime.label_to_index,
@@ -195,6 +197,8 @@ class FastPathPipeline:
             protocol=extracted.protocol,
             mitre_topk=mitre_topk,
             mitre_provenance=mitre_provenance,
+            ip_len=extracted.ip_len,
+            tcp_flags=extracted.tcp_flags,
         )
 
         subgraph = self.subgraph_builder.build(flow_state.flow_id)

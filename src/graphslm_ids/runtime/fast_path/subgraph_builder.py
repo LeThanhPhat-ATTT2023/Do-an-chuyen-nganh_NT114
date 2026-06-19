@@ -1,11 +1,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any
 
 import numpy as np
 
 from graphslm_ids.offline.preprocessing.payload_features import compute_packet_payload_features
+
+
+# Protocol string -> integer code, mirroring the offline extractor
+# (_PROTO_TCP=0, _PROTO_UDP=1, _PROTO_ICMP=2, _PROTO_OTHER=3). build_flow_features
+# treats proto==0 as TCP for flag-bit accounting, so this mapping must match.
+_PROTO_CODE = {"TCP": 0, "UDP": 1, "ICMP": 2}
+_EVIDENCE_FAMILY_ORDER = ("injection", "command_exec", "file_upload", "recon", "c2_beacon")
 
 
 EdgeKey = tuple[str, str, str]
@@ -66,6 +74,8 @@ class SubgraphBuilder:
         dlg_top_n_enabled: bool = False,
         dlg_top_n_per_seed: dict[str, int] | None = None,
         dlg_sort_by: str = "semantic_edge_weight",
+        flow_feature_names: list[str] | None = None,
+        family_to_idx: dict[str, int] | None = None,
     ) -> None:
         self.buffer = buffer
         self.cold_store = cold_store
@@ -84,6 +94,11 @@ class SubgraphBuilder:
             str(key): int(value) for key, value in (dlg_top_n_per_seed or {}).items()
         }
         self.dlg_sort_by = str(dlg_sort_by)
+        self.flow_feature_names = [str(n) for n in (flow_feature_names or [])]
+        if family_to_idx:
+            self.family_to_idx = {str(k): int(v) for k, v in family_to_idx.items()}
+        else:
+            self.family_to_idx = {fam: i for i, fam in enumerate(_EVIDENCE_FAMILY_ORDER)}
 
     def build(self, seed_flow_id: str) -> Subgraph:
         snapshot = self._snapshot(seed_flow_id)
@@ -101,7 +116,8 @@ class SubgraphBuilder:
         else:
             tactic_ids = _collect_tactics(technique_ids, technique_to_tactic)
 
-        flow_x = np.asarray([self._flow_features(snapshot["flow"])], dtype=np.float32)
+        flow_vec = self._flow_features_v3(str(seed_flow_id), snapshot, packet_entries)
+        flow_x = np.asarray([flow_vec], dtype=np.float32)
         if self.standardize_flow_features:
             flow_x = self._standardize_flow(flow_x)
 
@@ -234,6 +250,155 @@ class SubgraphBuilder:
             float(flow.get("dst_port", 0.0)),
             float(protocol_id),
         ]
+
+    def _flow_features_v3(
+        self,
+        seed_flow_id: str,
+        snapshot: dict[str, Any],
+        packet_entries: list[dict[str, Any]],
+    ) -> list[float]:
+        """Build the 79-dim CICFlowMeter flow vector for the seed flow.
+
+        Reuses the offline ``build_flow_features`` over all buffered packets (so the
+        per-source ``fan_*`` time-windowed features see cross-flow context), then
+        appends ``flow_start_ts`` + the 5 ``ev_*`` evidence-summary features, and
+        finally orders everything by the artifact's ``flow_feature_names``. Falls
+        back to the legacy 6-feature vector only when the contract is unavailable.
+        """
+        names = self.flow_feature_names
+        if not names:
+            return self._flow_features(snapshot["flow"])
+
+        from graphslm_ids.offline.preprocessing.flows import build_flow_features
+        import pandas as pd
+
+        records = self._buffer_packet_records()
+        if not records:
+            records = self._records_from_snapshot(seed_flow_id, snapshot)
+
+        row: dict[str, float] = {}
+        if records:
+            df = pd.DataFrame.from_records(self._to_flow_rows(records))
+            try:
+                feats_df, _ = build_flow_features(df)
+                if seed_flow_id in feats_df.index:
+                    srow = feats_df.loc[seed_flow_id]
+                    row = {
+                        col: float(srow[col])
+                        for col in feats_df.columns
+                        if col != "label" and not isinstance(srow[col], str)
+                    }
+            except Exception:
+                row = {}
+
+        seed_ts = [
+            float(pkt.get("timestamp", pkt.get("ts", 0.0)) or 0.0)
+            for pkt in snapshot.get("packets", [])
+        ]
+        row["flow_start_ts"] = float(min(seed_ts)) if seed_ts else 0.0
+        row.update(self._evidence_summary(packet_entries))
+
+        vector: list[float] = []
+        for name in names:
+            value = float(row.get(name, 0.0))
+            vector.append(value if math.isfinite(value) else 0.0)
+        return vector
+
+    def _buffer_packet_records(self) -> list[dict[str, Any]]:
+        for source in (self.buffer, self.cold_store):
+            getter = getattr(source, "packet_frame_records", None) if source is not None else None
+            if callable(getter):
+                try:
+                    records = getter()
+                except (AttributeError, KeyError, TypeError):
+                    records = None
+                if records:
+                    return list(records)
+        return []
+
+    def _records_from_snapshot(
+        self,
+        seed_flow_id: str,
+        snapshot: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        flow = snapshot.get("flow", {})
+        for pkt in snapshot.get("packets", []):
+            meta = pkt.get("metadata", {})
+            records.append(
+                {
+                    "flow_id": seed_flow_id,
+                    "ts": float(pkt.get("timestamp", pkt.get("ts", 0.0)) or 0.0),
+                    "src_ip": meta.get("src_ip", flow.get("src_ip", "unknown")),
+                    "dst_ip": meta.get("dst_ip", flow.get("dst_ip", "unknown")),
+                    "src_port": int(meta.get("src_port", flow.get("src_port", 0)) or 0),
+                    "dst_port": int(meta.get("dst_port", flow.get("dst_port", 0)) or 0),
+                    "protocol": str(meta.get("protocol", flow.get("protocol", "OTHER"))).upper(),
+                    "ip_len": int(meta.get("ip_len", 0) or 0),
+                    "payload_len": int(pkt.get("payload_len_raw", meta.get("payload_len_raw", 0)) or 0),
+                    "flags": int(meta.get("tcp_flags", 0) or 0),
+                }
+            )
+        return records
+
+    def _to_flow_rows(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Coerce buffer packet records into the column schema build_flow_features
+        consumes, deriving proto code, is_fwd (vs each flow's first endpoint) and a
+        dummy label."""
+        first_endpoint: dict[str, tuple[str, int]] = {}
+        for rec in records:
+            fid = str(rec["flow_id"])
+            if fid not in first_endpoint:
+                first_endpoint[fid] = (str(rec.get("src_ip", "")), int(rec.get("src_port", 0) or 0))
+        rows: list[dict[str, Any]] = []
+        for rec in records:
+            fid = str(rec["flow_id"])
+            fwd_ip, fwd_port = first_endpoint[fid]
+            rows.append(
+                {
+                    "flow_id": fid,
+                    "label": 0,
+                    "proto": _PROTO_CODE.get(str(rec.get("protocol", "OTHER")).upper(), 3),
+                    "src_port": int(rec.get("src_port", 0) or 0),
+                    "dst_port": int(rec.get("dst_port", 0) or 0),
+                    "src_ip": str(rec.get("src_ip", "")),
+                    "dst_ip": str(rec.get("dst_ip", "")),
+                    "is_fwd": bool(
+                        str(rec.get("src_ip", "")) == fwd_ip
+                        and int(rec.get("src_port", 0) or 0) == fwd_port
+                    ),
+                    "ip_len": float(rec.get("ip_len", 0) or 0),
+                    "payload_len": float(rec.get("payload_len", 0) or 0),
+                    "ts": float(rec.get("ts", 0.0) or 0.0),
+                    "flags": int(rec.get("flags", 0) or 0),
+                }
+            )
+        return rows
+
+    def _evidence_summary(self, packet_entries: list[dict[str, Any]]) -> dict[str, float]:
+        """Per-flow evidence summary matching graph_builder._flow_evidence_summary."""
+        count = 0
+        max_w = 0.0
+        family_counts: dict[str, int] = {}
+        sum_log = 0.0
+        for packet in packet_entries:
+            for _tech, family, weight in _triples(packet.get("mitre_topk", [])):
+                count += 1
+                if weight > max_w:
+                    max_w = weight
+                family_counts[family] = family_counts.get(family, 0) + 1
+                sum_log += float(math.log1p(weight))
+        dominant_id = -1.0
+        if count:
+            dominant = max(family_counts.items(), key=lambda kv: (kv[1], kv[0]))[0]
+            dominant_id = float(self.family_to_idx.get(dominant, -1))
+        return {
+            "ev_count": float(count),
+            "ev_max_weight": float(max_w),
+            "ev_dominant_family_id": dominant_id,
+            "ev_n_distinct_families": float(len(family_counts)),
+            "ev_sum_log1p_weight": float(sum_log),
+        }
 
     def _build_hosts(self, flow: dict[str, Any]):
         """Two host nodes (src, dst) with 4-d [out_deg, in_deg, fwd_bytes, bwd_bytes]."""
