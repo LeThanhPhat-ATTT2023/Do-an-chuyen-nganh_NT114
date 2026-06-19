@@ -1,5 +1,10 @@
 ﻿# Thiết Kế Scalable Training Cho HGT Trên Graph Lớn
 
+> ⚠️ **CẬP NHẬT (v3_ob, 2026-06):** Thiết kế storage→loading→sampling→training còn
+> đúng. Lưu ý tên edge type đã đổi: `matches_technique` → `evidence_<family>` trong
+> v3_ob; packet feature là ordered-byte (không còn embedding 768D từ student CNN).
+> Nguồn chuẩn schema: `CLAUDE.md`.
+
 Tài liệu này đề xuất kiến trúc training HGT khi dataset không còn vừa RAM. Áp
 dụng khi pipeline phát triển từ mức 27K flows hiện tại lên hàng chục triệu flow
 và graph artifact đạt cỡ ~400GB.

@@ -1,5 +1,14 @@
 ﻿# Kiến Trúc Streaming HGT Runtime v3 - Incremental RTEC + Tiered Storage
 
+> ⚠️ **CẬP NHẬT (graph `v3_ob`, 2026-06):** "v3" trong tên doc là phiên bản
+> *streaming runtime*, **khác** với artifact graph `v3_ob`. Phần streaming/storage/RTEC
+> còn đúng, nhưng tầng ngữ nghĩa MITRE đã đổi: **bỏ `student_cnn` ONNX + `cosine_topk`
+> + edge `matches_technique`**. v3_ob dùng packet feature **ordered-byte** và gán edge
+> bằng **MSEE** (PMI + procedure matcher), edge typed `evidence_<family>` mang
+> `family/weight/source/provenance`. Các đoạn `student_cnn_int8`, `cosine_topk`,
+> `use_semantic: cosine score`, và edge `*__matches_technique__*` bên dưới coi như
+> lịch sử — nguồn chuẩn: `CLAUDE.md` + [system_execution_flows.md](../architecture/system_execution_flows.md).
+
 Tài liệu này tổng hợp các kỹ thuật state-of-the-art 2024-2026 từ tài liệu user
 cung cấp (NeutronRT, RelGT, StreamTGN, HetSGFormer+ILLE, APT-HERA, IDS-HGAT,
 MixQ-GNN, GraNNite, GETA, HERO) và thay thế v2.

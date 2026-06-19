@@ -1,5 +1,23 @@
 ﻿# Thiết Kế Lớp Cầu Nối Fast Path ↔ Slow Path
 
+> ⚠️ **CẬP NHẬT (v3_ob, 2026-06):** Tài liệu này mô tả **cơ chế cầu nối** (queue,
+> snapshot, concurrency, ColdStore, thread model) vẫn còn đúng, nhưng phần
+> **cách tạo edge packet→technique đã thay đổi** theo v3. Khi cần đặc tả nguồn
+> chuẩn, dùng [system_execution_flows.md](system_execution_flows.md), `CLAUDE.md`,
+> và code thực tế trong `src/graphslm_ids/runtime/fast_path/`. Các điểm đã thay thế:
+> - **Không còn `student_runtime.py` / Student CNN ONNX / embedding 768D.** Packet
+>   feature là **ordered-byte** (`v3_ob`). File runtime thực tế: `edge_assigner.py`
+>   (`RuntimeEdgeAssigner`), `edge_filter.py`, không có student runtime.
+> - **Không còn gán edge bằng MITRE cosine top-k.** Edge dùng **MSEE**: PMI table
+>   + Aho-Corasick procedure matcher; mỗi edge mang `family / weight / source /
+>   provenance` (tokens, literals). `mitre_index.py` vẫn còn nhưng dùng cho metadata,
+>   không phải cosine similarity.
+> - **Không còn edge `matches_technique`.** Thay bằng các edge typed
+>   `evidence_<family>` (injection / command_exec / file_upload / recon / c2_beacon).
+> - Trong Mục 3.3 (`student_runtime.py`), Mục 3.4 (cosine top-k), và config
+>   `fast_path` ở Mục 7 (`student_onnx`, `mitre_embeddings`, `mitre_threshold`):
+>   coi như **lịch sử**, không áp dụng cho v3.
+>
 > Cập nhật theo `docs/unified_graph_growth_strategy_vi.md`: `ColdStore` trong tài
 > liệu này chỉ còn là fallback JSONL khi tắt `graph_store`. Runtime hiện tại dùng
 > `PersistentGraphStore` làm source of truth, HotGraphBuffer là cache RAM, slow

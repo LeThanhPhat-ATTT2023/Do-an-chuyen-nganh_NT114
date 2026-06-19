@@ -1,5 +1,12 @@
 # Huong dan lay khung MITRE cho CIC-IoT2023
 
+> ⚠️ CAP NHAT (v3_ob, 2026-06): Buoc lay ATT&CK CSV/STIX van dung. Nhung
+> "tactical edges packet/flow -> technique tao boi cosine similarity" (muc duoi)
+> da bi thay the. v3_ob khong dung cosine giua embedding student va technique;
+> thay bang MSEE (PMI counting + L1 LR + Aho-Corasick procedure matcher tren STIX
+> enterprise-attack.json). Edge mang family/weight/source/provenance. Nguon chuan:
+> CLAUDE.md + docs/architecture/system_execution_flows.md.
+
 ## Muc tieu
 Lay bo ATT&CK chinh thong va tao cac bang node/edge de dung cho tang ngu nghia trong do thi 3 tang.
 

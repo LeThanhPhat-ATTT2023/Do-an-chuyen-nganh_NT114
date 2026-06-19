@@ -1,5 +1,13 @@
 # Chiến Lược Thống Nhất Xử Lý Graph Phình To Cho Runtime Và Training
 
+> ⚠️ **CẬP NHẬT (v3_ob, 2026-06):** Chiến lược storage/sampling/graph-growth còn
+> đúng, nhưng **schema cạnh ngữ nghĩa đã đổi**: bỏ `student_cnn` + `cosine_topk` +
+> edge `matches_technique` / `use_semantic: cosine`. v3_ob dùng packet feature
+> **ordered-byte** và edge **MSEE** (`evidence_<family>` với family/weight/source/
+> provenance). Mọi `*__matches_technique__*`, `sort_by: semantic_edge_weight (cosine)`,
+> `student_cnn` bên dưới coi như lịch sử. Nguồn chuẩn: `CLAUDE.md` +
+> [system_execution_flows.md](system_execution_flows.md).
+
 Tài liệu này hợp nhất hai bài toán đã được trình bày riêng trước đó:
 
 ```text

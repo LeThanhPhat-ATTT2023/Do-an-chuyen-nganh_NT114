@@ -2,6 +2,13 @@
 
 > **Mục đích tài liệu:** Ghi lại tư duy ban đầu khi chọn hướng đề tài, lập luận vì sao hướng này có giá trị khoa học, và đánh giá tổng thể xem có thể hoàn thành trong điều kiện thực tế của nhóm (máy cá nhân i5/16 GB, thời gian một học kỳ) hay không.
 
+> ⚠️ **CẬP NHẬT (v3_ob, 2026-06):** Đây là tài liệu **giai đoạn đề xuất** — giữ nguyên để ghi lại tư duy ban đầu. Kiến trúc đã thực thi (`v3_ob`) **đã thay đổi** so với mô tả bên dưới ở 3 điểm cốt lõi. Khi trích dẫn cho báo cáo cuối, hãy dùng [system_execution_flows.md](system_execution_flows.md) và `CLAUDE.md` làm nguồn chuẩn:
+> 1. **Bỏ hoàn toàn Student 1D-CNN / SecureBERT distillation.** Pipeline v3 dùng **zero learned encoder ngoài chính HGT**. Packet feature là **ordered-byte** (đó là ý nghĩa của `v3_ob`), không còn embedding 768D từ teacher.
+> 2. **Bỏ MITRE mapping bằng cosine similarity embedding.** Thay bằng **MSEE** (Multi-Source Evidence Ensemble): PMI counting + L1 multinomial LR + Aho-Corasick procedure matching trên MITRE STIX. Edge mang `family / weight / source / provenance`, có thể audit.
+> 3. **Đánh giá theo Smart-BOTH + clean-key (LNL).** Đóng góp chính giờ là **dấu của (noisy − clean) macro-F1** và GAP random↔temporal, không phải MITRE mapping precision như bảng KPI bên dưới.
+>
+> Phần Slow-Path/SLM XAI vẫn đúng về tinh thần, nhưng nay đọc **graph-text bằng chứng** và có **VG2R verifier** chấm grounding (xem [system_execution_flows.md](system_execution_flows.md)).
+
 ---
 
 ## 1. Bối Cảnh và Động Lực Nghiên Cứu

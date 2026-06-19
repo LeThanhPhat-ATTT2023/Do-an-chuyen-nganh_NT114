@@ -1,7 +1,15 @@
 ﻿# Báo Cáo Chi Tiết: Trưng Cất Tri Thức 1D-CNN Cho Embedding Payload
 
+> 🛑 **THÀNH PHẦN ĐÃ LOẠI BỎ (v3_ob, 2026-06).** Toàn bộ pipeline Student 1D-CNN
+> distillation (SecureBERT teacher → student 768D) trong báo cáo này **không còn
+> nằm trong hệ thống**. v3 tuân nguyên tắc "zero learned encoder ngoài chính HGT":
+> packet feature là **ordered-byte** (đó là `_ob` trong `v3_ob`), và ánh xạ MITRE
+> dùng **MSEE** (PMI + procedure matcher), không phải embedding cosine. Giữ báo cáo
+> này **chỉ để ghi lại lịch sử** giai đoạn v1; **không** dùng làm mô tả hệ thống
+> hiện tại. Nguồn chuẩn: `CLAUDE.md` + [system_execution_flows.md](architecture/system_execution_flows.md).
+
 **Dự án:** Context-Rich Explainable IDS — NT114  
-**Phạm vi:** Offline Training — Student 1D-CNN Distillation  
+**Phạm vi:** Offline Training — Student 1D-CNN Distillation (LEGACY v1, đã loại bỏ)  
 **Ngày:** 2026-05-15
 
 ---

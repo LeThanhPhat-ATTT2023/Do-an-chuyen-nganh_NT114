@@ -1,5 +1,24 @@
 ﻿# Thiết Kế Chi Tiết SLM Slow Path — XAI Report Generation
 
+> ⚠️ **CẬP NHẬT (v3_ob, 2026-06 — realign `feat/slm-graphtext-v3-realign`):** Cấu
+> trúc Slow Path (dual-path, evidence bundle → serialize → SLM → validator/verifier)
+> vẫn đúng, nhưng **bằng chứng MITRE đã đổi từ cosine sang MSEE**. Slow Path đã
+> được viết lại để đọc graph v3; nhiều mô tả cosine bên dưới giờ **không còn đúng**.
+> Nguồn chuẩn: code trong `src/graphslm_ids/runtime/slow_path/` + `CLAUDE.md` +
+> [system_execution_flows.md](../architecture/system_execution_flows.md). Các điểm đã thay thế:
+> - **Bỏ `cosine_score` và `mapping_type: embedding_cosine_similarity`.** Mỗi
+>   `MitreEvidence` giờ mang `family / evidence_weight / source (pmi|procedure) /
+>   matched_tokens / matched_literals` (xem `evidence_bundle.py`).
+> - **Bỏ edge `matches_technique`.** Path edge giờ là
+>   `["contain", "evidence_<family>", "technique_tactic"]` (vd `evidence_injection`).
+> - **Caution đảo chiều.** Không còn câu "based on semantic similarity, not a
+>   signature". MSEE cung cấp **provenance token/literal kiểm chứng được**; verifier
+>   VG2R chấm `numeric_accuracy` theo `evidence_id`, không dựa cosine.
+> - **Bỏ Student CNN ONNX + MITRE cosine top-k ở fast path.** Packet feature là
+>   ordered-byte; edge gán bằng `RuntimeEdgeAssigner` (PMI + procedure). Các đoạn
+>   `student_cnn_onnx`, `cosine_topk`, `packet_x = zero_vector(768)`, và config
+>   `fast_path.student_cnn_onnx` bên dưới coi như **lịch sử**.
+>
 > Cập nhật theo kiến trúc graph store thống nhất: Slow Path hiện ưu tiên hydrate
 > context từ `PersistentGraphStore` source of truth. Hot Buffer/ColdStore trong
 > các đoạn cũ chỉ là cache/fallback, không phải nguồn dữ liệu chính.

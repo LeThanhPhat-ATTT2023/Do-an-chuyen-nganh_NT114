@@ -1,5 +1,14 @@
 ﻿# Báo Cáo Cấu Hình Train HGT Khuyến Nghị
 
+> ⚠️ **CẬP NHẬT (v3_ob, 2026-06):** Khuyến nghị về HGT (layers/heads/hidden, GCL
+> augmentation, neighbor sampling) còn dùng được, nhưng **tên edge type đã đổi**:
+> v3_ob không còn `matches_technique`; cạnh packet/flow→technique giờ là
+> `evidence_<family>` (injection/command_exec/file_upload/recon/c2_beacon). Khi áp
+> dụng `edge_perturbation` / flow-flow connectivity, thay `matches_technique` bằng
+> các `evidence_<family>`. "teacher" trong doc là continual-learning/distillation
+> (HERO/checkpoint trước), **không** phải SecureBERT teacher đã bị bỏ. Nguồn chuẩn:
+> `CLAUDE.md`.
+
 Tài liệu này chỉ giữ hai nhóm cấu hình còn dùng:
 
 - Baseline ban đầu của project: `configs/hgt_t082_k5_l3_d01.yaml`.

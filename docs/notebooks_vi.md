@@ -1,5 +1,11 @@
 # Notebooks
 
+> ⚠️ **CẬP NHẬT (v3_ob, 2026-06):** Các stage `teacher_targets` (SecureBERT) và
+> `student_cnn` (1D-CNN distillation) mô tả bên dưới **không còn dùng** trong v3.
+> v3_ob xây graph bằng pipeline Smart-BOTH (extractor → flows → tokenizer → PMI →
+> procedure matcher → ensemble MSEE → graph_builder) với packet feature ordered-byte.
+> Nguồn chuẩn cho lệnh build/train hiện tại: `CLAUDE.md` (mục Run commands).
+
 Ba notebook này chạy trên **Kaggle** (GPU T4 x2). Mỗi notebook tự động bỏ qua các stage đã có output.
 
 ---
