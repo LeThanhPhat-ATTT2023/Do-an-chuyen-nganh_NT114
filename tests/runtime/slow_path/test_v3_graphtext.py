@@ -167,3 +167,17 @@ def test_builder_emits_v3_mitre_evidence():
     assert me.matched_tokens == ["t:select"]
     if bundle.graph_paths:
         assert bundle.graph_paths[0].path_edges == ["contain", "evidence_injection", "technique_tactic"]
+
+
+from graphslm_ids.runtime.slow_path.graph_serializer import serialize_bundle  # noqa: E402
+
+
+def test_serializer_v3_graphtext():
+    job = SlowPathJob(alert_id="A1", flow_id="f1", predicted_label="SqlInjection",
+                      confidence=0.9, alert_threshold=0.7)
+    bundle = EvidenceBuilder().build(job, _ctx())
+    text = serialize_bundle(bundle)
+    assert "evidence_injection" in text
+    assert "w=0.90" in text or "w=0.9" in text
+    assert "src=pmi" in text
+    assert "cosine=" not in text and "matches_technique" not in text
