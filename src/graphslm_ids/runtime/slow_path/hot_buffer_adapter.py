@@ -422,6 +422,19 @@ class HotBufferAdapter:
     ) -> dict[str, "MitreEdge"]:
         prov = dict(provenance or {})
         out: dict[str, MitreEdge] = {}
+        if isinstance(value, Mapping):
+            # Legacy ``{technique_id: weight}`` form (no family/provenance).
+            for tech, weight in value.items():
+                if weight is None:
+                    continue
+                p = prov.get(str(tech), {})
+                out[str(tech)] = MitreEdge(
+                    family="", weight=float(weight),
+                    source=str(p.get("source", "")),
+                    tokens=[str(t) for t in p.get("tokens", [])],
+                    literals=[str(lit) for lit in p.get("literals", [])],
+                )
+            return out
         if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
             for item in value:
                 if isinstance(item, Sequence) and not isinstance(item, (str, bytes, bytearray)):

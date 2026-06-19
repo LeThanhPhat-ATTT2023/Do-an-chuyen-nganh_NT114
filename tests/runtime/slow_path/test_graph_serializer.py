@@ -23,19 +23,18 @@ def make_bundle() -> EvidenceBundle:
         linked_techniques=["E_TECH_001"], importance_score=0.91,
         importance_sources={"counterfactual_drop": 0.31, "hgt_attention_weight": 0.82, "combined_score": 0.91},
         importance_reason="Packet received high attention weight in the HGT model",
-        mitre_max_cosine=0.71,
     )
     tech = MitreEvidence(
         evidence_id="E_TECH_001", technique_id="T1190", technique_name="Exploit Public-Facing Application",
-        tactic="Initial Access", tactic_id="TA0001", cosine_score=0.71,
-        matched_from=["pkt_flow_42_00000003"], supporting_packet_count=1,
-        mapping_type="pmi+procedure", mapping_caution="Mapping uses embedding cosine similarity, semantic only.",
+        tactic="Initial Access", tactic_id="TA0001", family="injection",
+        evidence_weight=0.71, source="pmi+procedure", matched_tokens=["t:select"],
+        matched_literals=[], supporting_packet_count=1, matched_from=["pkt_flow_42_00000003"],
     )
     path = GraphPathEvidence(
         evidence_id="E_PATH_001",
         path_nodes=[{"id": "flow_42", "type": "flow"}, {"id": "pkt_flow_42_00000003", "type": "packet"},
                     {"id": "T1190", "type": "technique"}, {"id": "TA0001", "type": "tactic"}],
-        path_edges=["contains", "matches_technique", "belongs_to_tactic"],
+        path_edges=["contain", "evidence_injection", "technique_tactic"],
         path_score=0.58, attention_weight=0.82,
     )
     cf = CounterfactualEvidence(
@@ -46,7 +45,7 @@ def make_bundle() -> EvidenceBundle:
     return EvidenceBundle(
         bundle_version="1.0", alert=alert, flow_evidence=flow, packet_evidence=[packet],
         mitre_evidence=[tech], graph_paths=[path], counterfactual_evidence=[cf],
-        limitations=["MITRE mapping uses embedding cosine similarity, not deterministic signature matching."],
+        limitations=["MITRE mapping is from the v3 MSEE ensemble (PMI + procedure), not a deterministic signature."],
         bundle_stats=BundleStats(14, 1, 1, 1, 0),
     )
 
@@ -62,7 +61,7 @@ def test_serialization_has_four_sections_and_handles():
     assert "[E_FLOW_001]" in text and "[E_PKT_001]" in text and "[E_TECH_001]" in text
     assert "attn=0.82" in text and "cf_drop=0.31" in text
     assert "T1190" in text and "TA0001" in text
-    assert "matches_technique" in text and "pmi+procedure" in text
+    assert "evidence_injection" in text and "pmi+procedure" in text
 
 
 def test_serialization_is_deterministic():
@@ -79,7 +78,7 @@ def test_salience_orders_packets_by_attention():
         timestamp=1718000001.0, payload_len_raw=40, payload_preview_hex="00", payload_preview_ascii="x",
         linked_techniques=[], importance_score=0.2,
         importance_sources={"counterfactual_drop": 0.0, "hgt_attention_weight": 0.10, "combined_score": 0.2},
-        importance_reason="low", mitre_max_cosine=0.0,
+        importance_reason="low",
     ))
     text = serialize_bundle(bundle)
     salience = text.split("## SALIENCE")[1]

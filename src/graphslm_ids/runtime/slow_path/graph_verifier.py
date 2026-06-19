@@ -100,7 +100,7 @@ def _bundle_numeric_values(bundle: EvidenceBundle) -> list[float]:
         vals.append(round(float(pkt.importance_sources.get("hgt_attention_weight", 0.0)), 4))
         vals.append(round(float(pkt.importance_sources.get("counterfactual_drop", 0.0)), 4))
     for tech in bundle.mitre_evidence:
-        vals.append(round(float(tech.cosine_score), 4))
+        vals.append(round(float(tech.evidence_weight), 4))
     for cf in bundle.counterfactual_evidence:
         vals.append(round(float(cf.confidence_drop), 4))
     return vals
