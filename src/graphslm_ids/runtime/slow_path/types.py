@@ -33,6 +33,16 @@ class FlowContext:
 
 
 @dataclass
+class MitreEdge:
+    """One v3 evidence edge: family-routed technique with provenance."""
+    family: str
+    weight: float
+    source: str = ""
+    tokens: list[str] = field(default_factory=list)
+    literals: list[str] = field(default_factory=list)
+
+
+@dataclass
 class PacketContext:
     packet_id: str
     order_in_flow: int
@@ -40,7 +50,7 @@ class PacketContext:
     payload_len_raw: int
     payload_preview_hex: str
     payload_preview_ascii: str
-    mitre_cosine_scores: dict[str, float] = field(default_factory=dict)
+    mitre_evidence: dict[str, "MitreEdge"] = field(default_factory=dict)
     attention_weight: float | None = None
     counterfactual_drop: float | None = None
 
@@ -51,9 +61,10 @@ class MitreMetadata:
     technique_name: str
     tactic: str
     tactic_id: str
-    mapping_type: str = "embedding_cosine_similarity"
+    source: str = "msee_ensemble"
     mapping_caution: str = (
-        "This link is based on semantic similarity, not deterministic signature matching."
+        "This link is from the v3 MSEE ensemble (PMI + procedure matcher), "
+        "a statistical evidence vote, not forensic proof."
     )
 
 
@@ -62,5 +73,5 @@ class GraphContext:
     flow: FlowContext
     packets: list[PacketContext]
     mitre_metadata: dict[str, MitreMetadata]
-    flow_mitre_scores: dict[str, float] = field(default_factory=dict)
+    flow_mitre_evidence: dict[str, "MitreEdge"] = field(default_factory=dict)
     limitations: list[str] = field(default_factory=list)

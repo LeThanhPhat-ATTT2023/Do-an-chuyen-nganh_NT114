@@ -85,3 +85,22 @@ def test_hot_buffer_round_trips_provenance():
     )
     pkts = buf.get_packets("f1")
     assert pkts[0]["mitre_provenance"]["T1190"]["tokens"] == ["t:select"]
+
+
+from graphslm_ids.runtime.slow_path.types import (  # noqa: E402
+    GraphContext, MitreEdge, PacketContext,
+)
+
+
+def test_mitre_edge_defaults():
+    e = MitreEdge(family="injection", weight=0.9)
+    assert e.source == "" and e.tokens == [] and e.literals == []
+
+
+def test_packet_context_has_mitre_evidence():
+    pc = PacketContext(
+        packet_id="p1", order_in_flow=0, timestamp=0.0, payload_len_raw=2,
+        payload_preview_hex="6162", payload_preview_ascii="ab",
+        mitre_evidence={"T1190": MitreEdge("injection", 0.9, "pmi", ["t:select"], [])},
+    )
+    assert pc.mitre_evidence["T1190"].family == "injection"
