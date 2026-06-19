@@ -550,53 +550,78 @@ class EvidenceBuilder:
         model.eval()
         device = self._model_device(model, torch)
 
-        node_tensors: dict[str, torch.Tensor] = {}
-        for node_type, features in node_features.items():
-            tensor = torch.as_tensor(features, dtype=torch.float32, device=device)
-            node_tensors[str(node_type)] = tensor
+        # Counterfactual is optional report enrichment: a reconstruction/forward
+        # failure (e.g. empty node-feature rows serialized without their 2nd dim)
+        # must NOT abort the whole XAI report. Degrade gracefully to "no CF".
+        try:
+            node_tensors: dict[str, torch.Tensor] = {}
+            for node_type, features in node_features.items():
+                tensor = torch.as_tensor(features, dtype=torch.float32, device=device)
+                if tensor.ndim == 1:
+                    # An empty 2D node-feature block (0 rows) serializes to [] and
+                    # comes back 1D; restore (0, input_dim) so the model's Linear
+                    # projection sees the right trailing dimension.
+                    in_dim = self._model_input_dim(model, str(node_type))
+                    tensor = tensor.reshape(0, in_dim) if in_dim else tensor.reshape(tensor.shape[0], 0)
+                node_tensors[str(node_type)] = tensor
 
-        required_nodes = {"flow", "packet", "technique", "tactic"}
-        if not required_nodes.issubset(node_tensors.keys()):
-            return {}, float(job.confidence)
-
-        edge_index_dict = self._prepare_edge_index_dict(model, edge_index, device)
-        if not edge_index_dict:
-            return {}, float(job.confidence)
-
-        edge_weight = self._snapshot_get(snapshot, "edge_weight")
-        if edge_weight is None:
-            edge_weight = self._snapshot_get(snapshot, "edge_attr")
-        edge_weight_dict = self._prepare_edge_weight_dict(model, edge_weight, device)
-
-        with torch.no_grad():
-            base_logits = model(node_tensors, edge_index_dict, edge_weight_dict=edge_weight_dict)
-            base_probs = torch.softmax(base_logits, dim=-1)
-            if flow_idx >= base_probs.shape[0]:
-                flow_idx = 0
-            if target_idx >= base_probs.shape[1]:
+            required_nodes = {"flow", "packet", "technique", "tactic"}
+            if not required_nodes.issubset(node_tensors.keys()):
                 return {}, float(job.confidence)
-            base_conf = float(base_probs[flow_idx, target_idx].item())
 
-        drop_map: dict[str, float] = {}
-        packet_x = node_tensors.get("packet")
-        if packet_x is None:
-            return {}, base_conf
+            edge_index_dict = self._prepare_edge_index_dict(model, edge_index, device)
+            if not edge_index_dict:
+                return {}, float(job.confidence)
 
-        for packet in candidates:
-            packet_idx = packet_id_to_idx.get(packet.packet_id)
-            if packet_idx is None:
-                continue
-            masked_packet_x = packet_x.clone()
-            masked_packet_x[int(packet_idx)] = torch.zeros_like(masked_packet_x[int(packet_idx)])
-            masked_nodes = dict(node_tensors)
-            masked_nodes["packet"] = masked_packet_x
+            edge_weight = self._snapshot_get(snapshot, "edge_weight")
+            if edge_weight is None:
+                edge_weight = self._snapshot_get(snapshot, "edge_attr")
+            edge_weight_dict = self._prepare_edge_weight_dict(model, edge_weight, device)
+
             with torch.no_grad():
-                logits = model(masked_nodes, edge_index_dict, edge_weight_dict=edge_weight_dict)
-                probs = torch.softmax(logits, dim=-1)
-                masked_conf = float(probs[flow_idx, target_idx].item())
-            drop_map[packet.packet_id] = base_conf - masked_conf
+                base_logits = model(node_tensors, edge_index_dict, edge_weight_dict=edge_weight_dict)
+                base_probs = torch.softmax(base_logits, dim=-1)
+                if flow_idx >= base_probs.shape[0]:
+                    flow_idx = 0
+                if target_idx >= base_probs.shape[1]:
+                    return {}, float(job.confidence)
+                base_conf = float(base_probs[flow_idx, target_idx].item())
 
-        return drop_map, base_conf
+            drop_map: dict[str, float] = {}
+            packet_x = node_tensors.get("packet")
+            if packet_x is None:
+                return {}, base_conf
+
+            for packet in candidates:
+                packet_idx = packet_id_to_idx.get(packet.packet_id)
+                if packet_idx is None:
+                    continue
+                masked_packet_x = packet_x.clone()
+                masked_packet_x[int(packet_idx)] = torch.zeros_like(masked_packet_x[int(packet_idx)])
+                masked_nodes = dict(node_tensors)
+                masked_nodes["packet"] = masked_packet_x
+                with torch.no_grad():
+                    logits = model(masked_nodes, edge_index_dict, edge_weight_dict=edge_weight_dict)
+                    probs = torch.softmax(logits, dim=-1)
+                    masked_conf = float(probs[flow_idx, target_idx].item())
+                drop_map[packet.packet_id] = base_conf - masked_conf
+
+            return drop_map, base_conf
+        except Exception:
+            return {}, float(job.confidence)
+
+    def _model_input_dim(self, model: Any, node_type: str) -> int:
+        """Best-effort input feature dim for a node type, for empty-block reshape."""
+        proj = getattr(model, "input_projection", None)
+        try:
+            layer = proj[node_type]  # nn.ModuleDict -> nn.Sequential / nn.Linear
+            for module in (layer.modules() if hasattr(layer, "modules") else [layer]):
+                in_features = getattr(module, "in_features", None)
+                if in_features:
+                    return int(in_features)
+        except (KeyError, TypeError, AttributeError):
+            pass
+        return 0
 
     def _resolve_target_index(self, job: SlowPathJob) -> int | None:
         predicted_idx = getattr(job, "predicted_label_idx", None)
