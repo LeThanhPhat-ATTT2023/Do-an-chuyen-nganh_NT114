@@ -104,3 +104,20 @@ def test_packet_context_has_mitre_evidence():
         mitre_evidence={"T1190": MitreEdge("injection", 0.9, "pmi", ["t:select"], [])},
     )
     assert pc.mitre_evidence["T1190"].family == "injection"
+
+
+from graphslm_ids.runtime.slow_path.hot_buffer_adapter import HotBufferAdapter  # noqa: E402
+
+
+def test_adapter_builds_mitre_evidence_from_triples():
+    adapter = HotBufferAdapter(hot_buffer=None, mitre_catalog={})
+    record = {
+        "packet_id": "p1", "order_in_flow": 0, "timestamp": 0.0,
+        "payload_preview_hex": "6162", "payload_preview_ascii": "ab", "payload_len_raw": 2,
+        "mitre_topk": [("T1190", "injection", 0.9)],
+        "mitre_provenance": {"T1190": {"source": "pmi", "tokens": ["t:select"], "literals": []}},
+    }
+    pcs = adapter._build_packet_contexts([record], {})
+    edge = pcs[0].mitre_evidence["T1190"]
+    assert edge.family == "injection" and edge.weight == 0.9
+    assert edge.source == "pmi" and edge.tokens == ["t:select"]
