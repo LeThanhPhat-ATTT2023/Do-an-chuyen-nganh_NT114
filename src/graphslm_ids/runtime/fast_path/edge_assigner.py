@@ -13,6 +13,7 @@ from graphslm_ids.offline.preprocessing.ensemble import (
     aggregate_evidence,
     build_pmi_lookup_from_table,
     lookup_pmi_per_packet,
+    lookup_pmi_per_packet_with_tokens,
 )
 from graphslm_ids.offline.preprocessing.procedure_matcher import ProcedureMatcher
 
@@ -53,11 +54,31 @@ class RuntimeEdgeAssigner:
         self,
         payload: bytes,
         flow_consensus: dict[str, float] | None = None,
-    ) -> list[tuple[str, str, float]]:
+        return_provenance: bool = False,
+    ):
         if not payload:
-            return []
-        pmi_hits = lookup_pmi_per_packet(payload, self._pmi_lookup)
+            return ([], {}) if return_provenance else []
         proc_hits = self._proc.weight_per_technique(payload)
-        return aggregate_evidence(
+        if not return_provenance:
+            pmi_hits = lookup_pmi_per_packet(payload, self._pmi_lookup)
+            return aggregate_evidence(
+                pmi_hits, proc_hits, flow_consensus or {}, self._family, tau_edge=self._tau
+            )
+
+        pmi_tok = lookup_pmi_per_packet_with_tokens(payload, self._pmi_lookup)
+        pmi_hits = {tech: (fam, w) for tech, (fam, w, _toks) in pmi_tok.items()}
+        edges = aggregate_evidence(
             pmi_hits, proc_hits, flow_consensus or {}, self._family, tau_edge=self._tau
         )
+        proc_literals = self._proc.match(payload) if hasattr(self._proc, "match") else {}
+        provenance: dict[str, dict] = {}
+        for tech, _family, _w in edges:
+            in_pmi = tech in pmi_tok
+            in_proc = tech in proc_hits
+            source = "pmi+procedure" if (in_pmi and in_proc) else ("pmi" if in_pmi else "procedure")
+            provenance[tech] = {
+                "source": source,
+                "tokens": list(pmi_tok.get(tech, ("", 0.0, []))[2]),
+                "literals": list(proc_literals.get(tech, [])),
+            }
+        return edges, provenance
