@@ -1,0 +1,111 @@
+flowchart TB
+  subgraph DATA["1. Data silos and client simulation"]
+    DS[/"Benchmark dataset<br/>CIC-IoT-2023-style"/]
+    PART["Split train / validation / test first<br/>partition train into 5-10 simulated clients<br/>IID or non-IID label-skew"]
+    D1[("Client 1 raw PCAP / flow")]
+    D2[("Client 2 raw PCAP / flow")]
+    DK[("Client K raw PCAP / flow")]
+    DS --> PART
+    PART --> D1
+    PART --> D2
+    PART --> DK
+  end
+
+  subgraph CLIENTS["2. Client-local execution — repeated for each client"]
+    direction LR
+    subgraph C1["Client 1 — honest"]
+      direction TB
+      P1["Local preprocessing<br/>MSEE + MITRE + EACS"]
+      G1["Local heterogeneous graph<br/>flow / packet / host / technique / tactic"]
+      S1["Neighbor / subgraph sampling<br/>seed flow · 2-hop · fanout 5-10"]
+      T1[["Local HGT training<br/>GCL loss + local labels"]]
+      U1[/"Model delta Δw1 = w1 - Wt"/]
+      P1 --> G1 --> S1 --> T1 --> U1
+    end
+    subgraph C2["Client 2 — Byzantine scenario"]
+      direction TB
+      P2["Local preprocessing<br/>MSEE + MITRE + EACS"]
+      G2["Local heterogeneous graph"]
+      S2["Neighbor / subgraph sampling<br/>never crosses client boundary"]
+      T2[["Local HGT training"]]
+      A2["Experiment-only poisoning hook<br/>sign-flip · ALIE · Min-Max · Min-Sum · ScaleSign"]
+      U2[/"Poisoned model delta Δw2*"/]
+      P2 --> G2 --> S2 --> T2 --> A2 --> U2
+    end
+    subgraph CK["Client K — honest"]
+      direction TB
+      PK["Local preprocessing + MSEE/EACS"]
+      GK["Local heterogeneous graph"]
+      SK["Neighbor / subgraph sampling"]
+      TK[["Local HGT training"]]
+      UK[/"Model delta ΔwK"/]
+      PK --> GK --> SK --> TK --> UK
+    end
+    PRIV["Raw PCAP, graph, features, labels and evidence stay local<br/>Outbound: model delta + minimal protocol metadata"]
+  end
+
+  D1 --> P1
+  D2 --> P2
+  DK --> PK
+
+  subgraph COORD["3. FL coordinator and update-only defense"]
+    direction LR
+    B["Broadcast global model Wt"]
+    I["Update intake<br/>Δwk or Δwk*"]
+    Q{"Update-only screening<br/>schema / round validity<br/>norm-clipping · cosine · sign<br/>geometry · spectral · history"}
+    F[("Accepted update pool")]
+    R[("Flagged / quarantined updates")]
+    AGG[["Robust aggregation<br/>FedAvg baseline<br/>Median · Trimmed Mean · Multi-Krum"]]
+    NEXT[["Global model Wt+1"]]
+    B --> I --> Q
+    Q -->|filtered-in| F --> AGG --> NEXT
+    Q -->|flagged| R
+    NEXT -->|next round| B
+  end
+
+  U1 -->|local model delta| I
+  U2 -->|poisoned update| I
+  UK -->|local model delta| I
+  B -->|global model| T1
+  B -->|global model| T2
+  B -->|global model| TK
+
+  subgraph EVAL["4. Evaluation and feedback"]
+    direction LR
+    CE["Client-local held-out evaluation<br/>metrics only"]
+    GE["Global evaluation<br/>random / temporal<br/>noisy / clean labels"]
+    M["macro-F1 · attack impact · recall · FPR<br/>false exclusion · communication · sampling cost"]
+    CE --> GE --> M
+  end
+  B --> CE
+  R --> M
+
+  subgraph RUN["5. Runtime at gateway / client"]
+    direction LR
+    CKPT[("Approved global HGT checkpoint")]
+    LIVE[/"Live traffic"/]
+    INF[["Client-local HGT inference<br/>same graph schema + runtime sampling"]]
+    POL{"Policy"}
+    XAI["Local evidence-grounded XAI<br/>flow → packet → technique → tactic"]
+    SOC["SOC alert / report metadata"]
+    CKPT --> INF
+    LIVE --> INF --> POL
+    POL -->|alert| XAI --> SOC
+    POL -->|allow / monitor / block| SOC
+    SOC -. periodic retraining .-> B
+  end
+  NEXT --> CKPT
+  PRIV -. raw data stays local .- RUN
+
+  classDef source fill:#eef2ff,stroke:#3949ab,color:#1a237e
+  classDef process fill:#ffffff,stroke:#455a64,color:#212121
+  classDef model fill:#fff3e0,stroke:#ef6c00,stroke-width:2px,color:#e65100
+  classDef store fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20
+  classDef gate fill:#fce4ec,stroke:#ad1457,color:#880e4f
+  classDef attack fill:#fff0f0,stroke:#c62828,stroke-width:2px,color:#b71c1c
+  classDef note fill:#fffde7,stroke:#827717,color:#5f5b00
+  class DS,PART,D1,D2,DK,LIVE source
+  class P1,G1,S1,U1,P2,G2,S2,U2,PK,GK,SK,UK,PRIV,B,I,F,R,CE,GE,M,INF,XAI,SOC,process
+  class T1,T2,TK,AGG,NEXT,CKPT model
+  class Q,POL gate
+  class A2 attack

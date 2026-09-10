@@ -1,0 +1,101 @@
+[TÊN ĐỀ TÀI]
+Tên tiếng Việt: Khung học liên kết khả diễn giải và chống đầu độc mô hình cho hệ thống phát hiện xâm nhập dựa trên đồ thị không đồng nhất trong mạng IoT
+Tên tiếng Anh:
+
+[NỘI DUNG ĐỀ TÀI - BẢN CHỈNH]
+Sự phát triển nhanh của Internet vạn vật (IoT) làm gia tăng số lượng thiết bị, lưu lượng mạng và bề mặt tấn công. Các cuộc tấn công như DDoS, quét dịch vụ, command injection, SQL injection, cross-site scripting và tải tệp độc hại có thể ảnh hưởng đến tính sẵn sàng, tính bí mật và tính toàn vẹn của hệ thống. Hệ thống phát hiện xâm nhập dựa trên học máy và học sâu có khả năng phân tích lưu lượng mạng, nhận diện hành vi bất thường và hỗ trợ chuyên gia an ninh xử lý cảnh báo.
+
+Tuy nhiên, IDS tập trung thường yêu cầu tập hợp dữ liệu lưu lượng từ nhiều vùng mạng hoặc tổ chức về một máy chủ để huấn luyện. Cách tiếp cận này làm tăng chi phí lưu trữ và truyền dữ liệu, đồng thời tạo rủi ro về quyền riêng tư, bảo mật và tuân thủ vì dữ liệu PCAP, packet và flow có thể chứa thông tin nhạy cảm.
+
+Đề tài nghiên cứu việc áp dụng Federated Learning (FL) cho IDS dựa trên đồ thị không đồng nhất. Trong thực nghiệm, một bộ dữ liệu mạng chuẩn hóa được xem như dữ liệu tổng hợp từ nhiều gateway hoặc miền quản trị, sau đó được phân vùng thành các client mô phỏng. Đây là mô phỏng có kiểm soát để tái hiện data silo, không phải quá trình thu gom dữ liệu thô từ nhiều tổ chức. Mỗi client chỉ sử dụng phần dữ liệu được phân vùng cho mình; PCAP, packet, flow, đặc trưng và đồ thị cục bộ không được gửi đến máy chủ điều phối.
+
+Tại mỗi client, dữ liệu cục bộ được tiền xử lý và chuyển thành đồ thị không đồng nhất gồm các nút flow, packet, host, technique và tactic. Các cạnh bằng chứng được xây dựng từ các nguồn xác định như PMI, MITRE procedure matching và flow consensus. Cơ chế EACS được duy trì ở client để hỗ trợ xử lý nhiễu nhãn trong quá trình huấn luyện cục bộ. Các client sử dụng cùng schema đồ thị và cùng kiến trúc HGT; knowledge tĩnh như MITRE technique/tactic có thể được sao chép tại từng client.
+
+Để giảm chi phí bộ nhớ và tính toán, mỗi client thực hiện neighbor/subgraph sampling tại chỗ. Client chọn các seed flow, lấy subgraph K-hop theo từng loại quan hệ và tạo mini-batch cho HGT. Cấu hình khởi đầu dự kiến là 2-hop với fanout 5-10 node cho mỗi relation; giá trị cuối được chọn trên validation. Sampling chỉ giới hạn phạm vi tính toán, không thay thế bước phân vùng dữ liệu, không vượt qua biên client và không tạo ra trao đổi dữ liệu thô.
+
+Trong mỗi round FL, máy chủ gửi mô hình toàn cục đến các client được chọn. Client khởi tạo từ mô hình đó, huấn luyện trên dữ liệu và subgraph cục bộ, rồi chỉ gửi model delta Δw_k = w_k - w_t về máy chủ. Máy chủ không nhận PCAP, packet, flow, đặc trưng, đồ thị, nhãn, payload hoặc bằng chứng MITRE. Máy chủ chỉ phân tích các model delta bằng các tín hiệu như norm/clipping, cosine similarity, thống kê dấu, khoảng cách hình học, spectral outlier và lịch sử update; sau đó tổng hợp bằng FedAvg hoặc cơ chế Byzantine-robust.
+
+Trọng tâm an toàn của đề tài là model poisoning do client Byzantine. Các kịch bản sign-flip, ALIE, Min-Max, Min-Sum và ScaleSign được chèn tại bước gửi model delta, dưới IID và non-IID, với nhiều tỷ lệ client độc hại. Threat model mặc định mô phỏng 5-10 client, attacker biết global model và giao thức update, có thể gửi delta tùy ý; collusion là biến mở rộng. Untargeted poisoning là cấu hình chính; targeted misclassification hoặc backdoor chỉ dùng khi có kịch bản và metric riêng.
+
+Khả năng diễn giải được giữ như một lớp hỗ trợ tại client. Khi có cảnh báo, client có thể truy vết HGT attention, gradient saliency hoặc counterfactual confidence drop cùng provenance của các cạnh bằng chứng từ flow đến packet, technique và tactic. Evidence bundle dùng cho XAI được tạo trong miền dữ liệu cục bộ hoặc đánh giá ngoại tuyến; không tham gia server aggregation.
+
+Hệ thống được đánh giá trên lưu lượng CIC-IoT-2023-style với 18 lớp. Dữ liệu được split thành train/validation/test trước, sau đó chỉ phần train được phân vùng thành client để tránh leakage. Kết quả được báo cáo trên random split và temporal split, với noisy/clean label theo đúng vai trò đánh giá. Các chỉ số gồm macro-F1, weighted-F1, precision, recall, false-positive rate, validation loss, attack impact, targeted ASR nếu có, tỷ lệ loại nhầm client lành, chi phí truyền thông, thời gian huấn luyện, chi phí sampling và explanation stability.
+
+[MỤC TIÊU]
+- Xây dựng kiến trúc FL-based IDS dựa trên HGT và đồ thị không đồng nhất cho môi trường IoT phân tán.
+- Thiết kế cơ chế phân vùng dữ liệu thành nhiều client mô phỏng gateway hoặc miền quản trị độc lập trong các điều kiện IID và non-IID.
+- Xây dựng quy trình huấn luyện cục bộ tại client, gồm xây dựng đồ thị cục bộ và local neighbor/subgraph sampling theo mini-batch K-hop.
+- Cài đặt và đánh giá model poisoning attack gồm sign-flip, ALIE, Min-Max, Min-Sum và ScaleSign.
+- So sánh FedAvg với các phương pháp Byzantine-robust aggregation và khảo sát cơ chế tổng hợp đa tín hiệu chỉ dựa trên model delta.
+- Duy trì lớp XAI hỗ trợ dựa trên bằng chứng đồ thị cục bộ, đánh giá độ ổn định và khả năng truy nguyên của giải thích.
+- Đánh giá hiệu năng phát hiện, mức suy giảm dưới poisoning, chi phí truyền thông, chi phí huấn luyện và chi phí sampling.
+
+[ĐỐI TƯỢNG NGHIÊN CỨU]
+- Hệ thống phát hiện xâm nhập mạng cho môi trường IoT.
+- Federated Learning, horizontal cross-silo FL, IID/non-IID và client participation.
+- Model poisoning attack và Byzantine client trong FL.
+- Byzantine-robust aggregation dựa trên model delta.
+- Đồ thị không đồng nhất, Heterogeneous Graph Transformer và local neighbor/subgraph sampling.
+- MSEE, MITRE ATT&CK, EACS và evidence-grounded XAI ở phía client.
+- Bộ dữ liệu lưu lượng CIC-IoT-2023-style và dữ liệu PCAP/flow tương ứng.
+
+[PHẠM VI NGHIÊN CỨU]
+- Tập trung vào horizontal cross-silo FL. Client được mô phỏng bằng cách phân vùng một benchmark dataset; không triển khai FL thực tế giữa các tổ chức.
+- Mỗi client chỉ sở hữu và xử lý phần dữ liệu cục bộ được phân bổ. Client tự xây dựng graph, thực hiện sampling và huấn luyện HGT tại chỗ.
+- Các client dùng cùng schema đồ thị và kiến trúc HGT; MITRE technique/tactic là knowledge tĩnh có thể replica tại client.
+- Server chỉ nhận model delta theo round FL và gửi mô hình toàn cục trở lại client. Server không nhận dữ liệu thô, graph, feature, nhãn hoặc evidence.
+- Tập trung vào model poisoning ở mức model delta. Data poisoning, backdoor poisoning và tấn công hạ tầng mạng không thuộc phạm vi chính, trừ khi được bổ sung như thí nghiệm mở rộng.
+- Đánh giá sign-flip, ALIE, Min-Max, Min-Sum và ScaleSign dưới nhiều tỷ lệ client độc hại, IID/non-IID và mức độ tham gia khác nhau.
+- Secure aggregation và differential privacy không phải nội dung chính; chỉ xem xét như hướng mở rộng. Nếu screening từng client được bật, secure aggregation không được giả định đồng thời vì server cần quan sát từng delta.
+- XAI là lớp hỗ trợ tại client, không phải cơ chế quyết định aggregation và không phải đóng góp chính.
+
+[NỘI DUNG 1]
+Giữ nội dung nghiên cứu hệ thống IDS dựa trên đồ thị không đồng nhất, dữ liệu IoT, PCAP, flow, packet, host, MITRE ATT&CK, MSEE, PMI, procedure matching, flow consensus, MSEE evidence edges, HGT, GCL và EACS như bản gốc; bổ sung nguyên tắc mỗi client tạo artifact/graph cục bộ từ phần dữ liệu được phân vùng.
+
+[NỘI DUNG 2: NGHIÊN CỨU FEDERATED LEARNING CHO IDS PHÂN TÁN]
+Mục tiêu: Thiết kế quy trình phân vùng dữ liệu, xây dựng đồ thị cục bộ, sampling tại client và trao đổi model delta giữa client với server.
+
+Phương pháp: Split train/validation/test trước; sau đó phân vùng phần train thành 5-10 client theo các kịch bản IID và non-IID dựa trên label-skew hoặc Dirichlet. Một flow và toàn bộ packet của flow phải thuộc cùng một client. Mỗi client tiền xử lý dữ liệu, xây dựng heterogeneous graph theo schema thống nhất, chọn seed flow và thực hiện local neighbor/subgraph sampling. Cấu hình khởi đầu dùng 2-hop, fanout 5-10 theo relation, sau đó chọn trên validation. Client huấn luyện HGT trong một số local epoch.
+
+Trong mỗi round, server gửi global model W_t đến các client được chọn. Client khởi tạo từ W_t, train cục bộ và gửi model delta Δw_k = w_k - W_t. Server chỉ kiểm tra model delta, dùng FedAvg hoặc robust aggregation để tạo W_(t+1), rồi phát xuống round tiếp theo. Đánh giá ảnh hưởng của số client, local epoch, tỷ lệ tham gia, số hop, fanout, batch size và mức độ non-IID.
+
+[NỘI DUNG 3: NGHIÊN CỨU MODEL POISONING ATTACK TRONG FL-BASED IDS]
+Mục tiêu: Đo mức độ suy giảm của FL-based IDS khi một phần client Byzantine gửi model delta độc hại.
+
+Phương pháp: Xây dựng threat-model controller và bộ mô phỏng client độc hại. Client Byzantine nhận cùng W_t nhưng thao túng delta trước khi gửi. Đánh giá sign-flip, ALIE, Min-Max, Min-Sum và ScaleSign với nhiều tỷ lệ client độc hại, IID/non-IID và có/không có collusion ở thí nghiệm mở rộng.
+
+Chọn một giao thức thống nhất: mọi attack tác động lên Δw_k = w_k - W_t. Với untargeted poisoning, báo cáo attack impact, macro-F1 drop, recall drop, validation-loss increase và độ hội tụ theo round. Chỉ báo cáo Attack Success Rate khi có mục tiêu cụ thể như targeted misclassification hoặc backdoor/class suppression.
+
+[NỘI DUNG 4: XÂY DỰNG CƠ CHẾ TỔNG HỢP CHỐNG POISONING]
+Mục tiêu: Giảm ảnh hưởng của model delta độc hại nhưng vẫn duy trì hiệu năng khi dữ liệu giữa các client không đồng nhất.
+
+Phương pháp: So sánh FedAvg với Median, Trimmed Mean, Multi-Krum, DnC, SignGuard hoặc các phương pháp phù hợp. Khảo sát cơ chế đa tín hiệu chỉ dùng model delta và global model, gồm norm/clipping, cosine similarity, thống kê dấu, khoảng cách hình học, spectral outlier và lịch sử update. Các tín hiệu được chuẩn hóa trên train/validation, kết hợp thành client trust score để loại bỏ hoặc giới hạn trọng số delta đáng ngờ trước khi aggregation. Không dùng PCAP, graph, feature, nhãn, MITRE evidence hoặc XAI output tại server.
+
+Đánh giá defense trước hết trên clean IID và clean non-IID để đo benign-client rejection rate/false exclusion; sau đó mới đánh giá dưới poisoning. Custom multi-signal là phương án đề xuất/ablation, không tuyên bố chống mọi tấn công.
+
+[NỘI DUNG 5: LỚP DIỄN GIẢI HỖ TRỢ CHO FL-BASED IDS]
+Mục tiêu: Cung cấp giải thích cho cảnh báo và khảo sát độ ổn định khi mô hình chuyển từ local model sang global model.
+
+Phương pháp: Tại client, truy vết evidence edges có trọng số cao từ flow đến packet, technique và tactic; kết hợp HGT attention, gradient saliency hoặc counterfactual confidence drop nếu phù hợp. Evidence bundle và slow-path XAI được tạo trong client. Đánh giá top-k evidence overlap, explanation stability qua round và sự nhất quán giữa local/global model trên cùng dữ liệu cục bộ. XAI không tham gia server aggregation và không thay thế các chỉ số về poisoning.
+
+[NỘI DUNG 6: THỰC NGHIỆM, ĐÁNH GIÁ VÀ SO SÁNH]
+Mục tiêu: Đánh giá hiệu năng phát hiện, mức ảnh hưởng của poisoning, hiệu quả robust aggregation và chi phí hệ thống.
+
+Phương pháp: So sánh centralized HGT, local-only, FedAvg và Byzantine-robust aggregation trên cùng client partition, seed, số round, local epoch và learning rate. Thiết kế ma trận theo IID/non-IID, tỷ lệ client tham gia, tỷ lệ client độc hại và từng poisoning attack. Báo cáo macro-F1, weighted-F1, precision, recall, false-positive rate, confusion matrix, validation loss, attack impact, targeted ASR nếu có, convergence round, tỷ lệ loại update, false exclusion của client lành, communication cost, training time, sampling overhead, peak memory và explanation stability. Lặp nhiều seed và báo cáo trung bình cùng độ lệch khi tài nguyên cho phép.
+
+[KẾ HOẠCH THỰC HIỆN]
+| Giai đoạn | Nội dung | Kết quả mong đợi |
+|---|---|---|
+| Giai đoạn 1 | Khảo sát FL, FL-based IDS, model poisoning và Byzantine-robust aggregation; chốt threat model và metric. | Cơ sở lý thuyết, threat model, baseline và ma trận thí nghiệm. |
+| Giai đoạn 2 | Chuẩn hóa dữ liệu, split train/validation/test, xây dựng partition IID/non-IID và local graph. | Các client partition cố định, tái lập bằng seed. |
+| Giai đoạn 3 | Tích hợp pipeline GraphSLM IDS tại client: MSEE/EACS và local neighbor/subgraph sampling. | Artifact/graph cục bộ và sampler hoạt động. |
+| Giai đoạn 4 | Xây dựng local HGT training và baseline FL với FedAvg. | FL round hoàn chỉnh, global model, centralized/local-only/FedAvg comparison. |
+| Giai đoạn 5 | Cài đặt sign-flip, ALIE, Min-Max, Min-Sum và ScaleSign; đo attack impact. | Bộ kịch bản poisoning và kết quả theo IID/non-IID. |
+| Giai đoạn 6 | Triển khai robust aggregation, multi-signal ablation, XAI hỗ trợ, đánh giá và viết báo cáo. | Kết quả defense, giới hạn, sơ đồ, demo và luận văn hoàn chỉnh. |
+
+[NGUYÊN TẮC DIỄN ĐẠT]
+- FL không bảo đảm quyền riêng tư tuyệt đối; đề tài chỉ không trao đổi dữ liệu thô trong giao thức mô phỏng.
+- Model update vẫn có thể mang rủi ro rò rỉ; secure aggregation/DP là hướng mở rộng.
+- Không tuyên bố cơ chế đề xuất chống mọi poisoning attack; chỉ kết luận trên attack và điều kiện đã thực nghiệm.
+- Không gọi benchmark dataset đã phân vùng là dữ liệu thật sự thu thập từ nhiều tổ chức.
+- Không đặt trước các kết quả như tăng F1, giảm false alarm hoặc bảo mật tuyệt đối khi chưa có thực nghiệm.
