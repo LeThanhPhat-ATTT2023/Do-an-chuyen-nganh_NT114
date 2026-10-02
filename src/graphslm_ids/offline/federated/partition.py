@@ -51,11 +51,22 @@ class ClientPartition:
         )
 
 
+def _check_unique(ids: np.ndarray) -> None:
+    if np.unique(ids).size != ids.size:
+        raise ValueError("train_ids contains duplicate flow ids; each flow must appear once")
+
+
 def partition_iid(train_ids: np.ndarray, num_clients: int, seed: int) -> ClientPartition:
     if num_clients < 1:
         raise ValueError("num_clients must be >= 1")
+    train_ids = np.asarray(train_ids, dtype=np.int64)
+    if num_clients > train_ids.size:
+        raise ValueError(
+            f"num_clients ({num_clients}) exceeds the number of train flows ({train_ids.size})"
+        )
+    _check_unique(train_ids)
     rng = np.random.default_rng(seed)
-    perm = rng.permutation(np.asarray(train_ids, dtype=np.int64))
+    perm = rng.permutation(train_ids)
     return ClientPartition([np.sort(c) for c in np.array_split(perm, num_clients)], "iid", None, int(seed))
 
 
@@ -73,10 +84,13 @@ def partition_dirichlet(
     if alpha <= 0:
         raise ValueError("Dirichlet alpha must be > 0")
     train_ids = np.asarray(train_ids, dtype=np.int64)
+    _check_unique(train_ids)
     y = np.asarray(labels, dtype=np.int64)[train_ids]
     classes = np.unique(y)
     for attempt in range(max_retries):
-        rng = np.random.default_rng(seed + attempt)
+        # [seed, attempt] keeps retry streams of different seeds independent
+        # (seed + attempt would make seed s / attempt 1 identical to seed s+1 / attempt 0).
+        rng = np.random.default_rng([seed, attempt])
         buckets: list[list[np.ndarray]] = [[] for _ in range(num_clients)]
         for c in classes:
             ids_c = train_ids[y == c].copy()
@@ -99,6 +113,14 @@ def partition_dirichlet(
 
 
 def _stratified_take(ids: np.ndarray, labels: np.ndarray, k: int, rng: np.random.Generator) -> np.ndarray:
+    """Pick at most ``k`` of ``ids``, stratified by label.
+
+    Each class gets a quota proportional to its share of ``ids`` with a floor of 1, so every
+    class is kept whenever ``k`` is at least the number of classes. If ``k`` is below the
+    number of classes, quotas are trimmed from the largest quota first (ties broken toward
+    lower class ids by ``argmax``) until the total fits, so some classes are dropped. Flooring
+    can also leave the result a few ids short of ``k``.
+    """
     y = labels[ids]
     classes, counts = np.unique(y, return_counts=True)
     quota = np.maximum(1, np.floor(counts * (k / ids.shape[0])).astype(np.int64))
@@ -116,9 +138,13 @@ def _stratified_take(ids: np.ndarray, labels: np.ndarray, k: int, rng: np.random
 def subsample_partition(
     partition: ClientPartition, labels: np.ndarray, max_flows_per_client: int, seed: int
 ) -> ClientPartition:
-    rng = np.random.default_rng(seed)
-    labels = np.asarray(labels, dtype=np.int64)
     cap = int(max_flows_per_client)
+    if cap < 1:
+        raise ValueError(f"max_flows_per_client must be >= 1, got {max_flows_per_client}")
+    # Separate stream from the partitioners' default_rng(seed) so the subsample draws are
+    # not correlated with the IID permutation / Dirichlet shuffles.
+    rng = np.random.default_rng([seed, 1])
+    labels = np.asarray(labels, dtype=np.int64)
     out = [
         ids if ids.shape[0] <= cap else _stratified_take(ids, labels, cap, rng)
         for ids in partition.client_flow_ids
@@ -130,20 +156,26 @@ def make_partition(train_ids: np.ndarray, labels: np.ndarray, cfg: dict[str, Any
     scheme = str(cfg.get("scheme", "iid")).lower()
     num_clients = int(cfg.get("num_clients", 10))
     seed = int(cfg.get("seed", 42))
+    cap = cfg.get("max_flows_per_client")
     if scheme == "iid":
         part = partition_iid(train_ids, num_clients, seed)
     elif scheme == "dirichlet":
+        min_flows = int(cfg.get("min_flows_per_client", 1))
+        if cap and int(cap) < min_flows:
+            raise ValueError(
+                f"max_flows_per_client ({cap}) is below min_flows_per_client ({min_flows}); "
+                "subsampling would leave clients under the minimum"
+            )
         part = partition_dirichlet(
             train_ids,
             labels,
             num_clients,
             float(cfg.get("alpha", 0.5)),
             seed,
-            int(cfg.get("min_flows_per_client", 1)),
+            min_flows,
         )
     else:
         raise ValueError(f"unknown partition scheme {scheme!r}; expected 'iid' or 'dirichlet'")
-    cap = cfg.get("max_flows_per_client")
     if cap:
         part = subsample_partition(part, labels, int(cap), seed)
     return part
