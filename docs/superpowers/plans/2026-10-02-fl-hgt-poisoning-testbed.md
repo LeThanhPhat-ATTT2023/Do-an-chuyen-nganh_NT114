@@ -4142,6 +4142,8 @@ def test_context_reuse_and_validation(smoke_cfg):
         run_experiment(apply_overrides(cfg, {"federated.mode": "bogus"}))
     with pytest.raises(ValueError):
         run_experiment(apply_overrides(cfg, {"eval.monitor": "bogus"}))
+    with pytest.raises(ValueError, match="unknown config keys"):
+        run_experiment(apply_overrides(cfg, {"attack.malicous_ratio": 0.3}))
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -4178,7 +4180,7 @@ from graphslm_ids.models.hgt import HeteroGraphTransformer
 from graphslm_ids.offline.federated.aggregators import build_aggregator
 from graphslm_ids.offline.federated.attacks import Attack, AttackContext, build_attack
 from graphslm_ids.offline.federated.client_graph import build_client_artifact, packet_owner
-from graphslm_ids.offline.federated.config import apply_overrides
+from graphslm_ids.offline.federated.config import apply_overrides, unknown_keys
 from graphslm_ids.offline.federated.local_trainer import (
     ClientState,
     LocalTrainer,
@@ -4800,6 +4802,10 @@ def run_experiment(
         raise ValueError(f"unknown eval.monitor {monitor!r}; expected one of {VALID_MONITORS}")
     if context is not None and context.data_key != data_key(cfg):
         raise ValueError("experiment context was loaded for a different data section")
+    bad_keys = unknown_keys(cfg)
+    if bad_keys:
+        # A typo such as attack.malicous_ratio would silently run a clean baseline.
+        raise ValueError(f"unknown config keys (typo?): {bad_keys}")
     if mode == "centralized":
         cfg = apply_overrides(
             cfg,
@@ -5130,9 +5136,7 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-import yaml
-
-from graphslm_ids.offline.federated.config import apply_overrides, load_fl_config
+from graphslm_ids.offline.federated.config import apply_overrides, load_fl_config, yaml_load
 from graphslm_ids.offline.federated.simulation import data_key, load_context, run_experiment
 
 IMPACT_METRICS = ("final_test_macro_f1", "final_test_macro_f1_clean")
@@ -5171,7 +5175,7 @@ def run_grid(
     only: str | None = None,
     fail_fast: bool = False,
 ) -> list[dict[str, str]]:
-    grid = yaml.safe_load(Path(grid_path).read_text(encoding="utf-8")) or {}
+    grid = yaml_load(Path(grid_path).read_text(encoding="utf-8")) or {}
     base = load_fl_config(grid["base_config"])
     root = Path(grid.get("output_root", "outputs/fl/matrix"))
     common = dict(grid.get("overrides") or {})
@@ -5423,11 +5427,10 @@ git commit -m "feat(fl): add resumable experiment matrix runner and summarizer"
 from pathlib import Path
 
 import pytest
-import yaml
 
 from graphslm_ids.offline.federated.aggregators import build_aggregator
 from graphslm_ids.offline.federated.attacks import build_attack
-from graphslm_ids.offline.federated.config import apply_overrides, load_fl_config
+from graphslm_ids.offline.federated.config import apply_overrides, load_fl_config, yaml_load
 from graphslm_ids.offline.federated.matrix import expand_grid
 from graphslm_ids.offline.federated.screening import build_screener
 from graphslm_ids.offline.federated.simulation import VALID_MODES
@@ -5447,7 +5450,7 @@ def test_tier_configs_load():
 
 @pytest.mark.parametrize("grid_name", sorted(GRID_SIZES))
 def test_every_matrix_cell_builds(grid_name):
-    grid = yaml.safe_load((CFG_DIR / grid_name).read_text(encoding="utf-8"))
+    grid = yaml_load((CFG_DIR / grid_name).read_text(encoding="utf-8"))
     base = load_fl_config(ROOT / grid["base_config"])
     cells = expand_grid(grid)
     assert len(cells) == GRID_SIZES[grid_name]
