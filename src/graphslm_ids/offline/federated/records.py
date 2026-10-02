@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from pathlib import Path
 from typing import Any
 
@@ -33,7 +34,13 @@ def to_jsonable(obj: Any) -> Any:
 
 
 def write_json(path: str | Path, payload: Any) -> None:
-    Path(path).write_text(json.dumps(to_jsonable(payload), indent=2), encoding="utf-8")
+    """Write ``payload`` as indented JSON, creating parent dirs; replace the file atomically."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(target.name + ".tmp")
+    # Serialize before touching the disk so a bad payload never leaves a partial file behind.
+    tmp.write_text(json.dumps(to_jsonable(payload), indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, target)
 
 
 def append_jsonl(path: str | Path, record: Any) -> None:

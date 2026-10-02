@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import re
 from pathlib import Path
 from typing import Any
 
@@ -139,9 +140,59 @@ DEFAULT_FL_CONFIG: dict[str, Any] = {
 }
 
 
+# Subtrees whose keys are free-form (user-chosen names), so unknown_keys() does not police them.
+OPEN_SUBTREES: tuple[str, ...] = (
+    "experiment.labels",
+    "attack.params",
+    "defense.screen.params",
+    "defense.aggregator.params",
+    "sampler.fanouts",
+    "sampler.reverse_fanouts",
+    "eval.families",
+)
+
+_TIMESTAMP_TAG = "tag:yaml.org,2002:timestamp"
+_FLOAT_TAG = "tag:yaml.org,2002:float"
+
+
+class FLConfigLoader(yaml.SafeLoader):
+    """SafeLoader tuned for configs: ``1e-3`` is a float and ``2026-10-02`` stays a string.
+
+    PyYAML follows YAML 1.1, where a float needs a dot (``1e-3`` is read as the string
+    ``'1e-3'``) and a bare date becomes ``datetime.date``. Both are surprising in a config file.
+    The resolver tables below are copied per class, so the global ``yaml.SafeLoader`` is untouched.
+    """
+
+
+FLConfigLoader.yaml_implicit_resolvers = {
+    first_char: [(tag, regexp) for tag, regexp in resolvers if tag != _TIMESTAMP_TAG]
+    for first_char, resolvers in FLConfigLoader.yaml_implicit_resolvers.items()
+}
+FLConfigLoader.add_implicit_resolver(
+    _FLOAT_TAG,
+    re.compile(
+        r"""^(?:[-+]?(?:[0-9][0-9_]*)\.[0-9_]*(?:[eE][-+]?[0-9]+)?
+        |[-+]?(?:[0-9][0-9_]*)(?:[eE][-+]?[0-9]+)
+        |\.[0-9_]+(?:[eE][-+][0-9]+)?
+        |[-+]?\.(?:inf|Inf|INF)
+        |\.(?:nan|NaN|NAN))$""",
+        re.X,
+    ),
+    list("-+0123456789."),
+)
+
+
+def yaml_load(text_or_stream: Any) -> Any:
+    """Parse YAML with :class:`FLConfigLoader` (safe; scientific floats, dates as strings)."""
+    return yaml.load(text_or_stream, Loader=FLConfigLoader)  # SafeLoader subclass: safe
+
+
 def deep_update(base: dict[str, Any], override: dict[str, Any] | None) -> dict[str, Any]:
     out = copy.deepcopy(base)
     for key, value in (override or {}).items():
+        if value is None and isinstance(out.get(key), dict):
+            # An empty YAML section (``attack:``) must not wipe out the default sub-dict.
+            continue
         if isinstance(value, dict) and isinstance(out.get(key), dict):
             out[key] = deep_update(out[key], value)
         else:
@@ -153,20 +204,58 @@ def load_fl_config(path: str | Path | None = None) -> dict[str, Any]:
     if path is None:
         return copy.deepcopy(DEFAULT_FL_CONFIG)
     with Path(path).open("r", encoding="utf-8") as fh:
-        user = yaml.safe_load(fh) or {}
+        user = yaml_load(fh) or {}
     if not isinstance(user, dict):
         raise ValueError(f"FL config {path} must be a YAML mapping")
     return deep_update(DEFAULT_FL_CONFIG, user)
 
 
-def set_dotted(config: dict[str, Any], key: str, value: Any) -> None:
+def _in_open_subtree(path: str) -> bool:
+    return any(path == open_path or path.startswith(open_path + ".") for open_path in OPEN_SUBTREES)
+
+
+def unknown_keys(cfg: dict[str, Any], defaults: dict[str, Any] = DEFAULT_FL_CONFIG) -> list[str]:
+    """Return sorted dotted paths in ``cfg`` that do not exist in ``defaults``.
+
+    Free-form subtrees (``OPEN_SUBTREES``) are skipped entirely. Where the default value is not
+    a dict (scalars, lists, ``None``), whatever ``cfg`` holds there is accepted and not descended.
+    """
+    found: list[str] = []
+
+    def walk(node: dict[str, Any], reference: dict[str, Any], prefix: str) -> None:
+        for key, value in node.items():
+            path = f"{prefix}.{key}" if prefix else str(key)
+            if _in_open_subtree(path):
+                continue
+            if key not in reference:
+                found.append(path)
+            elif isinstance(value, dict) and isinstance(reference[key], dict):
+                walk(value, reference[key], path)
+
+    walk(cfg, defaults, "")
+    return sorted(found)
+
+
+def _split_dotted(key: str) -> list[str]:
     parts = key.split(".")
+    if any(not part for part in parts):
+        raise ValueError(f"invalid dotted key {key!r}: empty key or empty segment")
+    return parts
+
+
+def set_dotted(config: dict[str, Any], key: str, value: Any) -> None:
+    parts = _split_dotted(key)
     node = config
-    for part in parts[:-1]:
+    for depth, part in enumerate(parts[:-1]):
         child = node.get(part)
-        if not isinstance(child, dict):
+        if child is None:
             child = {}
             node[part] = child
+        elif not isinstance(child, dict):
+            where = ".".join(parts[: depth + 1])
+            raise ValueError(
+                f"cannot set {key!r}: {where!r} is a {type(child).__name__}, not a mapping"
+            )
         node = child
     node[parts[-1]] = value
 
@@ -186,11 +275,20 @@ def parse_set_args(items: list[str] | None) -> dict[str, Any]:
         if "=" not in item:
             raise ValueError(f"--set expects key=value, got {item!r}")
         key, raw = item.split("=", 1)
-        out[key.strip()] = yaml.safe_load(raw)
+        key = key.strip()
+        _split_dotted(key)
+        out[key] = yaml_load(raw)
     return out
 
 
 def apply_overrides(config: dict[str, Any], overrides: dict[str, Any] | None) -> dict[str, Any]:
+    """Return a deep copy of ``config`` with dotted-key ``overrides`` applied.
+
+    A dict value REPLACES the whole sub-dict at that key; it is not deep-merged the way a YAML
+    file is in :func:`load_fl_config`. For example ``{"defense.aggregator": {"name": "median"}}``
+    drops the default ``params`` entry, so consumers must read optional keys with
+    ``.get(key, default)``. Use a deeper key (``defense.aggregator.name``) to change one leaf.
+    """
     out = copy.deepcopy(config)
     for key, value in (overrides or {}).items():
         set_dotted(out, key, copy.deepcopy(value))
