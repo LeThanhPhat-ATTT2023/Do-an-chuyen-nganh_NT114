@@ -2,6 +2,9 @@
 
 N (clients per round) is small; D (HGT parameters, ~6.5M for the full model) is
 large, so coordinate-wise reductions run over column chunks to bound memory.
+
+Convention: torch for the (N, D) work, numpy float64 for per-client scalars.
+Inputs must be finite; the server rejects non-finite deltas before aggregation.
 """
 
 from __future__ import annotations
@@ -14,11 +17,18 @@ import torch
 CHUNK = 1 << 20
 
 
+def _check_chunk(chunk: int) -> None:
+    if chunk <= 0:
+        raise ValueError(f"chunk must be positive, got {chunk}")
+
+
 def pairwise_sq_dists(x: torch.Tensor) -> torch.Tensor:
     n = x.shape[0]
     out = torch.zeros((n, n), dtype=torch.float64, device=x.device)
     for i in range(n):
-        out[i] = (x - x[i]).pow(2).sum(dim=1).to(torch.float64)
+        # Direct differences on purpose (no |a|^2+|b|^2-2ab cancellation): do not
+        # "simplify" to cdist/vector_norm. In-place square halves peak memory.
+        out[i] = (x - x[i]).pow_(2).sum(dim=1).to(torch.float64)
     return out
 
 
@@ -28,10 +38,27 @@ def pairwise_cosine(x: torch.Tensor) -> torch.Tensor:
     return gram / (norms[:, None] * norms[None, :])
 
 
+def row_norms(x: torch.Tensor, chunk: int = CHUNK) -> torch.Tensor:
+    """float64 (N,) L2 norms from chunked sums of squares.
+
+    float32 ``Tensor.norm()`` over millions of columns has ~2e-4 relative error;
+    accumulating per-chunk sums in float64 avoids that without a float64 copy of x.
+    """
+    _check_chunk(chunk)
+    acc = torch.zeros(x.shape[0], dtype=torch.float64, device=x.device)
+    for a in range(0, x.shape[1], chunk):
+        acc += x[:, a:a + chunk].pow(2).sum(dim=1).to(torch.float64)
+    return acc.sqrt()
+
+
 def cosine_to(x: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     ref = ref.to(x.device, x.dtype)
-    dots = (x @ ref).to(torch.float64)
-    denom = x.norm(dim=1).to(torch.float64) * float(ref.norm())
+    # Chunked float64 accumulation: one float32 gemv over millions of columns is
+    # itself only good to ~1e-6 relative, which would swamp the precise norms.
+    dots = torch.zeros(x.shape[0], dtype=torch.float64, device=x.device)
+    for a in range(0, x.shape[1], CHUNK):
+        dots += (x[:, a:a + CHUNK] @ ref[a:a + CHUNK]).to(torch.float64)
+    denom = row_norms(x) * row_norms(ref.unsqueeze(0))[0]
     return dots / denom.clamp_min(1e-24)
 
 
@@ -41,7 +68,11 @@ def _sorted_chunks(x: torch.Tensor, chunk: int) -> Iterator[tuple[int, torch.Ten
 
 
 def coordinate_median(x: torch.Tensor, chunk: int = CHUNK) -> torch.Tensor:
+    """Coordinate-wise median; even N averages the two middle values (unlike torch.median)."""
+    _check_chunk(chunk)
     n = x.shape[0]
+    if n == 0:
+        raise ValueError("cannot take the median of zero rows")
     out = torch.empty(x.shape[1], dtype=x.dtype, device=x.device)
     for start, s in _sorted_chunks(x, chunk):
         end = start + s.shape[1]
@@ -50,6 +81,7 @@ def coordinate_median(x: torch.Tensor, chunk: int = CHUNK) -> torch.Tensor:
 
 
 def coordinate_trimmed_mean(x: torch.Tensor, k: int, chunk: int = CHUNK) -> torch.Tensor:
+    _check_chunk(chunk)
     n = x.shape[0]
     if k < 0 or 2 * k >= n:
         raise ValueError(f"cannot trim {k} per side from {n} rows")
@@ -61,16 +93,18 @@ def coordinate_trimmed_mean(x: torch.Tensor, k: int, chunk: int = CHUNK) -> torc
 
 def top_right_singular_vector(x: torch.Tensor) -> torch.Tensor:
     _u, _s, vh = torch.linalg.svd(x.to(torch.float32), full_matrices=False)
-    return vh[0]
+    return vh[0].to(x.dtype)
 
 
 def robust_center_scale(
     values: np.ndarray | list[float], axis: int = 0, floor: float = 1e-6
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray | float, np.ndarray | float]:
+    """Median and floored MAD scale along ``axis`` (reduced axis removed; scalars for 1-D)."""
     v = np.asarray(values, dtype=np.float64)
-    center = np.median(v, axis=axis)
-    scale = 1.4826 * np.median(np.abs(v - center), axis=axis)
-    return center, np.maximum(scale, floor)
+    center = np.median(v, axis=axis, keepdims=True)
+    mad = np.median(np.abs(v - center), axis=axis, keepdims=True)
+    scale = np.maximum(1.4826 * mad, floor)
+    return np.squeeze(center, axis=axis)[()], np.squeeze(scale, axis=axis)[()]
 
 
 def robust_z(values: np.ndarray | list[float], floor: float = 1e-6) -> np.ndarray:
@@ -86,8 +120,10 @@ def _offdiag_rows(mat: np.ndarray) -> list[np.ndarray]:
 
 
 def median_excluding_self(mat: np.ndarray) -> np.ndarray:
+    """Per-row median of off-diagonal entries; an empty row yields 1.0 (meant for cosine matrices)."""
     return np.array([float(np.median(r)) if r.size else 1.0 for r in _offdiag_rows(mat)])
 
 
 def mean_excluding_self(mat: np.ndarray) -> np.ndarray:
+    """Per-row mean of off-diagonal entries; an empty row yields 1.0 (meant for cosine matrices)."""
     return np.array([float(r.mean()) if r.size else 1.0 for r in _offdiag_rows(mat)])
