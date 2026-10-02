@@ -33,6 +33,7 @@ def pairwise_sq_dists(x: torch.Tensor) -> torch.Tensor:
 
 
 def pairwise_cosine(x: torch.Tensor) -> torch.Tensor:
+    """float64 (N, N) cosine matrix; zero-norm rows give cosine 0 (including a 0 diagonal entry)."""
     gram = (x @ x.T).to(torch.float64)
     norms = gram.diagonal().clamp_min(1e-24).sqrt()
     return gram / (norms[:, None] * norms[None, :])
@@ -52,12 +53,13 @@ def row_norms(x: torch.Tensor, chunk: int = CHUNK) -> torch.Tensor:
 
 
 def cosine_to(x: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+    """float64 cosine of each row of x with ref; a zero-norm row (or ref) gives 0, not NaN."""
     ref = ref.to(x.device, x.dtype)
-    # Chunked float64 accumulation: one float32 gemv over millions of columns is
-    # itself only good to ~1e-6 relative, which would swamp the precise norms.
+    # Elementwise product + chunked sum, accumulated in float64 (the row_norms
+    # pattern): a float32 sgemv's accumulation depends on the BLAS thread count.
     dots = torch.zeros(x.shape[0], dtype=torch.float64, device=x.device)
     for a in range(0, x.shape[1], CHUNK):
-        dots += (x[:, a:a + CHUNK] @ ref[a:a + CHUNK]).to(torch.float64)
+        dots += (x[:, a:a + CHUNK] * ref[a:a + CHUNK]).sum(dim=1).to(torch.float64)
     denom = row_norms(x) * row_norms(ref.unsqueeze(0))[0]
     return dots / denom.clamp_min(1e-24)
 

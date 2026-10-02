@@ -70,6 +70,17 @@ def test_row_norms_and_cosine_to_are_precise_at_large_d():
     assert cosine_to(x, x[0])[0].item() == pytest.approx(1.0, abs=1e-6)
 
 
+def test_cosine_to_precision_is_thread_independent():
+    torch.manual_seed(0)
+    x = torch.randn(3, 1_500_000) + 0.5
+    old = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        assert abs(cosine_to(x, x[0])[0].item() - 1.0) < 1e-6
+    finally:
+        torch.set_num_threads(old)
+
+
 def test_zero_norm_rows_give_zero_cosine_not_nan():
     x = torch.tensor([[0.0, 0.0], [1.0, 0.0]])
     c = pairwise_cosine(x)
