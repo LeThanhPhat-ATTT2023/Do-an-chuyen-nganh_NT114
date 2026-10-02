@@ -12,6 +12,7 @@ from graphslm_ids.offline.federated.attacks import (
     build_attack,
     krum_sign_counts,
     match_sign_counts,
+    perturbation_direction,
     search_gamma,
 )
 from graphslm_ids.offline.federated.linalg import pairwise_sq_dists
@@ -121,3 +122,164 @@ def test_scale_sign_gamma_stays_in_one_to_gamma_init():
     attack = ScaleSign(gamma_init=10.0, tol=1e-4)
     attack.craft(_ctx(benign, honest), 3)
     assert 1.0 <= attack.last_gamma <= 10.0
+
+
+@pytest.mark.parametrize("constraint", ["min_max", "min_sum"])
+def test_scale_sign_gamma_sits_on_constraint_boundary(constraint):
+    # Correlated clients: gamma* sits well below gamma_init / 8, where a search that
+    # rejects g < 1 on its way down used to return 1.0 (a no-op attack).
+    torch.manual_seed(3)
+    common = torch.randn(400)
+    benign = common + 0.1 * torch.randn(8, 400)
+    honest = common + 0.1 * torch.randn(2, 400)
+    attack = ScaleSign(gamma_init=10.0, tol=1e-6, constraint=constraint)
+    attack.craft(_ctx(benign, honest), 2)
+    gamma = attack.last_gamma
+    assert 1.0 < gamma < 10.0 / 8
+    gbar = honest.mean(0)
+    pos, neg = gbar.clamp_min(0), gbar.clamp_max(0)
+    d = pairwise_sq_dists(benign)
+    bound = float(d.max()) if constraint == "min_max" else float(d.sum(1).max())
+
+    def measure(g):
+        dist = (benign - (g * pos + neg / g)).pow(2).sum(1).double()
+        return float(dist.max()) if constraint == "min_max" else float(dist.sum())
+
+    assert measure(gamma) <= bound * (1 + 1e-4)
+    assert measure(1.01 * gamma) > bound
+
+
+def test_scale_sign_oracle_is_accurate_with_large_common_offset():
+    # |r|^2 ~ 4e9 swamps the ~20 squared distance: the origin-centred expansion loses
+    # every digit in float32; the expansion around gbar does not.
+    torch.manual_seed(5)
+    common = 1000.0 + torch.randn(4000)
+    benign = common + 0.05 * torch.randn(8, 4000)
+    honest = common + 0.05 * torch.randn(2, 4000)
+    a32, a64 = ScaleSign(tol=1e-6), ScaleSign(tol=1e-6)
+    a32.craft(_ctx(benign, honest), 2)
+    a64.craft(_ctx(benign.double(), honest.double()), 2)
+    assert a32.last_gamma > 1.0
+    assert a32.last_gamma == pytest.approx(a64.last_gamma, rel=1e-3)
+
+
+@pytest.mark.parametrize("kind", ["unit", "sign"])
+def test_unit_and_sign_perturbations_are_rescaled_to_sigma_norm(kind):
+    torch.manual_seed(7)
+    ref = torch.randn(10, 200) * 100.0 + 5.0
+    p = perturbation_direction(ref, kind)
+    sigma = ref.std(0, unbiased=False)
+    assert float(p.double().norm()) == pytest.approx(float(sigma.double().norm()), rel=1e-5)
+    mu = ref.mean(0)
+    base = -mu if kind == "unit" else -torch.sign(mu)
+    cos = (p.double() @ base.double()) / (p.double().norm() * base.double().norm())
+    assert float(cos) == pytest.approx(1.0, abs=1e-6)
+    assert torch.equal(perturbation_direction(ref, "std"), -sigma)
+
+
+@pytest.mark.parametrize("cls", [MinMax, MinSum])
+@pytest.mark.parametrize("kind", ["unit", "sign"])
+def test_unit_and_sign_perturbations_reach_boundary_on_scaled_data(cls, kind):
+    torch.manual_seed(4)
+    benign = torch.randn(10, 40) * 100.0 + 30.0
+    attack = cls(perturbation=kind, gamma_init=10.0, tol=1e-6)
+    v = attack.craft(_ctx(benign, torch.zeros(0, 40)), 3)[0]
+    d = pairwise_sq_dists(benign)
+
+    def measure(vec):
+        dist = (benign - vec).pow(2).sum(1).double()
+        return float(dist.max()) if cls is MinMax else float(dist.sum())
+
+    bound = float(d.max()) if cls is MinMax else float(d.sum(1).max())
+    mu, p = benign.mean(0), perturbation_direction(benign, kind)
+    assert 0 < attack.last_gamma < 2 * attack.gamma_init - 1.0
+    assert not attack.info["saturated"]
+    assert measure(v) <= bound * (1 + 1e-4)
+    assert measure(mu + 1.01 * attack.last_gamma * p) > bound
+
+
+def test_gamma_attack_partial_knowledge_uses_honest_rows():
+    torch.manual_seed(6)
+    benign = torch.randn(8, 30)
+    honest = torch.randn(3, 30) * 2.0 + 5.0
+    attack = MinMax(tol=1e-6)
+    out = attack.craft(_ctx(benign, honest, "partial"), 3)
+    expected = honest.mean(0) + attack.last_gamma * perturbation_direction(honest, "std")
+    assert torch.allclose(out[0], expected, atol=1e-5)
+    assert torch.equal(out[0], out[1]) and torch.equal(out[1], out[2])
+    omniscient = MinMax(tol=1e-6).craft(_ctx(benign, honest), 3)
+    assert not torch.allclose(out[0], omniscient[0])
+
+
+def test_no_attack_returns_honest_copy():
+    honest = torch.randn(2, 5)
+    out = build_attack({"name": "none"}).craft(_ctx(torch.randn(3, 5), honest), 2)
+    assert torch.equal(out, honest)
+    assert out.data_ptr() != honest.data_ptr()
+
+
+def test_partial_knowledge_without_honest_rows_raises():
+    benign = torch.ones(2, 3)
+    with pytest.raises(ValueError):
+        AttackContext(torch.zeros(0, 3), benign, 2, knowledge="partial").reference()
+    honest = torch.full((1, 3), 7.0)
+    assert torch.equal(AttackContext(honest, torch.zeros(0, 3), 1).reference(), honest)
+
+
+def test_build_attack_validates_knowledge():
+    assert build_attack({"name": "alie", "knowledge": "partial"}).name == "alie"
+    assert build_attack({"name": "alie", "knowledge": "omniscient"}).name == "alie"
+    with pytest.raises(ValueError):
+        build_attack({"name": "alie", "knowledge": "bogus"})
+
+
+def test_attack_info_diagnostics():
+    torch.manual_seed(8)
+    benign = torch.randn(10, 40)
+    alie = ALIE()
+    alie.craft(_ctx(benign, torch.zeros(2, 40)), 2)
+    assert alie.info["z"] == pytest.approx(alie_z(12, 2))
+    assert alie.last_gamma is None
+
+    mm = MinMax(tol=1e-6)
+    mm.craft(_ctx(benign, torch.zeros(0, 40)), 2)
+    assert mm.info["gamma"] == mm.last_gamma > 0
+    assert mm.info["saturated"] is False
+    # a tiny search range cannot reach the constraint: gamma saturates at its ceiling
+    tiny = MinMax(gamma_init=0.01, tol=1e-6)
+    tiny.craft(_ctx(benign, torch.zeros(0, 40)), 2)
+    assert tiny.info["saturated"] is True
+
+    honest = torch.randn(3, 40)
+    ss = ScaleSign(tol=1e-4)
+    ss.craft(_ctx(benign, honest), 3)
+    pos, _zero, neg = krum_sign_counts(honest)
+    assert ss.info["target_pos"] == pos and ss.info["target_neg"] == neg
+    assert ss.info["gamma"] == ss.last_gamma
+    ss.info["stale"] = 1
+    ss.craft(_ctx(benign, honest), 3)
+    assert "stale" not in ss.info
+
+
+@pytest.mark.parametrize(
+    "name,params",
+    [
+        ("min_max", {"gamma_init": 0.0}),
+        ("min_max", {"gamma_init": float("inf")}),
+        ("min_max", {"tol": -1.0}),
+        ("min_sum", {"tol": 0.0}),
+        ("min_sum", {"gamma_init": float("nan")}),
+        ("scale_sign", {"gamma_init": 1.0}),
+        ("scale_sign", {"gamma_init": float("inf")}),
+        ("scale_sign", {"tol": 0.0}),
+        ("scale_sign", {"constraint": "bogus"}),
+        ("sign_flip", {"scale": 0.0}),
+        ("sign_flip", {"scale": -1.0}),
+        ("sign_flip", {"scale": float("inf")}),
+        ("alie", {"z": float("nan")}),
+        ("alie", {"z": float("inf")}),
+    ],
+)
+def test_constructors_reject_bad_numbers(name, params):
+    with pytest.raises(ValueError):
+        build_attack({"name": name, "params": params})

@@ -150,24 +150,33 @@ test nhanh trên vector ngẫu nhiên và có thể tái dụng cho model khác.
 
 ### 3.5 Attack (`attacks.py`)
 
-Giao diện: `Attack.craft(ctx) -> Tensor (M, D)`; `ctx` gồm `honest` (delta trung thực của M
-attacker tham gia round), `benign` (delta của client lành tham gia), `num_participants`,
-`rng`. `knowledge`: `omniscient` (tập tham chiếu = benign, mặc định, kịch bản xấu nhất)
-hoặc `partial` (tập tham chiếu = honest của attacker). Không có benign ⇒ dùng honest.
-Attack bắt đầu từ `start_round`.
+Giao diện: `Attack.craft(ctx, num_malicious) -> Tensor (M, D)` với `M = num_malicious`;
+`ctx` (`AttackContext`) gồm `honest` (delta trung thực của M attacker tham gia round),
+`benign` (delta của client lành tham gia), `num_participants`, `knowledge` (không có `rng`:
+mọi attack đều tất định). `knowledge`: `omniscient` (tập tham chiếu = benign, mặc định,
+kịch bản xấu nhất) hoặc `partial` (tập tham chiếu = honest của attacker). Omniscient mà
+không có benign ⇒ dùng honest; `partial` mà không có honest ⇒ `ValueError` (không lén dùng
+benign). `build_attack` kiểm tra `attack.knowledge` ∈ {omniscient, partial}. Attack bắt đầu
+từ `start_round`. `Attack.info` (dict, reset mỗi lần `craft`) ghi chẩn đoán: `gamma`,
+`saturated` (γ chạm trần miền tìm kiếm ⇒ ràng buộc lỏng), `z` (ALIE), `target_pos/target_neg`
+(ScaleSign); `last_gamma` vẫn dùng được (`None` với attack không tìm γ).
 
 | Attack | Định nghĩa (nguồn) | Mặc định |
 |---|---|---|
 | `sign_flip` | `Δ_m = −s·Δ_m^honest`, mỗi attacker độc lập | `s = 1.0` |
 | `alie` | `s = ⌊n/2+1⌋ − m`; `z = Φ⁻¹((n−s)/n)`; mọi attacker gửi `μ + z·σ` (μ, σ theo coordinate trên tập tham chiếu) — Baruch et al. 2019, Alg. 3; n = số client tham gia | `z` tính theo công thức gốc; cho phép ghi đè |
-| `min_max` | `Δ_m = μ + γ·p`, γ lớn nhất sao cho `max_i ‖Δ_m − Δ_i‖ ≤ max_{i,j} ‖Δ_i − Δ_j‖`; tìm γ theo NDSS'21 Alg. 1 | `p = −std` (tùy chọn `unit`: `−μ/‖μ‖`, `sign`: `−sign(μ)`), `γ_init = 10`, `τ = 1e−5` |
+| `min_max` | `Δ_m = μ + γ·p`, γ lớn nhất sao cho `max_i ‖Δ_m − Δ_i‖ ≤ max_{i,j} ‖Δ_i − Δ_j‖`; tìm γ theo NDSS'21 Alg. 1 | `p = −std` (tùy chọn `unit`: `−μ/‖μ‖`, `sign`: `−sign(μ)`, cả hai được **rescale về ‖σ‖** để γ không có đơn vị và không phụ thuộc thang dữ liệu; tập `μ + γp` không đổi), `γ_init = 10`, `τ = 1e−5` |
 | `min_sum` | như trên với `Σ_i ‖Δ_m − Δ_i‖² ≤ max_i Σ_j ‖Δ_i − Δ_j‖²` (Eq. 7, dùng max như bài báo; code chính thức dùng min — ghi chú) | như Min-Max |
-| `scale_sign` | Yang et al. TIFS 2025 §V: `ḡ` = mean honest của attacker; `φ_r = γ` nếu `ḡ_r > 0`, `1/γ` nếu `< 0`, `0` nếu `= 0`; γ ∈ [1, γ_init] lớn nhất thỏa ràng buộc Min-Max trên tập tham chiếu (oracle NDSS — **sửa** Alg. 2 in sai vì J được kiểm trên g* cũ); sau đó chỉnh số coordinate dương/âm về `(P̄, N̄)` chọn kiểu Krum trên đếm dấu của attacker (Eq. 10), theo quy tắc đặt 0 / đặt τ của Alg. 4 | `γ_init = 10`, `τ = 1e−3`, `constraint = min_max` |
+| `scale_sign` | Yang et al. TIFS 2025 §V: `ḡ` = mean honest của attacker; `φ_r = γ` nếu `ḡ_r > 0`, `1/γ` nếu `< 0`, `0` nếu `= 0`; γ ∈ [1, γ_init] lớn nhất thỏa ràng buộc Min-Max trên tập tham chiếu (oracle NDSS — **sửa** Alg. 2 in sai vì J được kiểm trên g* cũ); tìm trên `t = γ − 1 ∈ [0, γ_init − 1]` (như Alg. 2): tìm trực tiếp γ rồi từ chối `γ < 1` làm các bước lùi `γ_init/2, /4, /8…` rơi xuống dưới 1 và trả về 1 (attack thành no-op) khi γ* < γ_init/8; khoảng cách tính theo khai triển quanh `ḡ` (cộng float64 theo chunk) để tránh triệt tiêu khi client tương quan cao; sau đó chỉnh số coordinate dương/âm về `(P̄, N̄)` chọn kiểu Krum trên đếm dấu của attacker (Eq. 10), theo quy tắc đặt 0 / đặt τ của Alg. 4 | `γ_init = 10`, `τ = 1e−3`, `constraint = min_max` |
 
 Mọi attacker trong ALIE/Min-Max/Min-Sum/ScaleSign gửi cùng vector (collusion theo
 định nghĩa gốc). Tự động: attacker chỉ train trung thực khi attack cần `honest`
 (sign_flip, scale_sign, hoặc `knowledge: partial`); ALIE/Min-Max/Min-Sum omniscient bỏ qua
 bước train của attacker để tiết kiệm GPU.
+
+Quy ước: `σ` là std **quần thể** (`unbiased=False`); code tham chiếu thường dùng std mẫu
+(`torch.std` mặc định, lớn hơn `√(n/(n−1))`), nên σ ở đây nhỏ hơn `√((n−1)/n)` và độ lệch
+`z·σ` của ALIE co lại cùng hệ số (n = 10: 0,949; n = 50: 0,990).
 
 ### 3.6 Aggregator (`aggregators.py`)
 
