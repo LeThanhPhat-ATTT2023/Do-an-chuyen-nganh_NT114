@@ -186,7 +186,8 @@ class Attack:
 
     ``info`` is a diagnostics dict reset on every call; gamma-searching attacks fill
     ``gamma`` / ``saturated`` (gamma reached the ceiling of its search range, i.e. the
-    constraint was slack) and keep ``last_gamma`` in sync.
+    constraint was slack) and keep ``last_gamma`` in sync. Min-Max / Min-Sum add
+    ``degenerate`` (zero perturbation, output = mu); ScaleSign adds ``feasible``.
     """
 
     name = "base"
@@ -265,9 +266,16 @@ class _GammaAttack(Attack):
         cc = _sq_norm(p)
         oracle = self._oracle(a, b, cc, pairwise_sq_dists(ref))
         self.last_gamma = search_gamma(oracle, self.gamma_init, self.tol)
+        # cc == 0: the perturbation vanished (e.g. sigma = 0 for a single-row reference), the
+        # output is mu whatever gamma is, so gamma carries no signal and cannot be saturated.
+        degenerate = cc == 0.0
         # The step schedule reaches at most ~2 * gamma_init; landing there = slack constraint.
-        saturated = self.last_gamma >= 2.0 * self.gamma_init - 4.0 * self.tol
-        self.info = {"gamma": self.last_gamma, "saturated": bool(saturated)}
+        saturated = not degenerate and self.last_gamma >= 2.0 * self.gamma_init - 4.0 * self.tol
+        self.info = {
+            "gamma": self.last_gamma,
+            "saturated": bool(saturated),
+            "degenerate": bool(degenerate),
+        }
         return (mu + self.last_gamma * p).unsqueeze(0).repeat(num_malicious, 1)
 
 
@@ -310,6 +318,11 @@ class ScaleSign(Attack):
             raise ValueError(f"unknown scale_sign constraint {constraint!r}")
         self.gamma_init = _above("scale_sign gamma_init", gamma_init, floor=1.0)
         self.tol = _above("scale_sign tol", tol)
+        if self.gamma_init - 1.0 <= self.tol:
+            raise ValueError(
+                f"scale_sign needs gamma_init - 1 > tol (search range [0, gamma_init - 1]); "
+                f"got gamma_init={gamma_init!r}, tol={tol!r}"
+            )
         self.constraint = constraint
         self.last_gamma = 1.0
 
@@ -351,6 +364,9 @@ class ScaleSign(Attack):
         self.info = {
             "gamma": self.last_gamma,
             "saturated": bool(t >= t_max - self.tol),
+            # False with gamma == 1: the constraint is infeasible even for the honest mean
+            # (gamma = 1 forced), as opposed to a feasible search that stopped at gamma* ~ 1.
+            "feasible": bool(feasible(self.last_gamma)),
             "target_pos": target_pos,
             "target_neg": target_neg,
         }

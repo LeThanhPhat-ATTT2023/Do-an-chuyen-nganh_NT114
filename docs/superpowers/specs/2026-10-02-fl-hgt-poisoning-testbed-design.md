@@ -158,8 +158,10 @@ kịch bản xấu nhất) hoặc `partial` (tập tham chiếu = honest của a
 không có benign ⇒ dùng honest; `partial` mà không có honest ⇒ `ValueError` (không lén dùng
 benign). `build_attack` kiểm tra `attack.knowledge` ∈ {omniscient, partial}. Attack bắt đầu
 từ `start_round`. `Attack.info` (dict, reset mỗi lần `craft`) ghi chẩn đoán: `gamma`,
-`saturated` (γ chạm trần miền tìm kiếm ⇒ ràng buộc lỏng), `z` (ALIE), `target_pos/target_neg`
-(ScaleSign); `last_gamma` vẫn dùng được (`None` với attack không tìm γ).
+`saturated` (γ chạm trần miền tìm kiếm ⇒ ràng buộc lỏng), `z` (ALIE), `degenerate`
+(Min-Max/Min-Sum: perturbation bằng 0, đầu ra = μ), `feasible` + `target_pos/target_neg`
+(ScaleSign; `feasible = False` ⇒ ràng buộc vi phạm ngay cả ở γ = 1, γ = 1 là bị ép);
+`last_gamma` vẫn dùng được (`None` với attack không tìm γ).
 
 | Attack | Định nghĩa (nguồn) | Mặc định |
 |---|---|---|

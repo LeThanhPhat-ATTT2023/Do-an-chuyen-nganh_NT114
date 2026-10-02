@@ -122,6 +122,7 @@ def test_scale_sign_gamma_stays_in_one_to_gamma_init():
     attack = ScaleSign(gamma_init=10.0, tol=1e-4)
     attack.craft(_ctx(benign, honest), 3)
     assert 1.0 <= attack.last_gamma <= 10.0
+    assert attack.info["saturated"] is True
 
 
 @pytest.mark.parametrize("constraint", ["min_max", "min_sum"])
@@ -270,6 +271,7 @@ def test_attack_info_diagnostics():
         ("min_sum", {"tol": 0.0}),
         ("min_sum", {"gamma_init": float("nan")}),
         ("scale_sign", {"gamma_init": 1.0}),
+        ("scale_sign", {"gamma_init": 1.0005, "tol": 1e-3}),
         ("scale_sign", {"gamma_init": float("inf")}),
         ("scale_sign", {"tol": 0.0}),
         ("scale_sign", {"constraint": "bogus"}),
@@ -283,3 +285,45 @@ def test_attack_info_diagnostics():
 def test_constructors_reject_bad_numbers(name, params):
     with pytest.raises(ValueError):
         build_attack({"name": name, "params": params})
+
+
+def test_scale_sign_info_tells_forced_gamma_from_tight_gamma():
+    torch.manual_seed(3)
+    common = torch.randn(400)
+    benign = common + 0.1 * torch.randn(8, 400)
+    close = ScaleSign(tol=1e-6)
+    close.craft(_ctx(benign, common + 0.1 * torch.randn(2, 400)), 2)
+    assert close.last_gamma > 1.0 and close.info["feasible"] is True
+
+    # honest deltas far from every benign one: even gamma = 1 breaks the constraint,
+    # so the search returns nothing and gamma = 1 is forced.
+    torch.manual_seed(9)
+    benign = torch.randn(8, 60)
+    forced = ScaleSign(tol=1e-6)
+    forced.craft(_ctx(benign, benign[:2] + 10.0), 2)
+    assert forced.last_gamma == 1.0
+    assert forced.info["feasible"] is False
+
+
+@pytest.mark.parametrize("kind", ["std", "unit", "sign"])
+@pytest.mark.parametrize("cls", [MinMax, MinSum])
+def test_gamma_attacks_flag_a_zero_perturbation_as_degenerate(cls, kind):
+    # One reference row: sigma = 0, so the perturbation vanishes and the output is mu.
+    row = torch.randn(1, 10)
+    ctx = AttackContext(row, torch.zeros(0, 10), 1, knowledge="partial")
+    attack = cls(perturbation=kind)
+    out = attack.craft(ctx, 2)
+    assert attack.info["degenerate"] is True
+    assert attack.info["saturated"] is False
+    assert torch.equal(out[0], row[0])
+
+    torch.manual_seed(10)
+    normal = cls(perturbation=kind)
+    normal.craft(_ctx(torch.randn(8, 10), torch.zeros(0, 10)), 2)
+    assert normal.info["degenerate"] is False
+
+
+def test_alie_info_z_is_the_override():
+    alie = ALIE(z=1.5)
+    alie.craft(_ctx(torch.randn(8, 6), torch.zeros(2, 6)), 2)
+    assert alie.info["z"] == 1.5
