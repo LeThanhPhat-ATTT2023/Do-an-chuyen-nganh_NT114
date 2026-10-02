@@ -50,6 +50,9 @@ Package mới `src/graphslm_ids/offline/federated/`. Mỗi file một trách nhi
 federated/
   __init__.py
   config.py          # DEFAULT_FL_CONFIG, load_fl_config, --set overrides (dotted keys)
+  records.py         # to_jsonable, write_json, append_jsonl
+  linalg.py          # pairwise dist/cosine, median/trimmed mean theo chunk, robust z, SVD
+  matrix.py          # expand_grid, run_grid, summarize (logic cho scripts/fl/*)
   partition.py       # IID / Dirichlet, subsample, JSON
   client_graph.py    # packet_owner, build_client_artifact, recompute_host_features
   params.py          # ParamLayout: flatten/unflatten, nhóm tham số HGT, active groups
@@ -135,7 +138,7 @@ test nhanh trên vector ngẫu nhiên và có thể tái dụng cho model khác.
 - EACS warm-up tính theo **round toàn cục** (`epoch = round_idx`), vì độ trưởng thành
   của model global mới là điều warm-up cần.
 - Class weight CB tính từ nhãn **cục bộ** của client (`class_weights_from_backend`).
-- RNG: sampler seed = `seed + 1000·round + client_id`; `torch.manual_seed` cùng công thức.
+- RNG: sampler seed = `seed + 100003·round + 1009·client_id`; `torch.manual_seed` cùng công thức.
 
 ### 3.5 Attack (`attacks.py`)
 
@@ -154,8 +157,9 @@ Attack bắt đầu từ `start_round`.
 | `scale_sign` | Yang et al. TIFS 2025 §V: `ḡ` = mean honest của attacker; `φ_r = γ` nếu `ḡ_r > 0`, `1/γ` nếu `< 0`, `0` nếu `= 0`; γ ∈ [1, γ_init] lớn nhất thỏa ràng buộc Min-Max trên tập tham chiếu (oracle NDSS — **sửa** Alg. 2 in sai vì J được kiểm trên g* cũ); sau đó chỉnh số coordinate dương/âm về `(P̄, N̄)` chọn kiểu Krum trên đếm dấu của attacker (Eq. 10), theo quy tắc đặt 0 / đặt τ của Alg. 4 | `γ_init = 10`, `τ = 1e−3`, `constraint = min_max` |
 
 Mọi attacker trong ALIE/Min-Max/Min-Sum/ScaleSign gửi cùng vector (collusion theo
-định nghĩa gốc). `attacker_trains: auto` — attacker chỉ train trung thực khi attack cần
-`honest` (sign_flip, scale_sign, hoặc `knowledge: partial`).
+định nghĩa gốc). Tự động: attacker chỉ train trung thực khi attack cần `honest`
+(sign_flip, scale_sign, hoặc `knowledge: partial`); ALIE/Min-Max/Min-Sum omniscient bỏ qua
+bước train của attacker để tiết kiệm GPU.
 
 ### 3.6 Aggregator (`aggregators.py`)
 
@@ -211,11 +215,14 @@ liệu server/học thêm):
 
 - Tín hiệu: `cos(Δ_k, ref)` (f2), cosine trung bình tới client khác (f3), `log‖Δ_k‖` (f4),
   tỷ lệ đồng thuận dấu với `ref` (f5); tùy chọn tín hiệu độ lệch nhóm relation như trên.
-- Chuẩn hóa robust z (median/MAD) trong round. Nghi ngờ mỗi tín hiệu:
-  `clip(−z/3, 0, 1)` cho tín hiệu kiểu tương đồng, `clip(|z|/3, 0, 1)` cho norm và độ lệch
-  nhóm. Trọng số đều (giống ablation rule-based của bài báo).
-- `trust_now = 1 − mean(nghi ngờ)`; lịch sử `trust_k = 0.8·trust_now + 0.2·trust_k^{t−1}`
-  (β = 0.8 như EMA Shapley của bài báo).
+- Chuẩn hóa robust z (median/MAD) trong round. Nghi ngờ mỗi tín hiệu có vùng chết 1σ:
+  `s = clip((−z − 1)/(z_max − 1), 0, 1)` cho tín hiệu kiểu tương đồng (chỉ thấp mới đáng
+  ngờ), `s = clip((|z| − 1)/(z_max − 1), 0, 1)` cho norm, `clip((z − 1)/(z_max − 1), 0, 1)` cho
+  độ lệch nhóm; `z_max = 3`.
+- Kết hợp **noisy-OR** `S = 1 − Π(1 − s_k)`, `trust_now = 1 − S` (lệch khỏi tổ hợp tuyến tính
+  đều của bài báo: với trung bình đều, một update ×50 chỉ mất 1/4 trust và vẫn phá model;
+  noisy-OR để một tín hiệu bão hòa là đủ loại). Lịch sử
+  `trust_k = 0.8·trust_now + 0.2·trust_k^{t−1}` (β = 0.8 như EMA Shapley của bài báo).
 - `trust < 0.5` → `reject` (ngưỡng 0.5 của bài báo); `0.5 ≤ trust < 0.8` → `downweight`
   (trọng số = trust); còn lại `accept`.
 
@@ -249,8 +256,9 @@ cục, split, clean labels, cache client) cho phép matrix runner nạp artifact
 Chế độ:
 
 - `fl`: vòng round như dưới.
-- `centralized`: 1 client chứa toàn bộ train (đã subsample nếu có), `optimizer_state:
-  persist`, mỗi round = 1 epoch, không attack, FedAvg.
+- `centralized`: 1 client chứa **hợp các flow của các client FL** (cùng partition, cùng
+  subsample ⇒ cùng dữ liệu train, chỉ khác cách tổng hợp), `optimizer_state: persist`, mỗi
+  round = 1 epoch, không attack, FedAvg.
 - `local_only`: mỗi client tự train `rounds × local_epochs` từ cùng khởi tạo, không tổng hợp;
   chấm từng model trên val/test toàn cục; báo cáo mean/std/min/max.
 
@@ -262,8 +270,10 @@ Một round `fl`:
 3. Từ `start_round`, attacker thay delta bằng `attack.craft`.
 4. `server.step` → model global mới.
 5. Đối chiếu ground truth → TP/FP/FN/TN phát hiện, loại nhầm client lành.
-6. Mỗi `eval.every` round: chấm val (subsample cố định `max_val_flows` nếu đặt) bằng
-   `evaluate_neighbor_sampling` + clean key; giữ best theo `eval.monitor`.
+6. Mỗi `eval.every` round: chấm val (subsample cố định `max_val_flows` nếu đặt) bằng vòng
+   lặp confusion matrix riêng (`metrics.confusion_from_loader`, cùng `to_torch_batch`; macro-F1
+   định nghĩa y hệt trainer cũ: trung bình trên lớp có support > 0) trên nhãn noisy và clean
+   key; RNG sampler đánh giá được đặt lại mỗi lần chấm; giữ best theo `eval.monitor`.
 7. Kết thúc: chấm test cho model round cuối và best-val; lưu checkpoint.
 
 Round 0 trước vòng lặp: thu moment flow từ client → `flow_feature_stats` chung.
@@ -301,8 +311,9 @@ process, sắp theo partition để tái dụng cache client; bỏ qua ô đã c
 
 ## 4. Xử lý lỗi
 
-- Config sai (tên attack/aggregator/screener lạ, `k ≥ N/2` cho trimmed mean, Krum thiếu
-  `N > 2f + 2`) → `ValueError` khi dựng, trước khi train.
+- Config sai (tên attack/aggregator/screener lạ, tham số lạ, mode/monitor lạ) →
+  `ValueError` khi dựng, trước khi train. `k ≥ N/2` cho trimmed mean hoặc Krum thiếu
+  `N > 2f + 2` → `ValueError` lúc aggregate (N phụ thuộc số client tham gia round).
 - Dirichlet không đạt `min_flows_per_client` sau 100 lần → `ValueError` gợi ý tăng α.
 - Delta không hữu hạn/sai kích thước/sai round → `invalid`, bị loại, ghi log; round không có
   delta hợp lệ → giữ nguyên `W_t`.
