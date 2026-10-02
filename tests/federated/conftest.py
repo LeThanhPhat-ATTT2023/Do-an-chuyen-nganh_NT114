@@ -13,6 +13,24 @@ FLOW_FEATURES = ["proto", "src_port", "dst_port", "sig_a", "sig_b", "sig_c"]
 TECHNIQUES = {"T1059": 0, "T1190": 1, "T1498": 2, "T1595": 3}
 
 
+def host_features_reference(
+    src_host: np.ndarray, dst_host: np.ndarray, dst_port: np.ndarray, num_hosts: int
+) -> np.ndarray:
+    """Host tier features over ALL flows, by the same rule as graph_builder._build_host_tier:
+    out-degree, in-degree, #distinct dst ports and #distinct dst hosts per source host."""
+    out = np.zeros((num_hosts, 4), dtype=np.float32)
+    ports: list[set[int]] = [set() for _ in range(num_hosts)]
+    peers: list[set[int]] = [set() for _ in range(num_hosts)]
+    for s, d, p in zip(src_host.tolist(), dst_host.tolist(), dst_port.tolist(), strict=True):
+        out[s, 0] += 1.0
+        out[d, 1] += 1.0
+        ports[s].add(int(p))
+        peers[s].add(d)
+    out[:, 2] = [len(s) for s in ports]
+    out[:, 3] = [len(s) for s in peers]
+    return out
+
+
 def write_tiny_v3(root: Path, num_flows: int = 48, seed: int = 0) -> dict[str, Path]:
     rng = np.random.default_rng(seed)
     root.mkdir(parents=True, exist_ok=True)
@@ -32,18 +50,21 @@ def write_tiny_v3(root: Path, num_flows: int = 48, seed: int = 0) -> dict[str, P
     xss_pk = 2 * flows[y == 1]
     ddos_pk = 2 * flows[y == 2]
     xss_flows = flows[y == 1]
+    from_host = flows % 3
+    to_host = 3 + (flows % 3)
+    host_x = host_features_reference(from_host, to_host, flow_x[:, 2].astype(np.int64), 6)
     arrays = {
         "flow_x": flow_x,
         "flow_y": y,
         "packet_x": packet_x,
-        "host_x": np.zeros((6, 4), dtype=np.float32),
+        "host_x": host_x,
         "technique_x": rng.normal(size=(len(TECHNIQUES), 5)).astype(np.float32),
         "contain_edge_index": np.stack([np.repeat(flows, 2), np.arange(num_packets)]),
         "link_edge_index": np.stack([2 * flows, 2 * flows + 1]),
         "link_edge_attr": np.full((num_flows, 1), 0.01, dtype=np.float32),
-        "from_host_edge_index": np.stack([flows, flows % 3]),
+        "from_host_edge_index": np.stack([flows, from_host]),
         "from_host_edge_attr": np.ones((num_flows, 1), dtype=np.float32),
-        "to_host_edge_index": np.stack([flows, 3 + (flows % 3)]),
+        "to_host_edge_index": np.stack([flows, to_host]),
         "to_host_edge_attr": np.ones((num_flows, 1), dtype=np.float32),
         "burst_neighbor_edge_index": burst,
         "burst_neighbor_edge_attr": np.ones((burst.shape[1], 1), dtype=np.float32),

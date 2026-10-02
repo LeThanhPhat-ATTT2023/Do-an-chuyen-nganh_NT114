@@ -19,11 +19,35 @@ FROM_HOST = ("flow", "from_host", "host")
 TO_HOST = ("flow", "to_host", "host")
 
 
+def _require_single_edge(
+    key: tuple[str, str, str], endpoint: np.ndarray, num_nodes: int, noun: str
+) -> None:
+    """Fancy assignment with repeated indices has an undefined winner; refuse such inputs."""
+    if endpoint.size and np.bincount(endpoint, minlength=num_nodes).max() > 1:
+        raise ValueError(f"{noun} has more than one {key} edge; the ownership/host mapping is ambiguous")
+
+
+def _normalize_flow_ids(client_flow_ids: np.ndarray, num_flows: int) -> np.ndarray:
+    """Sorted unique int64 flow ids; integer dtype and ``0 <= id < num_flows`` are required
+    (an empty input of any dtype is an empty client)."""
+    ids = np.asarray(client_flow_ids)
+    if ids.size == 0:
+        return np.empty((0,), dtype=np.int64)
+    if not np.issubdtype(ids.dtype, np.integer):
+        raise ValueError(f"client_flow_ids must be an integer array, got dtype {ids.dtype}")
+    if ids.min() < 0 or ids.max() >= num_flows:
+        raise ValueError(
+            f"client flow ids must lie in [0, {num_flows}); got range [{ids.min()}, {ids.max()}]"
+        )
+    return np.unique(ids.astype(np.int64))
+
+
 def packet_owner(artifact: HeteroGraphArtifact) -> np.ndarray:
     num_packets = int(artifact.node_features["packet"].shape[0])
     owner = np.full((num_packets,), -1, dtype=np.int64)
     edges = np.asarray(artifact.edge_index.get(CONTAINS, np.zeros((2, 0))), dtype=np.int64)
     if edges.shape[1]:
+        _require_single_edge(CONTAINS, edges[1], num_packets, "a packet")
         owner[edges[1]] = edges[0]
     return owner
 
@@ -32,20 +56,26 @@ def _flow_to_host(artifact: HeteroGraphArtifact, key: tuple[str, str, str], num_
     out = np.full((num_flows,), -1, dtype=np.int64)
     edges = np.asarray(artifact.edge_index.get(key, np.zeros((2, 0))), dtype=np.int64)
     if edges.shape[1]:
+        _require_single_edge(key, edges[0], num_flows, "a flow")
         out[edges[0]] = edges[1]
     return out
 
 
 def recompute_host_features(artifact: HeteroGraphArtifact, client_flow_ids: np.ndarray) -> np.ndarray:
     """out-degree, in-degree, #distinct dst ports, #distinct dst hosts over the
-    client's flows only (graph_builder._build_host_tier aggregates over ALL flows)."""
+    client's flows only (graph_builder._build_host_tier aggregates over ALL flows).
+
+    Duplicate ids are counted once. A ``host_x`` that is not ``(H, 4)`` is an error: falling
+    back to the global host features would leak other clients' traffic statistics."""
     host_x = np.asarray(artifact.node_features["host"])
     if host_x.ndim != 2 or host_x.shape[1] != 4:
-        _LOG.warning("host_x has shape %s (expected (H, 4)); keeping global host features", host_x.shape)
-        return np.array(host_x, dtype=np.float32, copy=True)
+        raise ValueError(
+            f"host_x has shape {host_x.shape}, expected (H, 4); host features must be "
+            "recomputed per client and the global ones cannot be reused"
+        )
     num_hosts = int(host_x.shape[0])
     num_flows = int(artifact.node_features["flow"].shape[0])
-    ids = np.asarray(client_flow_ids, dtype=np.int64)
+    ids = _normalize_flow_ids(client_flow_ids, num_flows)
     src = _flow_to_host(artifact, FROM_HOST, num_flows)[ids]
     dst = _flow_to_host(artifact, TO_HOST, num_flows)[ids]
     out = np.zeros((num_hosts, 4), dtype=np.float32)
@@ -74,9 +104,29 @@ def build_client_artifact(
     owner: np.ndarray | None = None,
     recompute_host: bool = True,
 ) -> HeteroGraphArtifact:
-    ids = np.unique(np.asarray(client_flow_ids, dtype=np.int64))
-    owner = packet_owner(artifact) if owner is None else np.asarray(owner, dtype=np.int64)
+    """Client-local view of ``artifact``: drop every edge with an endpoint the client does not own.
+
+    Ownership: a flow is owned if its id is in ``client_flow_ids``; a packet if its ``contains``
+    flow is (an orphan packet, owner -1, is never owned). Node ids are not renumbered, and
+    node-feature arrays are shared with ``artifact`` except ``host`` (recomputed from the
+    client's own flows unless ``recompute_host=False``).
+
+    ``metadata`` is shared from the global artifact: its counts and mappings describe the
+    global graph, not this client view.
+    """
     num_flows = int(artifact.node_features["flow"].shape[0])
+    num_packets = int(artifact.node_features["packet"].shape[0])
+    ids = _normalize_flow_ids(client_flow_ids, num_flows)
+    if owner is None:
+        owner = packet_owner(artifact)
+    else:
+        owner = np.asarray(owner, dtype=np.int64)
+        if owner.ndim != 1 or owner.shape[0] != num_packets:
+            raise ValueError(
+                f"owner has shape {owner.shape}, expected ({num_packets},) (one entry per packet)"
+            )
+        if num_packets and (owner.min() < -1 or owner.max() >= num_flows):
+            raise ValueError(f"owner entries must be -1 or a flow id in [0, {num_flows})")
     flow_mask = np.zeros((num_flows,), dtype=bool)
     flow_mask[ids] = True
     packet_mask = np.zeros(owner.shape, dtype=bool)
