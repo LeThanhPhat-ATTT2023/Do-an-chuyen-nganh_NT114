@@ -118,9 +118,11 @@ test nhanh trên vector ngẫu nhiên và có thể tái dụng cho model khác.
   `rel:<src__rel__dst>` cho `layers.*.relation_{key,value,prior}.*`;
   `node:<type>` cho `input_projection.<type>` và `layers.*.{query,key,value,out,norm_attn,norm_ffn,ffn}.<type>`;
   `tactic_embedding`; `classifier`; còn lại `other`.
-- `group_index: dict[str, LongTensor]` (chỉ số coordinate), `group_norms(deltas) -> (N, G)`,
+- `groups: dict[str, list[(start, end)]]` (các đoạn coordinate của từng nhóm) và
+  `group_coords(names) -> LongTensor` (chỉ số coordinate của các nhóm), `group_norms(deltas) -> (N, G)`,
   `active_groups(deltas) -> bool (N, G)` (norm nhóm > 0). Relation không xuất hiện ở
   client ⇒ grad None ⇒ AdamW bỏ qua ⇒ delta nhóm đó đúng bằng 0.
+- Lưu ý: nhóm là thô — một nhóm "active" vẫn có thể chứa coordinate bằng 0 ở mọi client.
 
 ### 3.4 Local trainer (`local_trainer.py`)
 

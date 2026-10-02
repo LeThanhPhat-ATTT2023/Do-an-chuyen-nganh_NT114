@@ -4,6 +4,12 @@ Groups: ``rel:<src__rel__dst>`` (relation_key/value/prior across layers),
 ``node:<type>`` (input projection + per-type q/k/v/out/norm/ffn), ``tactic_embedding``,
 ``classifier``. A relation absent from every batch of a client round gets grad None,
 AdamW skips it, so its delta group is exactly zero ("inactive").
+
+Precondition for "inactive => exactly zero delta": the local trainer must clear gradients with
+``optimizer.zero_grad(set_to_none=True)``. A reused model with ``set_to_none=False`` keeps
+zero/stale grad tensors, so AdamW would still apply weight decay and momentum to parameters
+that no batch touched. Likewise, no EMA/weight averaging may modify parameters that received
+no gradient.
 """
 
 from __future__ import annotations
@@ -15,6 +21,7 @@ from dataclasses import dataclass, field
 import torch
 
 _REL_RE = re.compile(r"^layers\.\d+\.relation_(?:key|value|prior)\.([^.]+)")
+_RELATION_MARKERS = ("relation_key", "relation_value", "relation_prior")
 _NODE_RE = re.compile(
     r"^(?:input_projection|layers\.\d+\.(?:query|key|value|out|norm_attn|norm_ffn|ffn))\.([^.]+)"
 )
@@ -61,6 +68,14 @@ class ParamLayout:
             offsets.append(offset)
             groups.setdefault(group_of(name), []).append((offset, offset + n))
             offset += n
+        if not any(g.startswith("rel:") for g in groups) and any(
+            marker in name for name in names for marker in _RELATION_MARKERS
+        ):
+            raise ValueError(
+                "state_dict has relation_key/relation_value/relation_prior entries but none matched "
+                "'layers.<i>.relation_*.<name>'; a wrapper prefix such as 'module.' (DDP) or "
+                "'_orig_mod.' (torch.compile) is probably present and must be stripped first"
+            )
         return cls(names, shapes, dtypes, offsets, offset, groups)
 
     @classmethod
@@ -72,11 +87,22 @@ class ParamLayout:
         return list(self.groups.keys())
 
     def flatten(self, state_dict: dict[str, torch.Tensor]) -> torch.Tensor:
-        return torch.cat(
-            [state_dict[name].detach().reshape(-1).to("cpu", torch.float32) for name in self.names]
-        )
+        parts = []
+        for name, shape in zip(self.names, self.shapes):
+            if name not in state_dict:
+                raise ValueError(f"state_dict is missing key {name!r}")
+            tensor = state_dict[name]
+            if tensor.shape != shape:
+                raise ValueError(
+                    f"state_dict entry {name!r} has shape {tuple(tensor.shape)}, "
+                    f"layout expects {tuple(shape)}"
+                )
+            parts.append(tensor.detach().reshape(-1).to("cpu", torch.float32))
+        return torch.cat(parts)
 
     def unflatten(self, vec: torch.Tensor) -> dict[str, torch.Tensor]:
+        if vec.ndim != 1:
+            raise ValueError(f"vector must be 1-D, got shape {tuple(vec.shape)}")
         if vec.numel() != self.numel:
             raise ValueError(f"vector has {vec.numel()} entries, layout expects {self.numel}")
         vec = vec.detach().to("cpu", torch.float32)
