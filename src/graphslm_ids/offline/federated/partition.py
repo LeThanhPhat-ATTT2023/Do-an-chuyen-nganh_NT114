@@ -148,8 +148,9 @@ def _stratified_quota(counts: np.ndarray, k: int) -> np.ndarray:
     one to the classes with the largest fractional remainder that still have spare flows
     (ties toward lower class ids). If ``k`` is below the number of classes the floor-of-1
     quotas are trimmed from the largest quota first (ties toward lower class ids), so some
-    classes are dropped. If the floor-of-1 bumps overshoot ``k``, the over-served classes
-    closest to their exact share give back first.
+    classes are dropped. If the floor-of-1 bumps overshoot ``k``, classes above 1 give back
+    one at a time, the one with the smallest fractional remainder first; the bumped classes
+    keep their single flow.
     """
     n = int(counts.sum())
     exact = counts * k  # the proportional quota, scaled by n
