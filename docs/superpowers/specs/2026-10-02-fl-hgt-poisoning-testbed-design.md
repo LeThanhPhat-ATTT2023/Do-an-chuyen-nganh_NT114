@@ -79,9 +79,14 @@ test nhanh trên vector ngẫu nhiên và có thể tái dụng cho model khác.
 - Đầu vào: `train_ids` (global flow id của split đã chọn `random`/`temporal`), `labels`.
 - `iid`: hoán vị theo seed, chia đều.
 - `dirichlet(alpha)`: với mỗi lớp c, `p ~ Dir(alpha·1_K)`, chia flow lớp c theo `p`;
-  thử lại (tối đa 100 lần, seed tăng dần) cho tới khi mọi client có
-  ≥ `min_flows_per_client`. Hết lượt → `ValueError`.
-- `max_flows_per_client`: subsample phân tầng theo lớp trong từng client (tầng gọn).
+  thử lại (tối đa 100 lần, mỗi lần dùng stream độc lập `default_rng([seed, attempt])`;
+  lần 0 trùng `default_rng(seed)`) cho tới khi mọi client có
+  ≥ `min_flows_per_client`. Hết lượt → `ValueError`. Cấu hình bất khả thi
+  (`min_flows_per_client < 1` hoặc `num_clients · min_flows_per_client > |train|`) báo lỗi ngay, không thử lại.
+- `max_flows_per_client`: subsample phân tầng theo lớp trong từng client (tầng gọn),
+  dùng stream riêng `SeedSequence(seed, spawn_key=(1,))` (không trùng stream nào của partitioner);
+  hạn mức được lấp đúng bằng cap theo phương pháp phần dư lớn nhất (largest remainder),
+  mỗi lớp giữ ≥ 1 flow khi cap ≥ số lớp.
 - `ClientPartition` lưu `client_flow_ids: list[np.ndarray]` (sorted), `scheme`, `alpha`,
   `seed`; `to_json/from_json`; `class_histogram(labels, C) -> (K, C)`.
 - Bất biến: các client rời nhau, hợp lại ⊆ train, không chứa val/test.
