@@ -166,6 +166,16 @@ def test_wrapper_prefixed_keys_are_rejected_with_a_clear_error(prefix):
         ParamLayout.from_state_dict(state)
 
 
+def test_partially_prefixed_relation_key_is_rejected_and_named():
+    state = dict(_tiny_model().state_dict())
+    bad = "layers.1.relation_prior.flow__contains__packet"
+    assert bad in state
+    state["module." + bad] = state.pop(bad)  # other rel groups still form
+    with pytest.raises(ValueError, match="prefix") as excinfo:
+        ParamLayout.from_state_dict(state)
+    assert "module." + bad in str(excinfo.value)
+
+
 def test_model_without_relations_does_not_trigger_prefix_error():
     layout = ParamLayout.from_state_dict({"classifier.0.weight": torch.zeros(3)})
     assert layout.group_names == ["classifier"]

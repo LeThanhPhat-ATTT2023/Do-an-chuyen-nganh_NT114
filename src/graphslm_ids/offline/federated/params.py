@@ -61,21 +61,20 @@ class ParamLayout:
         for name, tensor in state_dict.items():
             if not torch.is_floating_point(tensor):
                 raise ValueError(f"non-float state entry {name!r} is not supported by ParamLayout")
+            group = group_of(name)
+            if not group.startswith("rel:") and any(marker in name for marker in _RELATION_MARKERS):
+                raise ValueError(
+                    f"state_dict key {name!r} looks like a relation parameter but does not match "
+                    "'layers.<i>.relation_*.<name>'; a wrapper prefix such as 'module.' (DDP) or "
+                    "'_orig_mod.' (torch.compile) is probably present and must be stripped first"
+                )
             n = int(tensor.numel())
             names.append(name)
             shapes.append(tensor.shape)
             dtypes.append(tensor.dtype)
             offsets.append(offset)
-            groups.setdefault(group_of(name), []).append((offset, offset + n))
+            groups.setdefault(group, []).append((offset, offset + n))
             offset += n
-        if not any(g.startswith("rel:") for g in groups) and any(
-            marker in name for name in names for marker in _RELATION_MARKERS
-        ):
-            raise ValueError(
-                "state_dict has relation_key/relation_value/relation_prior entries but none matched "
-                "'layers.<i>.relation_*.<name>'; a wrapper prefix such as 'module.' (DDP) or "
-                "'_orig_mod.' (torch.compile) is probably present and must be stripped first"
-            )
         return cls(names, shapes, dtypes, offsets, offset, groups)
 
     @classmethod
