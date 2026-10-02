@@ -44,3 +44,5 @@ logs/
 !/data/processed/.gitkeep
 !/data/mitre/.gitkeep
 docs/superpowers/
+# Claude Code worktrees
+.claude/worktrees/
