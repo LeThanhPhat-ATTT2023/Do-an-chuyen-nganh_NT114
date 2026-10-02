@@ -94,7 +94,8 @@ test nhanh trên vector ngẫu nhiên và có thể tái dụng cho model khác.
 ### 3.2 Graph con (`client_graph.py`)
 
 - `packet_owner(artifact) -> int64[num_packets]`: flow sở hữu mỗi packet, từ
-  `flow__contains__packet` (−1 nếu không có).
+  `flow__contains__packet` (−1 nếu không có; packet có > 1 cạnh `contains`, hoặc flow có
+  > 1 cạnh `from_host`/`to_host`, ⇒ `ValueError`).
 - `build_client_artifact(artifact, client_flow_ids, packet_owner, recompute_host=True)`:
   - `owned[flow] = isin(flow, client)`, `owned[packet] = owned_flow[packet_owner]`,
     các node type khác: luôn đúng.
