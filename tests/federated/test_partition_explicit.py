@@ -92,15 +92,59 @@ def test_zero_dominance_is_an_even_split():
     assert (part.counts[:3] == 11).all() and (part.counts[3:] == 10).all()
 
 
-def test_cap_keeps_the_earliest_flows_of_each_run():
+def _in_group_share(counts, cfg, family):
+    """Share of the family's flows held by the clients of the group whose family it is."""
+    group = next(g for g, spec in cfg["groups"].items() if spec["family"] == family)
+    members = group_members(cfg["groups"], 20)[group]
+    cols = [C[name] for name in cfg["families"][family]]
+    return counts[members][:, cols].sum() / counts[:, cols].sum()
+
+
+def test_cap_shrinks_the_whole_table_uniformly():
+    ids, labels = _data(per_class=2000)
+    order = -ids.astype(np.float64)  # later ids are earlier in time
+    full = partition_explicit(ids, labels, LABEL_NAMES, _cfg(), order=order)
+    cfg = _cfg(max_flows_per_client=600)
+    capped = partition_explicit(ids, labels, LABEL_NAMES, cfg, order=order)
+    assert full.counts.sum(axis=1).max() > 600 and full.params["cap_scale"] == 1.0
+    # (a) every client total is within the cap
+    assert capped.sizes() == capped.counts.sum(axis=1).tolist() and max(capped.sizes()) <= 600
+    # (b) the capped table is the same share table applied to floor(s * N_c)
+    s = capped.params["cap_scale"]
+    assert 0.0 < s < 1.0
+    f = explicit_fractions(LABEL_NAMES, 20, cfg["groups"], cfg["families"], 0.8)
+    shrunk = np.floor(s * np.full(18, 2000) + 1e-9).astype(np.int64)
+    assert np.array_equal(capped.counts, explicit_counts(f, shrunk))
+    assert np.array_equal(capped.class_histogram(labels, 18), capped.counts)
+    # (c) the in-group family shares of the full table survive the cap
+    for family in ("ddos", "recon", "web", "other"):
+        assert _in_group_share(capped.counts, cfg, family) == pytest.approx(
+            _in_group_share(full.counts, cfg, family), abs=0.02
+        ), family
+    # (d) client k keeps the head (earliest flows) of its full-data run of every class
+    for f_ids, c_ids in zip(full.client_flow_ids, capped.client_flow_ids):
+        for c in range(18):
+            run = np.sort(f_ids[labels[f_ids] == c])[::-1]
+            kept = np.sort(c_ids[labels[c_ids] == c])[::-1]
+            assert np.array_equal(kept, run[: kept.size])
+
+
+def test_cap_that_does_not_bind_changes_nothing():
     ids, labels = _data()
     full = partition_explicit(ids, labels, LABEL_NAMES, _cfg())
-    capped = partition_explicit(ids, labels, LABEL_NAMES, _cfg(max_flows_per_client=60))
-    for k, (f_ids, c_ids) in enumerate(zip(full.client_flow_ids, capped.client_flow_ids)):
-        assert c_ids.size == min(f_ids.size, 60) and capped.counts[k].sum() == c_ids.size
-        for c in range(18):
-            run, kept = np.sort(f_ids[labels[f_ids] == c]), np.sort(c_ids[labels[c_ids] == c])
-            assert np.array_equal(kept, run[: kept.size])
+    loose = partition_explicit(ids, labels, LABEL_NAMES, _cfg(max_flows_per_client=int(full.counts.sum(axis=1).max())))
+    assert np.array_equal(loose.counts, full.counts) and loose.params["cap_scale"] == 1.0
+    assert all(np.array_equal(a, b) for a, b in zip(loose.client_flow_ids, full.client_flow_ids))
+
+
+def test_cap_that_would_grow_a_cell_is_refused():
+    # Largest remainder is not monotone in the class total (Alabama paradox): at p = 0.5 with 5 flows
+    # per class, the table shrunk to the cap of 11 gives a client a flow its full-data run lacks.
+    ids, labels = _data(per_class=5)
+    with pytest.raises(AssertionError, match="max_flows_per_client"):
+        partition_explicit(
+            ids, labels, LABEL_NAMES, _cfg(dominance=0.5, max_flows_per_client=11, min_flows_per_client=1)
+        )
 
 
 def test_class_outside_every_family_is_split_evenly():

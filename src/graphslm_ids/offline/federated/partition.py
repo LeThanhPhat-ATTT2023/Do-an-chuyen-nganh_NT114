@@ -340,6 +340,30 @@ def explicit_counts(fractions: np.ndarray, class_counts: np.ndarray) -> np.ndarr
     return out
 
 
+def capped_counts(fractions: np.ndarray, class_counts: np.ndarray, cap: int | None) -> tuple[np.ndarray, float]:
+    """The share table shrunk uniformly so that no client holds more than ``cap`` flows.
+
+    Returns ``(n', s)``. Without a cap, or when ``n = explicit_counts(f, N)`` already has every
+    client total ``<= cap``, that is ``(n, 1.0)``. Otherwise ``n' = explicit_counts(f, floor(s * N_c
+    + 1e-9))``: the same fractions and tie rule on smaller class totals, so the client x class shares
+    stay those of ``f``. ``s`` starts at ``cap / max_k sum_c n[k, c]`` and, while the largest client
+    total of ``n'`` still exceeds ``cap``, is multiplied by ``cap / that total``. Deterministic.
+    """
+    f = np.asarray(fractions, dtype=np.float64)
+    totals = np.asarray(class_counts, dtype=np.int64)
+    counts = explicit_counts(f, totals)
+    top = int(counts.sum(axis=1).max()) if counts.size else 0
+    if cap is None or top <= cap:
+        return counts, 1.0
+    scale = cap / top
+    while True:
+        counts = explicit_counts(f, np.floor(scale * totals + 1e-9).astype(np.int64))
+        top = int(counts.sum(axis=1).max())
+        if top <= cap:
+            return counts, scale
+        scale *= cap / top
+
+
 def partition_explicit(
     train_ids: np.ndarray,
     labels: np.ndarray,
@@ -351,8 +375,10 @@ def partition_explicit(
 
     The train flows of class ``c`` are sorted by ``(order[id], id)`` (by ``id`` without ``order``)
     and cut into consecutive runs of ``n[0, c], n[1, c], ...`` flows; client ``k`` takes run
-    ``k``. With ``max_flows_per_client`` a larger client's row shrinks via ``_stratified_quota``
-    and it keeps the first flows of each of its runs. Nothing is random; ``seed`` is only recorded.
+    ``k``. With ``max_flows_per_client`` the WHOLE table shrinks uniformly (``capped_counts``,
+    scale recorded as ``params["cap_scale"]``) so the shares of ``f`` survive, and client ``k``
+    keeps the first ``n'[k, c]`` flows of its full-data run of class ``c``. Nothing is random;
+    ``seed`` is only recorded.
     """
     num_clients = int(cfg.get("num_clients", 10))
     min_flows = int(cfg.get("min_flows_per_client", 1))
@@ -378,11 +404,18 @@ def partition_explicit(
     num_classes = max([int(c) + 1 for c in label_names] + [int(y.max()) + 1 if y.size else 0])
     dominance = float(cfg.get("dominance", 0.8))
     fractions = explicit_fractions(label_names, num_clients, groups, families, dominance, num_classes=num_classes)
-    full = explicit_counts(fractions, np.bincount(y, minlength=num_classes))
-    kept = full.copy()  # ``full`` fixes the run boundaries, ``kept`` how much of each run survives the cap
-    if cap is not None:
-        for k in np.flatnonzero(full.sum(axis=1) > cap):
-            kept[k] = _stratified_quota(full[k], cap)
+    class_counts = np.bincount(y, minlength=num_classes)
+    full = explicit_counts(fractions, class_counts)  # fixes the run boundaries
+    kept, cap_scale = capped_counts(fractions, class_counts, cap)  # how much of each run survives the cap
+    grown = np.argwhere(kept > full)
+    if grown.size:
+        # Largest remainder is not monotone in the class total (Alabama paradox), so a shrunk
+        # table can, for tiny classes, give a client a flow its full-data run does not have.
+        k, c = (int(v) for v in grown[0])
+        raise AssertionError(
+            f"capped explicit table gives client {k + 1} {int(kept[k, c])} flows of class {c} but its "
+            f"full-data run has {int(full[k, c])}; choose another max_flows_per_client"
+        )
     small = np.flatnonzero(kept.sum(axis=1) < min_flows)
     if small.size:
         raise ValueError(
@@ -406,6 +439,7 @@ def partition_explicit(
         "families": {str(f): [str(n) for n in names] for f, names in families.items()},
         "ordered_by": "flow_id" if ranks is None else "flow_start_ts",
         "max_flows_per_client": cap,
+        "cap_scale": float(cap_scale),
     }
     return ClientPartition(clients, "explicit", None, int(cfg.get("seed", 42)), counts=kept, params=params)
 
