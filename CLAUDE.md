@@ -13,8 +13,8 @@ it (negative gap). See `docs/reports/2026-06-13-eacs-vs-baselines.md`.
 
 ## Python environment (USE THIS)
 - Dedicated venv: **`D:\v\nt114`** (Windows).
-- Interpreter: **`D:\v\nt114\Scripts\python.exe`** (Python 3.13.13).
-- Installed: numpy 2.4.4, pandas 3.0.2, scipy 1.17.1, torch 2.11.0+cpu, scikit-learn 1.8.0, dpkt, scapy, pytest 9.0.3.
+- Interpreter: **`D:\v\nt114\Scripts\python.exe`** (Python 3.14).
+- Installed: numpy 2.4.4, pandas 3.0.2, scipy 1.17.1, torch 2.14 CPU, scikit-learn 1.8.0, dpkt, scapy, pytest 9.0.3, psutil, matplotlib. `torch_geometric` is NOT installed, so `tests/baselines` cannot run locally: use `pytest tests -q --ignore=tests/baselines`.
 - Always run project scripts with this interpreter, e.g.:
   `D:\v\nt114\Scripts\python.exe -m pytest tests/ -q`
 - Machine: 16 logical CPUs, ~16 GB RAM. CPU-only torch locally; full HGT training runs on a remote L40S (48 GB) VM.
@@ -133,6 +133,31 @@ feature_store:
   n_warmup_batches: 200
 # gpu_sampling: { enabled: true }   # only if CPU sampling is the throughput bottleneck
 ```
+
+## Federated-learning poisoning testbed (FL-HGT)
+Spec: `docs/superpowers/specs/2026-10-02-fl-hgt-poisoning-testbed-design.md`; plan: `docs/superpowers/plans/2026-10-02-fl-hgt-poisoning-testbed.md`.
+
+Package `src/graphslm_ids/offline/federated/` simulates 20 clients on an explicit gateway-group partition table (dominance 0/50/80%), with HGT, MLP and 1D-CNN models behind one `ModelAdapter`, five poisoning attacks (sign_flip, alie, min_max, min_sum, scale_sign), six comparison defenses (fedavg baseline, median, trimmed_mean, multi_krum, signguard, dnc) plus the proposed `RAGuard` (relation-aware, per-parameter-group screening with trust history), three modes (`fl`, `centralized`, `local_only`) and offline replay of detection on saved deltas. The centralized trainer `train_hgt_flow_classifier.py` is untouched. Real training runs on the remote GPU machine; locally only CPU unit/smoke tests run.
+
+```bat
+:: Partition table for the thesis (CSV + heatmap)
+D:\v\nt114\Scripts\python.exe scripts/fl/export_partition_table.py --config configs/fl/fl_base.yaml ^
+  --set partition.dominance=0.8 --out-csv outputs/fl/partition_p80.csv --out-png outputs/fl/partition_p80.png
+:: One experiment
+D:\v\nt114\Scripts\python.exe -m graphslm_ids.offline.federated.cli --config configs/fl/fl_base.yaml --device cuda ^
+  --set attack.name=alie --set attack.malicious_ratio=0.2 --set defense.aggregator.name=raguard
+:: Pilot, then P0 grids (resumable), then tables
+D:\v\nt114\Scripts\python.exe scripts/fl/run_matrix.py --grid configs/fl/matrix_pilot.yaml --device cuda
+D:\v\nt114\Scripts\python.exe scripts/fl/run_matrix.py --grid configs/fl/matrix_p0_defense.yaml --device cuda
+D:\v\nt114\Scripts\python.exe scripts/fl/summarize_matrix.py --root outputs/fl/matrix_p0_defense
+:: Offline detection replay on a FedAvg run saved with output.save_deltas=true
+D:\v\nt114\Scripts\python.exe -m graphslm_ids.offline.federated.offline_eval --run outputs/fl/<run> ^
+  --defense median --defense trimmed_mean --defense multi_krum --defense signguard --defense dnc --defense raguard
+:: FL tests (CPU)
+D:\v\nt114\Scripts\python.exe -m pytest tests/federated -q
+```
+
+Per-run output in `outputs/fl/<run>/`: `config.resolved.yaml`, `partition.json` (with the count table), `rounds.jsonl`, `fl_summary.json`, `global_final.pt`, `global_best.pt`, and optionally `deltas/round_XXX.pt` (`output.save_deltas=true`). The matrix runner also writes `matrix_results.csv` and a markdown table per grid root.
 
 ## Diagnosis history (v1, May 2026)
 v1 HGT plateaued at macro-F1 ≈ 0.12. Root cause was the input pipeline, not the recipe:

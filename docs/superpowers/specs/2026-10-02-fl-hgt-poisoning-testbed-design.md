@@ -92,29 +92,31 @@ Package `src/graphslm_ids/offline/federated/`. Mỗi file một trách nhiệm:
 
 ```
 federated/
-  __init__.py
+  __init__.py                                                                                 [đã code]
   config.py          # DEFAULT_FL_CONFIG, load_fl_config, --set overrides (dotted keys)      [đã code]
   records.py         # to_jsonable, write_json, append_jsonl                                 [đã code]
   linalg.py          # pairwise dist/cosine, median/trimmed mean theo chunk, robust z, SVD   [đã code]
-  partition.py       # IID / Dirichlet [đã code]; bảng tường minh `explicit` [mới]
+  partition.py       # IID / Dirichlet / bảng tường minh `explicit`                          [đã code]
   client_graph.py    # packet_owner, build_client_artifact, recompute_host_features         [đã code]
   params.py          # ParamLayout: flatten/unflatten, nhóm tham số, active groups           [đã code]
   attacks.py         # NoAttack, SignFlip, ALIE, MinMax, MinSum, ScaleSign                   [đã code]
-  models.py          # FlowMLP, ByteCNN1D + ModelAdapter (HGTAdapter, MLPAdapter, CNNAdapter) [mới]
-  local_trainer.py   # ClientState, LocalTrainer.train(...) -> LocalUpdate (qua ModelAdapter)
-  aggregators.py     # clip_deltas, FedAvg, Median, TrimmedMean, MultiKrum, SignGuard, DnC, (MSGuard)
-  defense.py         # RAGuard (giải pháp đề xuất) + các cờ ablation                          [mới]
-  server.py          # ClientMessage, FLServer (integrity → [defense] → aggregate)
-  metrics.py         # FPR, family recall, detection rates, convergence
-  offline_eval.py    # chấm lại chỉ số phát hiện trên bản cập nhật đã lưu                     [mới]
-  simulation.py      # run_experiment(): fl / local_only / centralized
-  cli.py             # python -m graphslm_ids.offline.federated.cli
-  matrix.py          # expand_grid, run_grid, summarize (logic cho scripts/fl/*)
-scripts/fl/run_matrix.py
-scripts/fl/summarize_matrix.py
-scripts/fl/export_partition_table.py   # xuất bảng client × lớp (CSV) + biểu đồ nhiệt       [mới]
-configs/fl/...                          # cấu hình 3 mô hình, 3 mức lệch, ma trận P0/P1/P2
-tests/federated/...
+  context.py         # dữ liệu dùng chung (artifact, split, nhãn clean), moment flow round 0 [đã code]
+  models.py          # FlowMLP, ByteCNN1D + ModelAdapter (MLPAdapter, CNNAdapter)            [đã code]
+  hgt_adapter.py     # HGTAdapter (graph con, sampler HGT, EACS tùy chọn)                    [đã code]
+  local_trainer.py   # ClientState, LocalTrainer.train(...) -> LocalUpdate (qua ModelAdapter) [đã code]
+  aggregators.py     # clip_deltas, FedAvg, Median, TrimmedMean, MultiKrum, SignGuard, DnC    [đã code]
+  defense.py         # RAGuard (giải pháp đề xuất) + các cờ ablation                          [đã code]
+  server.py          # ClientMessage, FLServer (integrity → [defense] → aggregate)           [đã code]
+  metrics.py         # FPR, family recall, detection rates, convergence                      [đã code]
+  offline_eval.py    # chấm lại chỉ số phát hiện trên bản cập nhật đã lưu                     [đã code]
+  simulation.py      # run_experiment(): fl / local_only / centralized                       [đã code]
+  cli.py             # python -m graphslm_ids.offline.federated.cli                          [đã code]
+  matrix.py          # expand_grid, run_grid, summarize (logic cho scripts/fl/*)             [đã code]
+scripts/fl/run_matrix.py                                                                    [đã code]
+scripts/fl/summarize_matrix.py                                                              [đã code]
+scripts/fl/export_partition_table.py   # xuất bảng client × lớp (CSV) + biểu đồ nhiệt       [đã code]
+configs/fl/...                          # fl_base + 11 lưới ma trận (mục 3.12)              [đã code]
+tests/federated/...                                                                         [đã code]
 ```
 
 Ranh giới quan trọng: `attacks.py`, `aggregators.py`, `defense.py`, `server.py` chỉ làm việc trên
@@ -140,7 +142,8 @@ HGT, MLP và CNN, và test nhanh trên vector ngẫu nhiên.
 - Họ lớp (dựa trên `DEFAULT_FAMILIES` trong `config.py`, gộp `mirai` + `malware` thành **Khác**): **DDoS** (5 lớp), **Recon**
   (5 lớp), **Web** (CommandInjection, XSS, SqlInjection, Uploading_Attack, BrowserHijacking),
   **Khác** (Backdoor_Malware, Mirai-udpplain), **Benign**.
-- Nhóm gateway (mặc định, cấu hình được):
+- Nhóm gateway (mặc định, cấu hình được; `partition.groups` / `partition.families` đọc từ YAML
+  **thay thế hoàn toàn** (không gộp với) giá trị mặc định):
 
   | Nhóm | Client (1-based) | Họ chủ đạo |
   |---|---|---|
@@ -163,10 +166,11 @@ HGT, MLP và CNN, và test nhanh trên vector ngẫu nhiên.
   | Khác | 41% / 1% | 27,5% / 2,5% | 5% |
   | Benign | 5% | 5% | 5% |
 
-- **Số lượng (không ngẫu nhiên):** `n[k, c] = floor(f[k, c] · N_c)`; phần dư giao cho client có phần
-  lẻ lớn nhất, hòa thì client có chỉ số nhỏ hơn.
+- **Số lượng (không ngẫu nhiên):** `n[k, c] = floor(f[k, c] · N_c + 1e-9)` (dung sai tránh lỗi làm
+  tròn float); phần dư giao cho client có phần lẻ lớn nhất (largest remainder), hòa thì client có chỉ
+  số nhỏ hơn.
 - **Chọn flow (không ngẫu nhiên):** sắp flow train của lớp c theo thời gian bắt đầu flow (nếu
-  metadata có), nếu không theo flow id; cắt thành các đoạn liên tiếp dài `n[1, c], n[2, c], …`,
+  metadata có `flow_start_ts`), nếu không theo flow id (ghi vào `partition.json` là `ordered_by`); cắt thành các đoạn liên tiếp dài `n[1, c], n[2, c], …`,
   giao lần lượt cho client 1, 2, … Mỗi gateway thấy một khoảng thời gian liên tục của traffic.
 - `max_flows_per_client` (tầng gọn): co bảng theo tỉ lệ bằng largest remainder, lấy **phần đầu** của
   mỗi đoạn — vẫn xác định.
@@ -208,8 +212,9 @@ theo thứ tự trong flow (cạnh `contains`, thứ tự theo `next_packet`); t
   `tactic_embedding`; `classifier`; còn lại `other`.
 - `groups`, `group_coords(names)`, `group_norms(deltas) -> (N, G)`, `active_groups(deltas) -> bool (N, G)`.
   Relation không xuất hiện ở client ⇒ grad None ⇒ AdamW bỏ qua ⇒ delta nhóm đó đúng bằng 0.
-- **MLP/CNN** không có tên khớp các mẫu trên ⇒ toàn bộ rơi vào `other` (và `classifier` nếu đặt tên
-  lớp cuối như vậy) ⇒ phần "theo nhóm quan hệ" của `RAGuard` suy biến thành kiểm tra toàn bộ vector.
+- **MLP/CNN** không có tên khớp các mẫu quan hệ/node ⇒ layout chỉ có **hai nhóm** (`other` +
+  `classifier`, lớp cuối) ⇒ `RAGuard` sàng lọc hai nhóm này (không phải đúng một nhóm); phần "theo
+  nhóm quan hệ" suy biến thành kiểm tra gần như toàn bộ vector.
 - **Ràng buộc kiến trúc:** model không được có buffer không phải float. CNN **không dùng
   BatchNorm** (có `num_batches_tracked` kiểu int và running stats không phải tham số học);
   dùng GroupNorm hoặc không chuẩn hóa.
@@ -285,7 +290,7 @@ selected: bool (N,) | None, scores: dict, info: dict)`.
 | `fedavg` | `Σ w_i Δ_i / Σ w_i` | `weighting: samples` | Mốc không phòng thủ |
 | `median` | median theo coordinate | | Thống kê; mục tiêu của Min-Max/Min-Sum |
 | `trimmed_mean` | bỏ k lớn nhất và k nhỏ nhất mỗi coordinate, `k = ⌊β·N⌋`, cần `k < N/2` | `β = assumed_malicious_ratio` | Thống kê; mục tiêu của Min-Max/Min-Sum |
-| `multi_krum` | điểm Krum `s(i)` = tổng bình phương khoảng cách tới `N−f−2` láng giềng gần nhất; chọn lặp m vector, trung bình (Blanchard 2017) | `f = ⌊assumed·N⌋`, `m = N − f` | Khoảng cách |
+| `multi_krum` | điểm Krum `s(i)` = tổng bình phương khoảng cách tới `N−f−2` láng giềng gần nhất; chọn m vector có điểm Krum **một lần** thấp nhất (không chấm lại lặp), trung bình (Blanchard et al. 2017) | `f = ⌊assumed·N⌋`, `m = N − f` | Khoảng cách |
 | `signguard` | S1 = `{0.1 ≤ ‖Δ_i‖/med ≤ 3.0}`; đặc trưng tỉ lệ dương/0/âm trên khối 10% coordinate; MeanShift, S2 = cụm lớn nhất; trung bình clipped trên S1∩S2 (code chính thức SignGuard) | `L=0.1, R=3.0, ratio=0.1` | Dấu; mục tiêu của ScaleSign |
 | `dnc` | NDSS'21 Alg. 2: `b` chiều ngẫu nhiên, tâm hóa, vector kỳ dị chính, giữ `N − c·f` điểm thấp nhất | `niters=1, c=1, b=10000` (b ≤ D) | Phổ; đi cặp với Min-Max/Min-Sum |
 | `msguard` *(tùy chọn)* | Yang et al. Alg. 8; bài báo không cho tham số mặc định → dựng lại theo quy ước SignGuard, `ζ = 10000` (ghi rõ là dựng lại) | | Đi cặp với ScaleSign |
@@ -303,7 +308,9 @@ delta của nó trông "khác số đông" dù trung thực. Các phòng thủ s
 `RAGuard` **so sánh riêng từng nhóm tham số, chỉ giữa các client có nhóm đó hoạt động**.
 
 **Bước 0 — chuẩn bị:** server đã kiểm tra toàn vẹn (mục 3.8); co mỗi `Δ_k` về
-`clip_factor · median_norm` (mặc định 1.0).
+`clip_factor · median_norm` (mặc định 1.0). **Tín hiệu (bước 1) tính trên delta THÔ**, còn **tổng hợp
+(bước 3) dùng delta đã co (clipped)** — để attacker khuếch đại norm vẫn bị phát hiện mà không kéo
+aggregate.
 
 **Bước 1 — tín hiệu theo nhóm:** với mỗi nhóm g (theo `ParamLayout`) và tập client hoạt động
 `A_g` (bỏ qua nhóm có `|A_g| < 3`):
@@ -312,21 +319,30 @@ delta của nó trông "khác số đông" dù trung thực. Các phòng thủ s
 - hướng: `cos(Δ_k[g], ref[g])`, `ref` = aggregate round trước (round 1: median theo coordinate);
 - dấu: tỉ lệ đồng thuận dấu với `ref[g]`.
 
-Chuẩn hóa robust z (median/MAD) trong `A_g`; nghi ngờ mỗi tín hiệu có vùng chết 1σ
+Chuẩn hóa robust z (median/MAD) trong `A_g`; **MAD nhân 1.4826** (đưa về đơn vị σ). Mẫu số z của
+tín hiệu dấu có sàn `max(1.4826·MAD, scale_floor, 1/n)` (`1/n` là độ phân giải của tỉ lệ đồng thuận
+dấu, `n` = số tọa độ có dấu `ref` khác 0). Nghi ngờ mỗi tín hiệu có vùng chết 1σ
 (`s = clip((|z| − 1)/(z_max − 1), 0, 1)` cho độ lớn; `clip((−z − 1)/(z_max − 1), 0, 1)` cho hướng/dấu;
-`z_max = 3`); gộp trong nhóm bằng noisy-OR `u_kg = 1 − Π(1 − s)`. Nghi ngờ của client
+**`z_max = 4`** — bản đầu ghi 3, nhưng với 3 test non-IID tổng hợp không tấn công đã loại nhầm client
+lành; chọn lại theo đúng quy tắc "hằng số chọn trên run không tấn công" bên dưới); gộp trong nhóm bằng noisy-OR `u_kg = 1 − Π(1 − s)`. Nghi ngờ của client
 `U_k` = trung bình có trọng số (theo số tham số của nhóm) của `u_kg` trên các nhóm hoạt động
-(ablation: `max`). MLP/CNN: chỉ có một nhóm ⇒ kiểm tra toàn bộ vector.
+(ablation: `max`). MLP/CNN: chỉ có hai nhóm (`other`, `classifier`) ⇒ gần như kiểm tra toàn bộ vector.
 
 **Bước 2 — lịch sử:** `trust_k^t = 0.8·(1 − U_k^t) + 0.2·trust_k^{t−1}` (EMA như MultiSignal);
 đánh dấu thay đổi đột ngột khi `|U_k^t − U_k^{t−1}|` > median + 3·MAD lịch sử của client (ý tưởng
-ΔMD của SecureDyn-FL) ⇒ hạ trust về `min(trust, 0.5)`. Warm-up 2 round: chỉ dùng tín hiệu cắt
+ΔMD của SecureDyn-FL), với **sàn ngưỡng `abrupt_min_jump = 0.15`** (ngưỡng không thấp hơn 0.15, tránh
+báo động giả khi lịch sử gần như phẳng) ⇒ hạ trust về `min(trust, 0.5)`. Warm-up 2 round: chỉ dùng tín hiệu cắt
 ngang.
 
 **Bước 3 — quyết định và tổng hợp:** `trust < 0.5` → `reject`; `0.5 ≤ trust < 0.8` → `downweight`
 (trọng số = trust); còn lại `accept`. Tổng hợp **trimmed mean có trọng số theo từng nhóm** trên
 client không bị loại và có nhóm hoạt động (cắt `β = assumed_malicious_ratio` theo khối lượng trọng
 số mỗi đầu); nhóm không ai hoạt động → 0.
+
+**Hiệu chỉnh (ghi chú):** trên fixture tổng hợp round-1 qua 30 seed, tỉ lệ loại nhầm client lành là
+0.5% (không tấn công), 0.67% (attacker ×50), 1.0% (lệch quan hệ về 0); có 3–5 trên 20 client lành bị
+downweight. Đây chỉ là số liệu tổng hợp: **GT1 phải được kiểm lại trên run HGT không tấn công thật
+(pilot) trước khi chạy ma trận.**
 
 **Giả thuyết cần kiểm chứng:**
 
@@ -359,7 +375,7 @@ Min-Max ràng buộc theo từng nhóm) là khảo sát bổ sung có điều ki
 3. `W_{t+1} = W_t + η·Δ_agg` (`server_lr`, mặc định 1.0). Ghi `prev_aggregate`.
 4. Trả `RoundReport`: id client, quyết định (aggregator lọc như Krum/SignGuard/DnC: không được chọn
    ⇒ `reject`), trust, đặc trưng, norm, thời gian.
-5. Tùy chọn `save_deltas: true`: lưu `(N, D)` của round (float16) để chấm phát hiện ngoại tuyến.
+5. Tùy chọn `save_deltas: true`: lưu `(N, D)` của round (float16; tràn float16 thì round đó tự lùi về float32) để chấm phát hiện ngoại tuyến.
 
 Server không bao giờ nhận cờ "là attacker"; simulation tự đối chiếu sau khi server trả kết quả.
 
@@ -373,7 +389,8 @@ Chế độ:
 
 - `fl`: vòng round như dưới.
 - `centralized`: 1 client chứa **hợp các flow của các client FL** (cùng bảng chia ⇒ cùng dữ liệu
-  train), `optimizer_state: persist`, mỗi round = 1 epoch, không attack, FedAvg.
+  train), `optimizer_state: persist`, mỗi round = 1 epoch, không attack, FedAvg; đồng thời ghim
+  `local_epochs = 1`, `max_local_steps = None`, `server_lr = 1.0`.
 - `local_only`: mỗi client tự train `rounds × local_epochs` từ cùng khởi tạo, không tổng hợp; báo
   cáo mean/std/min/max trên val/test toàn cục.
 
@@ -385,12 +402,16 @@ Một round `fl`:
 2. Client lành (và attacker nếu cần) train tuần tự trên một instance model dùng chung.
 3. Từ `start_round`, attacker thay delta bằng `attack.craft`.
 4. `server.step` → model global mới.
-5. Đối chiếu ground truth → TP/FP/FN/TN phát hiện, loại nhầm client lành.
+5. Đối chiếu ground truth → TP/FP/FN/TN phát hiện, loại nhầm client lành. Tập attacker chỉ được
+   dùng để chấm ở các round attack **đang hoạt động** (`r ≥ start_round`); trước đó không có attacker.
 6. Mỗi `eval.every` round: chấm val trên nhãn gốc và clean key; giữ best theo `eval.monitor`.
 7. Kết thúc: chấm test cho model **round cuối** (chỉ số chính) và best-val; lưu checkpoint
    (`output.save_checkpoints`, bật cho các run quan trọng — dùng lại ở giai đoạn XAI).
 
 Round 0 trước vòng lặp: thu moment flow từ client → `flow_feature_stats` chung.
+
+Cache dữ liệu client khóa theo: tên mô hình + flow id của client + digest cấu hình model/sampler —
+đổi một trong ba thì dựng lại.
 
 ### 3.10 Chỉ số (`metrics.py`, `offline_eval.py`)
 
@@ -400,7 +421,9 @@ Round 0 trước vòng lặp: thu moment flow từ client → `flow_feature_stat
   tỉ lệ downweight; malicious acceptance rate = 1 − TPR.
 - **Ngoại tuyến:** `offline_eval.py` nạp các `(N, D)` đã lưu từ một run FedAvg có attacker và cho mọi
   phòng thủ chấm lại để tính TPR/tỉ lệ loại nhầm mà không cần train lại. Macro-F1 khi bị tấn công
-  vẫn cần chạy đầy đủ từng phòng thủ.
+  vẫn cần chạy đầy đủ từng phòng thủ. Bản phát lại **bỏ qua** các message mà server trực tiếp đã
+  đánh dấu `invalid` ⇒ nếu attack gửi delta không hữu hạn thì tổng phát hiện trực tiếp và ngoại tuyến
+  có thể lệch nhau.
 - Hội tụ: round đầu tiên đạt ≥ 95% val macro-F1 tốt nhất của run.
 - Chi phí: thời gian train client/round, thời gian server/round, peak RSS, peak VRAM, bytes lên/xuống
   = `4·D·|S_t|`.
@@ -420,6 +443,12 @@ num_classes, num_tactics, label_names, flow_feature_stats, epoch, val_metrics, t
 `base_config` + `axes` + quy tắc `attack=none` ⇒ `malicious_ratio=0`; chạy tuần tự, tái dụng cache
 client, bỏ qua ô đã có `fl_summary.json`. `scripts/fl/summarize_matrix.py --root <dir>` →
 `matrix_results.csv` + bảng markdown.
+
+**Các lưới đã có** trong `configs/fl/` (số ô): `matrix_pilot` 8, `matrix_ch1` 27,
+`matrix_ch1_temporal` 9, `matrix_p0_defense` 84, `matrix_p0_ablation` 12, `matrix_p1_ratio` 18,
+`matrix_p1_group` 6, `matrix_p1_ch2` 96, `matrix_p1_seeds` 18, `matrix_p2_eacs` 4, `matrix_p2_threat` 8.
+`max_flows_per_client: 2000` và hai phòng thủ so sánh của P1/P2 (`multi_krum`, `signguard`) là
+**giá trị tạm**, chốt lại sau pilot / kết quả P0.
 
 Ma trận thu gọn theo ưu tiên (số run là ước lượng; chốt sau pilot):
 
@@ -488,14 +517,17 @@ Mọi test chạy CPU, dưới `tests/federated/`:
   hoặc không có mẫu của lớp đó.
 - MLP/CNN không có nhóm quan hệ ⇒ `RAGuard` suy biến; đây là đối chứng chủ đích.
 - Đánh giá dùng dữ liệu toàn cục (experiment-only), không phải một bước của giao thức FL.
+- MSGuard và ablation bỏ nguồn PMI **không được cài đặt**.
 - Kết luận chỉ đúng trên các attack, bảng chia và tỉ lệ độc hại đã thử.
 
 ## 7. Trạng thái và thứ tự triển khai
 
-**Đã xong (task 1–6 của plan cũ):** config/records, linalg, partition IID/Dirichlet, client_graph,
-params, attacks (114 hàm test; cần xác nhận pass trên máy có torch).
+**Đã xong:** T1–T6 (config/records, linalg, partition IID/Dirichlet, client_graph, params, attacks)
+và **T7–T16** (server/metrics, models + adapter, simulation + cli, bảng tường minh, MLP/CNN, aggregators,
+`RAGuard`, lưu delta + offline_eval, matrix + scripts + configs, tài liệu). `tests/federated`:
+325 test pass; toàn repo (bỏ `tests/baselines`, vì venv không có `torch_geometric`): 645 passed, 3 skipped.
 
-**Thứ tự mới** (đưa vòng FL tối giản lên trước để chạy CH1 sớm):
+**Thứ tự đã thực hiện** (đưa vòng FL tối giản lên trước để chạy CH1 sớm):
 
 | # | Việc | Phục vụ |
 |---|---|---|
@@ -510,8 +542,7 @@ params, attacks (114 hàm test; cần xác nhận pass trên máy có torch).
 | T15 | `matrix.py`, scripts, `configs/fl/` theo P0/P1/P2 | Tất cả |
 | T16 | Tài liệu + kiểm thử toàn bộ | |
 
-Plan chi tiết `docs/superpowers/plans/2026-10-02-fl-hgt-poisoning-testbed.md` cần cập nhật theo
-thứ tự này trước khi code tiếp.
+Plan chi tiết: `docs/superpowers/plans/2026-10-02-fl-hgt-poisoning-testbed.md`.
 
 ## 8. Việc còn chờ
 
