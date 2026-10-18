@@ -59,9 +59,37 @@ DEFAULT_FL_CONFIG: dict[str, Any] = {
         "always_include_all_tactics": True,
     },
     "partition": {
-        "scheme": "dirichlet",
+        "scheme": "explicit",
         "num_clients": 20,
-        "alpha": 0.5,
+        "alpha": 0.5,  # dirichlet only
+        # explicit only: dominance p, gateway groups (1-based inclusive client ranges) and the
+        # class families they dominate; iid / dirichlet ignore all three.
+        "dominance": 0.8,
+        "groups": {
+            "G1": {"clients": [1, 5], "family": "ddos"},
+            "G2": {"clients": [6, 10], "family": "recon"},
+            "G3": {"clients": [11, 14], "family": "web"},
+            "G4": {"clients": [15, 16], "family": "other"},
+            "G5": {"clients": [17, 20], "family": None},
+        },
+        "families": {
+            "ddos": [
+                "DDoS-ACK_Fragmentation",
+                "DDoS-ICMP_Flood",
+                "DDoS-ICMP_Fragmentation",
+                "DDoS-PSHACK_Flood",
+                "DDoS-RSTFINFlood",
+            ],
+            "recon": [
+                "Recon-HostDiscovery",
+                "Recon-OSScan",
+                "Recon-PingSweep",
+                "Recon-PortScan",
+                "VulnerabilityScan",
+            ],
+            "web": ["CommandInjection", "XSS", "SqlInjection", "Uploading_Attack", "BrowserHijacking"],
+            "other": ["Backdoor_Malware", "Mirai-udpplain"],
+        },
         "min_flows_per_client": 50,
         "max_flows_per_client": None,
         "seed": 42,
@@ -119,6 +147,7 @@ DEFAULT_FL_CONFIG: dict[str, Any] = {
         "malicious_ratio": 0.0,
         "knowledge": "omniscient",
         "start_round": 1,
+        "placement": "random",  # "random" or "group:<name>" (a key of partition.groups)
         "params": {},
     },
     "defense": {
@@ -146,7 +175,13 @@ OPEN_SUBTREES: tuple[str, ...] = (
     "sampler.fanouts",
     "sampler.reverse_fanouts",
     "eval.families",
+    "partition.groups",
+    "partition.families",
 )
+
+# Open subtrees whose YAML value REPLACES the default instead of merging into it: a gateway
+# layout or family list is a whole, and leftover default groups would no longer tile the clients.
+REPLACE_SUBTREES: tuple[str, ...] = ("partition.groups", "partition.families")
 
 _TIMESTAMP_TAG = "tag:yaml.org,2002:timestamp"
 _FLOAT_TAG = "tag:yaml.org,2002:float"
@@ -184,14 +219,15 @@ def yaml_load(text_or_stream: Any) -> Any:
     return yaml.load(text_or_stream, Loader=FLConfigLoader)  # SafeLoader subclass: safe
 
 
-def deep_update(base: dict[str, Any], override: dict[str, Any] | None) -> dict[str, Any]:
+def deep_update(base: dict[str, Any], override: dict[str, Any] | None, _prefix: str = "") -> dict[str, Any]:
     out = copy.deepcopy(base)
     for key, value in (override or {}).items():
+        path = f"{_prefix}.{key}" if _prefix else str(key)
         if value is None and isinstance(out.get(key), dict):
             # An empty YAML section (``attack:``) must not wipe out the default sub-dict.
             continue
-        if isinstance(value, dict) and isinstance(out.get(key), dict):
-            out[key] = deep_update(out[key], value)
+        if isinstance(value, dict) and isinstance(out.get(key), dict) and path not in REPLACE_SUBTREES:
+            out[key] = deep_update(out[key], value, path)
         else:
             out[key] = copy.deepcopy(value)
     return out

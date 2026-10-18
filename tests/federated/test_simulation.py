@@ -156,6 +156,11 @@ def test_context_reuse_and_validation(smoke_cfg):
         {"client.lr_schedule": "bogus"},
         {"client.optimizer_state": "bogus"},
         {"federated.rounds": 0},
+        {"partition.scheme": "bogus"},
+        {"partition.scheme": "explicit", "partition.dominance": 1.5},
+        {"attack.placement": "bogus"},
+        {"attack.name": "sign_flip", "attack.malicious_ratio": 0.34, "attack.placement": "group:G9"},
+        {"attack.name": "sign_flip", "attack.malicious_ratio": 0.34, "attack.placement": "group:G1"},
     ],
 )
 def test_bad_config_fails_before_anything_is_written(smoke_cfg, tmp_path, override):
@@ -236,3 +241,47 @@ def test_detection_is_graded_only_in_rounds_where_the_attack_is_active(smoke_cfg
     assert len(summary["malicious_clients"]) == 1
     assert summary["detection"]["tp"] + summary["detection"]["fn"] == 1
     assert summary["detection"]["fp"] + summary["detection"]["tn"] == 5
+
+
+TINY_GROUPS = {
+    "G1": {"clients": [1, 1], "family": "ddos"},
+    "G2": {"clients": [2, 2], "family": "web"},
+    "G3": {"clients": [3, 3], "family": None},
+}
+
+
+def test_fl_smoke_explicit_partition_and_group_placement(smoke_cfg, tmp_path):
+    cfg = smoke_cfg(
+        "explicit",
+        **{
+            "partition.scheme": "explicit",
+            "partition.groups": TINY_GROUPS,
+            "attack.name": "sign_flip",
+            "attack.malicious_ratio": 0.34,
+            "attack.placement": "group:G2",
+        },
+    )
+    summary = run_experiment(cfg)
+    assert summary["malicious_clients"] == [1]
+    part = json.loads((tmp_path / "explicit" / "partition.json").read_text(encoding="utf-8"))
+    assert part["scheme"] == "explicit" and len(part["counts"]) == 3 and len(part["counts"][0]) == 3
+
+
+def test_export_partition_table_script(smoke_cfg, tmp_path):
+    import importlib.util
+    from pathlib import Path
+
+    import yaml
+
+    cfg_path = tmp_path / "cfg.yaml"
+    cfg_path.write_text(yaml.safe_dump(smoke_cfg("x", **{"partition.scheme": "explicit", "partition.groups": TINY_GROUPS})), encoding="utf-8")
+    script = Path(__file__).resolve().parents[2] / "scripts" / "fl" / "export_partition_table.py"
+    spec = importlib.util.spec_from_file_location("export_partition_table", script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    out_csv = tmp_path / "table.csv"
+    assert module.main(["--config", str(cfg_path), "--out-csv", str(out_csv), "--out-png", str(tmp_path / "t.png")]) == 0
+    lines = out_csv.read_text(encoding="utf-8").splitlines()
+    assert lines[0] == "client,group,Benign,XSS,DDoS-ICMP_Flood,total" and len(lines) == 4
+    pytest.importorskip("matplotlib")
+    assert (tmp_path / "t.png").exists()

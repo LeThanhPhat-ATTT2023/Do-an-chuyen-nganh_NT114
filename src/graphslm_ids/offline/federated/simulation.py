@@ -52,7 +52,13 @@ from graphslm_ids.offline.federated.metrics import (
 )
 from graphslm_ids.offline.federated.models import ModelAdapter, build_adapter
 from graphslm_ids.offline.federated.params import ParamLayout
-from graphslm_ids.offline.federated.partition import ClientPartition, make_partition, subsample_partition
+from graphslm_ids.offline.federated.partition import (
+    ClientPartition,
+    check_partition_config,
+    group_members,
+    make_partition,
+    subsample_partition,
+)
 from graphslm_ids.offline.federated.records import append_jsonl, to_jsonable, write_json
 from graphslm_ids.offline.federated.server import ClientMessage, FLServer
 from graphslm_ids.offline.training.train_hgt_flow_classifier import resolve_device, set_seed
@@ -87,8 +93,43 @@ def select_participants(num_clients: int, fraction: float, seed: int, round_idx:
     return sorted(int(c) for c in rng.choice(num_clients, size=k, replace=False))
 
 
-def select_malicious(num_clients: int, ratio: float, seed: int) -> list[int]:
+def parse_placement(placement: Any) -> tuple[str, str | None]:
+    """``attack.placement`` as ``("random", None)`` or ``("group", <group name>)``."""
+    text = str(placement)
+    if text == "random":
+        return "random", None
+    if text.startswith("group:") and len(text) > len("group:"):
+        return "group", text[len("group:") :]
+    raise ValueError(f"unknown attack.placement {placement!r}; expected 'random' or 'group:<name>'")
+
+
+def select_malicious(
+    num_clients: int,
+    ratio: float,
+    seed: int,
+    *,
+    placement: str = "random",
+    groups: dict[str, Any] | None = None,
+) -> list[int]:
+    """The ``round(ratio * K)`` attacker client ids.
+
+    ``random`` draws them from all clients with ``seed``; ``group:<name>`` takes the first ones,
+    in client order, of that gateway group (``groups`` is ``partition.groups``).
+    """
+    kind, name = parse_placement(placement)
     m = min(max(int(round(float(ratio) * num_clients)), 0), num_clients)
+    if kind == "group":
+        if not groups:
+            raise ValueError(f"attack.placement {placement!r} needs partition.groups")
+        members = group_members(groups, num_clients)
+        if name not in members:
+            raise ValueError(f"attack.placement {placement!r}: no group {name!r}; groups are {sorted(members)}")
+        if m > len(members[name]):
+            raise ValueError(
+                f"attack.placement {placement!r}: {m} attackers (malicious_ratio {ratio}) exceed the "
+                f"{len(members[name])} clients of group {name!r}"
+            )
+        return members[name][:m]
     if m == 0:
         return []
     rng = np.random.default_rng(int(seed) + 7919)
@@ -197,6 +238,19 @@ def _check_config(cfg: dict[str, Any], context: ExperimentContext | None) -> str
     if rounds < 1:
         raise ValueError(f"federated.rounds must be >= 1, got {rounds}")
     round_lr(cfg["client"], 1, rounds)  # rejects an unknown client.lr_schedule
+    check_partition_config(cfg["partition"])  # unknown scheme, bad explicit groups / families / dominance
+    attack_cfg = cfg["attack"]
+    placement = attack_cfg.get("placement", "random")
+    parse_placement(placement)
+    if mode == "fl" and str(attack_cfg.get("name", "none")).lower() != "none":
+        # Dry run: an unknown group or too many attackers for it must fail before training.
+        select_malicious(
+            int(cfg["partition"]["num_clients"]),
+            float(attack_cfg.get("malicious_ratio", 0.0)),
+            0,
+            placement=placement,
+            groups=cfg["partition"].get("groups"),
+        )
     return mode
 
 
@@ -337,7 +391,13 @@ def _run_federated(run: _Run) -> dict[str, Any]:
     malicious = (
         []
         if attack.name == "none"
-        else select_malicious(len(run.clients), float(attack_cfg.get("malicious_ratio", 0.0)), seed)
+        else select_malicious(
+            len(run.clients),
+            float(attack_cfg.get("malicious_ratio", 0.0)),
+            seed,
+            placement=str(attack_cfg.get("placement", "random")),
+            groups=cfg["partition"].get("groups"),
+        )
     )
     mal_set = set(malicious)
     rounds_path = run.out / "rounds.jsonl"
@@ -549,7 +609,9 @@ def run_experiment(
     device = resolve_device(str(cfg.get("device", "auto")))
     ctx = context if context is not None else load_context(cfg)
 
-    partition = make_partition(ctx.train_ids, ctx.labels, cfg["partition"])
+    partition = make_partition(
+        ctx.train_ids, ctx.labels, cfg["partition"], label_names=ctx.label_names, order=ctx.flow_order
+    )
     if mode == "centralized":
         # Same (possibly subsampled) training flows as the FL clients, held by one silo.
         partition = ClientPartition([partition.all_flow_ids()], "centralized", None, seed)

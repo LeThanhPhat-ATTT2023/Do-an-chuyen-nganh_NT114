@@ -1,11 +1,13 @@
-"""Split TRAIN flows into simulated FL clients (IID or Dirichlet label skew)."""
+"""Split TRAIN flows into simulated FL clients (IID, Dirichlet label skew, explicit class shares)."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
+
+VALID_SCHEMES = ("iid", "dirichlet", "explicit")
 
 
 @dataclass
@@ -14,6 +16,8 @@ class ClientPartition:
     scheme: str
     alpha: float | None
     seed: int
+    counts: np.ndarray | None = None  # (K, C) int64 client x class table; set by the explicit scheme
+    params: dict[str, Any] = field(default_factory=dict)  # scheme parameters worth recording
 
     @property
     def num_clients(self) -> int:
@@ -38,6 +42,8 @@ class ClientPartition:
             "scheme": self.scheme,
             "alpha": self.alpha,
             "seed": self.seed,
+            "counts": None if self.counts is None else np.asarray(self.counts, dtype=np.int64).tolist(),
+            "params": dict(self.params),
             "client_flow_ids": [ids.astype(np.int64).tolist() for ids in self.client_flow_ids],
         }
 
@@ -48,6 +54,8 @@ class ClientPartition:
             scheme=str(payload["scheme"]),
             alpha=None if payload.get("alpha") is None else float(payload["alpha"]),
             seed=int(payload["seed"]),
+            counts=None if payload.get("counts") is None else np.asarray(payload["counts"], dtype=np.int64),
+            params=dict(payload.get("params") or {}),
         )
 
 
@@ -205,10 +213,236 @@ def subsample_partition(
     return ClientPartition(out, partition.scheme, partition.alpha, partition.seed)
 
 
-def make_partition(train_ids: np.ndarray, labels: np.ndarray, cfg: dict[str, Any]) -> ClientPartition:
+# -- explicit class-share table ---------------------------------------------------------------
+
+
+def group_members(groups: dict[str, Any], num_clients: int) -> dict[str, list[int]]:
+    """Validated 0-based client indices of every gateway group.
+
+    ``groups`` maps a group name to ``{"clients": [first, last], "family": ...}`` with 1-based
+    inclusive client ranges. The ranges must lie in ``1..num_clients``, be disjoint and together
+    cover every client.
+    """
+    if not isinstance(groups, dict) or not groups:
+        raise ValueError("partition.groups must be a non-empty mapping of group name -> {clients, family}")
+    owner: dict[int, str] = {}
+    members: dict[str, list[int]] = {}
+    for name, spec in groups.items():
+        rng = spec.get("clients") if isinstance(spec, dict) else None
+        if (
+            not isinstance(rng, (list, tuple))
+            or len(rng) != 2
+            or not all(isinstance(v, (int, np.integer)) and not isinstance(v, bool) for v in rng)
+        ):
+            raise ValueError(f"group {name!r}: 'clients' must be a [first, last] pair of 1-based client numbers")
+        first, last = int(rng[0]), int(rng[1])
+        if not 1 <= first <= last <= num_clients:
+            raise ValueError(f"group {name!r}: clients [{first}, {last}] must satisfy 1 <= first <= last <= {num_clients}")
+        for k in range(first - 1, last):
+            if k in owner:
+                raise ValueError(f"groups {owner[k]!r} and {name!r} both contain client {k + 1}")
+            owner[k] = str(name)
+        members[str(name)] = list(range(first - 1, last))
+    missing = [k + 1 for k in range(num_clients) if k not in owner]
+    if missing:
+        raise ValueError(f"groups must cover all {num_clients} clients; no group contains client(s) {missing}")
+    return members
+
+
+def _explicit_plan(
+    num_clients: int, groups: dict[str, Any], families: dict[str, list[str]], dominance: Any
+) -> tuple[float, dict[str, list[int]], dict[str, str]]:
+    """Validate the explicit-scheme settings; returns (dominance, group -> clients, class -> group)."""
+    try:
+        p = float(dominance)
+    except (TypeError, ValueError):
+        raise ValueError(f"partition.dominance must be a number in [0, 1], got {dominance!r}") from None
+    if not 0.0 <= p <= 1.0:  # also rejects NaN
+        raise ValueError(f"partition.dominance must lie in [0, 1], got {dominance!r}")
+    members = group_members(groups, int(num_clients))
+    if not isinstance(families, dict):
+        raise ValueError("partition.families must be a mapping of family name -> class names")
+    group_of_family: dict[str, str] = {}
+    for name, spec in groups.items():
+        family = spec.get("family")
+        if family is None:
+            continue
+        if family not in families:
+            raise ValueError(f"group {name!r}: family {family!r} is not in partition.families {sorted(families)}")
+        if family in group_of_family:
+            raise ValueError(f"family {family!r} is used by groups {group_of_family[family]!r} and {name!r}; at most one")
+        group_of_family[family] = str(name)
+    class_family: dict[str, str] = {}
+    group_of_class: dict[str, str] = {}
+    for family, class_names in families.items():
+        for cls in class_names:
+            if class_family.setdefault(str(cls), str(family)) != family:
+                raise ValueError(f"class {cls!r} is listed in both families {class_family[str(cls)]!r} and {family!r}")
+            if family in group_of_family:
+                group_of_class[str(cls)] = group_of_family[family]
+    return p, members, group_of_class
+
+
+def explicit_fractions(
+    label_names: dict[int, str],
+    num_clients: int,
+    groups: dict[str, Any],
+    families: dict[str, list[str]],
+    dominance: float,
+    *,
+    num_classes: int | None = None,
+) -> np.ndarray:
+    """``(K, C)`` share of each class that every client receives; every column sums to 1.
+
+    A class of family ``F`` whose group has ``n_F`` clients goes ``p / n_F + (1 - p) / K`` to each
+    client inside the group and ``(1 - p) / K`` to every other client. A class in no family, or
+    in a family no group uses, is split ``1 / K`` evenly. ``C`` is ``max(label_names) + 1``
+    unless ``num_classes`` is larger.
+    """
+    p, members, group_of_class = _explicit_plan(num_clients, groups, families, dominance)
+    k_total = int(num_clients)
+    n_classes = max([int(num_classes or 0)] + [int(c) + 1 for c in label_names])
+    frac = np.full((k_total, n_classes), 1.0 / k_total, dtype=np.float64)
+    for c in range(n_classes):
+        group = group_of_class.get(str(label_names.get(c)))
+        if group is None:
+            continue
+        inside = members[group]
+        frac[:, c] = (1.0 - p) / k_total
+        frac[inside, c] += p / len(inside)
+    if not np.allclose(frac.sum(axis=0), 1.0, rtol=0.0, atol=1e-9):
+        raise ValueError("explicit class shares do not sum to 1 for every class")
+    return frac
+
+
+def explicit_counts(fractions: np.ndarray, class_counts: np.ndarray) -> np.ndarray:
+    """``(K, C)`` integer table ``n[k, c]`` whose column sums are exactly ``class_counts``.
+
+    ``n = floor(f * N_c)`` (the ``1e-9`` absorbs float error, e.g. ``0.17 * 400 = 67.999...``);
+    the ``N_c - sum(n)`` leftovers go one each to the clients with the largest fractional part,
+    ties to the smaller client index.
+    """
+    f = np.asarray(fractions, dtype=np.float64)
+    totals = np.asarray(class_counts, dtype=np.int64)
+    if f.ndim != 2 or totals.shape != (f.shape[1],):
+        raise ValueError(f"fractions {f.shape} and class_counts {totals.shape} do not line up")
+    scaled = f * totals
+    base = np.floor(scaled + 1e-9).astype(np.int64)
+    left = totals - base.sum(axis=0)
+    if (left < 0).any():
+        raise ValueError("fractions sum to more than 1 for some class")
+    # Rounded so two shares that are equal on paper stay tied despite float noise.
+    remainder = np.round(scaled - base, 9)
+    out = base.copy()
+    for c in range(f.shape[1]):
+        winners = np.lexsort((np.arange(f.shape[0]), -remainder[:, c]))[: int(left[c])]
+        out[winners, c] += 1
+    return out
+
+
+def partition_explicit(
+    train_ids: np.ndarray,
+    labels: np.ndarray,
+    label_names: dict[int, str],
+    cfg: dict[str, Any],
+    order: np.ndarray | None = None,
+) -> ClientPartition:
+    """Deterministic client x class split: the share table, then consecutive time segments.
+
+    The train flows of class ``c`` are sorted by ``(order[id], id)`` (by ``id`` without ``order``)
+    and cut into consecutive runs of ``n[0, c], n[1, c], ...`` flows; client ``k`` takes run
+    ``k``. With ``max_flows_per_client`` a larger client's row shrinks via ``_stratified_quota``
+    and it keeps the first flows of each of its runs. Nothing is random; ``seed`` is only recorded.
+    """
+    num_clients = int(cfg.get("num_clients", 10))
+    min_flows = int(cfg.get("min_flows_per_client", 1))
+    cap = cfg.get("max_flows_per_client")
+    if cap is not None:
+        cap = int(cap)
+        if cap < 1:
+            raise ValueError(f"max_flows_per_client must be >= 1, got {cap}")
+    if min_flows < 1:
+        raise ValueError(f"min_flows_per_client must be >= 1, got {min_flows}")
+    groups, families = cfg.get("groups"), cfg.get("families")
+    if groups is None or families is None:
+        raise ValueError("partition scheme 'explicit' needs partition.groups and partition.families")
+    train_ids = np.asarray(train_ids, dtype=np.int64)
+    labels = np.asarray(labels, dtype=np.int64)
+    _check_unique(train_ids)
+    ranks = None
+    if order is not None:
+        ranks = np.asarray(order, dtype=np.float64)
+        if train_ids.size and int(train_ids.max()) >= ranks.shape[0]:
+            raise ValueError(f"order has {ranks.shape[0]} entries but train_ids reach flow id {int(train_ids.max())}")
+    y = labels[train_ids]
+    num_classes = max([int(c) + 1 for c in label_names] + [int(y.max()) + 1 if y.size else 0])
+    dominance = float(cfg.get("dominance", 0.8))
+    fractions = explicit_fractions(label_names, num_clients, groups, families, dominance, num_classes=num_classes)
+    full = explicit_counts(fractions, np.bincount(y, minlength=num_classes))
+    kept = full.copy()  # ``full`` fixes the run boundaries, ``kept`` how much of each run survives the cap
+    if cap is not None:
+        for k in np.flatnonzero(full.sum(axis=1) > cap):
+            kept[k] = _stratified_quota(full[k], cap)
+    small = np.flatnonzero(kept.sum(axis=1) < min_flows)
+    if small.size:
+        raise ValueError(
+            f"explicit partition leaves client(s) {(small + 1).tolist()} below min_flows_per_client "
+            f"({min_flows}); lower min_flows_per_client or raise max_flows_per_client"
+        )
+    parts: list[list[np.ndarray]] = [[] for _ in range(num_clients)]
+    for c in range(num_classes):
+        ids_c = train_ids[y == c]
+        ids_c = np.sort(ids_c) if ranks is None else ids_c[np.lexsort((ids_c, ranks[ids_c]))]
+        bounds = np.concatenate([[0], np.cumsum(full[:, c])])
+        for k in range(num_clients):
+            parts[k].append(ids_c[bounds[k] : bounds[k] + kept[k, c]])
+    clients = [np.sort(np.concatenate(p)).astype(np.int64) for p in parts]
+    params = {
+        "dominance": dominance,
+        "groups": {
+            str(g): {"clients": [int(s["clients"][0]), int(s["clients"][1])], "family": s.get("family")}
+            for g, s in groups.items()
+        },
+        "families": {str(f): [str(n) for n in names] for f, names in families.items()},
+        "ordered_by": "flow_id" if ranks is None else "flow_start_ts",
+        "max_flows_per_client": cap,
+    }
+    return ClientPartition(clients, "explicit", None, int(cfg.get("seed", 42)), counts=kept, params=params)
+
+
+def check_partition_config(cfg: dict[str, Any]) -> str:
+    """Reject a bad ``partition`` section without touching any data; returns the scheme."""
+    scheme = str(cfg.get("scheme", "iid")).lower()
+    if scheme not in VALID_SCHEMES:
+        raise ValueError(f"unknown partition scheme {scheme!r}; expected one of {VALID_SCHEMES}")
+    if scheme == "explicit":
+        groups, families = cfg.get("groups"), cfg.get("families")
+        if groups is None or families is None:
+            raise ValueError("partition scheme 'explicit' needs partition.groups and partition.families")
+        _explicit_plan(int(cfg.get("num_clients", 10)), groups, families, cfg.get("dominance", 0.8))
+    return scheme
+
+
+def make_partition(
+    train_ids: np.ndarray,
+    labels: np.ndarray,
+    cfg: dict[str, Any],
+    *,
+    label_names: dict[int, str] | None = None,
+    order: np.ndarray | None = None,
+) -> ClientPartition:
+    """Build the client split named by ``cfg["scheme"]``.
+
+    ``label_names`` (class id -> name) is required by ``explicit``; ``order`` (flow id -> start
+    time) is optional there and ignored by the other schemes.
+    """
     scheme = str(cfg.get("scheme", "iid")).lower()
     num_clients = int(cfg.get("num_clients", 10))
     seed = int(cfg.get("seed", 42))
+    if scheme == "explicit":
+        if label_names is None:
+            raise ValueError("partition scheme 'explicit' needs label_names (class id -> name)")
+        return partition_explicit(train_ids, labels, label_names, cfg, order)
     cap = cfg.get("max_flows_per_client")
     if cap is not None:
         cap = int(cap)
@@ -232,7 +466,7 @@ def make_partition(train_ids: np.ndarray, labels: np.ndarray, cfg: dict[str, Any
             min_flows,
         )
     else:
-        raise ValueError(f"unknown partition scheme {scheme!r}; expected 'iid' or 'dirichlet'")
+        raise ValueError(f"unknown partition scheme {scheme!r}; expected one of {VALID_SCHEMES}")
     if cap is not None:
         part = subsample_partition(part, labels, cap, seed)
     return part
