@@ -1,6 +1,6 @@
 """Run one FL poisoning experiment.
 
-    python -m graphslm_ids.offline.federated.cli --config configs/fl/fl_hgt.yaml \
+    python -m graphslm_ids.offline.federated.cli --config configs/fl/fl_base.yaml \
         --device cuda --set attack.name=alie --set attack.malicious_ratio=0.2
 """
 

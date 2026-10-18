@@ -128,5 +128,11 @@ def test_sign_signal_scale_is_floored_at_its_resolution():
     assert sign_suspicion(agreement, 10**6, scale_floor=1e-3, z_max=4.0)[3] == pytest.approx(1.0)
 
 
+def test_raguard_info_records_the_effective_beta():
+    x = _round()
+    assert _run(build_defense({"name": "raguard"}, assumed_malicious_ratio=0.2), x).info["beta"] == 0.2
+    assert _run(RAGuard(beta=0.1), x).info["beta"] == 0.1
+
+
 def test_default_z_max_is_four():
     assert RAGuard().z_max == 4.0

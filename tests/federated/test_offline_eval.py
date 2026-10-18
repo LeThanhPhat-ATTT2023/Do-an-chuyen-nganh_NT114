@@ -48,6 +48,8 @@ def test_offline_eval_cli_scores_several_defenses(smoke_cfg, tmp_path):
     assert set(result) == {"median", "raguard"} and result["median"]["detection"]["tpr"] is not None
     with pytest.raises(ValueError):
         replay(run, {"name": "bogus"})
+    with pytest.raises(ValueError, match="krum"):
+        main(["--run", str(run), "--defense", "multi_krum", "--params-json", '{"krum": {"f": 1}}'])
 
 
 def test_bad_deltas_dtype_rejected(smoke_cfg):

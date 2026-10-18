@@ -16,6 +16,18 @@ def test_load_context_reads_splits_labels_and_clean_key(smoke_cfg, tiny_paths):
     assert ctx.flow_order is None
 
 
+def test_flow_order_is_the_flow_start_ts_column_of_flow_x(smoke_cfg, tiny_paths, tiny_artifact):
+    meta_path = tiny_paths["graph_meta_json"]
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    names = list(meta["flow_feature_names"])
+    names[4] = "flow_start_ts"  # v3 keeps the start time as a flow_x column, not a metadata key
+    meta["flow_feature_names"] = names
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+    ctx = load_context(smoke_cfg())
+    assert ctx.flow_order.dtype == np.float64
+    assert np.array_equal(ctx.flow_order, np.asarray(tiny_artifact.node_features["flow"][:, 4], dtype=np.float64))
+
+
 def test_load_context_rejects_wrong_clean_length(smoke_cfg, tmp_path):
     bad = tmp_path / "bad.npy"
     np.save(bad, np.zeros(5, dtype=np.int64))

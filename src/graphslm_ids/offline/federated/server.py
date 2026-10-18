@@ -45,6 +45,9 @@ class RoundReport:
     seconds: float
     info: dict[str, Any] = field(default_factory=dict)
     scores: dict[str, Any] = field(default_factory=dict)
+    # True iff the aggregator gave per-client verdicts (``decisions`` or ``selected``); FedAvg,
+    # Median and Trimmed Mean accept everyone by construction, so their rounds are not screened.
+    screened: bool = False
 
     def decision_map(self) -> dict[int, str]:
         return {d.client_id: d.decision for d in self.decisions}
@@ -178,4 +181,5 @@ class FLServer:
             time.perf_counter() - start,
             to_jsonable(result.info),
             to_jsonable(result.scores),
+            screened=result.decisions is not None or result.selected is not None,
         )

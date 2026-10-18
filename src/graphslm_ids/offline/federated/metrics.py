@@ -172,6 +172,17 @@ def detection_rates(counts: dict[str, int]) -> dict[str, float | None]:
     }
 
 
+def detection_summary(counts: dict[str, int], screened: bool) -> dict[str, Any]:
+    """Run-level detection: the counts and rates accumulated over the screened rounds.
+
+    ``screened`` says whether any round was screened (the aggregator gave per-client verdicts).
+    FedAvg / Median / Trimmed Mean accept every client by construction, so their rates are None
+    (not applicable) rather than a misleading TPR of 0.
+    """
+    zero = detection_counts({}, set())
+    return {**merge_counts(zero, counts), **detection_rates(counts if screened else {}), "screened": bool(screened)}
+
+
 def convergence_round(history: list[tuple[int, float | None]], frac: float = 0.95) -> int | None:
     values = [(int(r), float(s)) for r, s in history if s is not None]
     if not values:

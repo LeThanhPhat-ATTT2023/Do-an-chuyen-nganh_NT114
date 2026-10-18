@@ -46,7 +46,7 @@ from graphslm_ids.offline.federated.metrics import (
     compact_metrics,
     convergence_round,
     detection_counts,
-    detection_rates,
+    detection_summary,
     evaluate_predictions,
     merge_counts,
 )
@@ -81,6 +81,10 @@ CENTRALIZED_OVERRIDES: dict[str, Any] = {
 }
 # Local-only clients train alone for every round, so Adam moments carry across rounds.
 LOCAL_ONLY_OVERRIDES: dict[str, Any] = {"client.optimizer_state": "persist"}
+# Aggregator params that would replace the defender's assumed malicious ratio. It is fixed for
+# every experiment (``defense.assumed_malicious_ratio``), so run_experiment rejects them; the
+# builders still take them (unit tests, offline sensitivity checks with offline_eval).
+ASSUMED_RATIO_PARAMS = ("beta", "trim_ratio", "trim_k", "f", "f_ratio")
 
 
 # -- selection --------------------------------------------------------------------------------
@@ -243,6 +247,13 @@ def _check_config(cfg: dict[str, Any], context: ExperimentContext | None) -> str
         raise ValueError(f"federated.rounds must be >= 1, got {rounds}")
     round_lr(cfg["client"], 1, rounds)  # rejects an unknown client.lr_schedule
     check_partition_config(cfg["partition"])  # unknown scheme, bad explicit groups / families / dominance
+    agg_params = (cfg["defense"].get("aggregator") or {}).get("params") or {}
+    overriding = sorted(k for k in agg_params if k in ASSUMED_RATIO_PARAMS)
+    if overriding:
+        raise ValueError(
+            f"defense.aggregator.params {overriding} would override defense.assumed_malicious_ratio, which is "
+            "fixed for every experiment; vary it offline with offline_eval instead"
+        )
     attack_cfg = cfg["attack"]
     placement = attack_cfg.get("placement", "random")
     parse_placement(placement)
@@ -410,7 +421,8 @@ def _run_federated(run: _Run) -> dict[str, Any]:
     every = max(1, int(cfg["eval"].get("every", 1)))
     monitor = str(cfg["eval"]["monitor"])
     bytes_per_update = 4 * layout.numel
-    totals: dict[str, int] = {}
+    totals: dict[str, int] = {}  # detection counts over the screened rounds only
+    screened_any = False
     history: list[dict[str, Any]] = []
     best: dict[str, Any] = {"score": None, "round": 0, "vec": None, "val": None}
     last_val: dict[str, Any] | None = None
@@ -470,7 +482,9 @@ def _run_federated(run: _Run) -> dict[str, Any]:
                 deltas_dir, r, ids, saved.detach().cpu(), samples.detach().cpu(), sorted(active), deltas_dtype
             )
         det = detection_counts(report.decision_map(), active)
-        totals = merge_counts(totals, det)
+        if report.screened:
+            totals = merge_counts(totals, det)
+            screened_any = True
         cost["client_train_seconds"] += train_seconds
         cost["server_seconds"] += report.seconds
         cost["bytes_up"] += bytes_per_update * len(participants)
@@ -485,6 +499,11 @@ def _run_federated(run: _Run) -> dict[str, Any]:
             "aggregate_norm": report.aggregate_norm,
             "decisions": [asdict(d) for d in report.decisions],  # includes each client's trust
             "agg_info": report.info,
+            # Per-client defense scores (RAGuard suspicion/abrupt, Krum scores, ...), aligned with
+            # the non-invalid decisions in order.
+            "scores": report.scores,
+            "attack_info": to_jsonable(attack.info) if mal_now else {},
+            "screened": report.screened,
             "detection": det,
             "client_metrics": {c: {**u.metrics, "steps": u.steps, "seconds": u.seconds} for c, u in updates.items()},
             "train_seconds": train_seconds,
@@ -543,7 +562,7 @@ def _run_federated(run: _Run) -> dict[str, Any]:
         "best_score": best["score"],
         "final": {"val": last_val, "test": test_final},
         "best": {"val": best["val"], "test": test_best},
-        "detection": {**totals, **detection_rates(totals)},
+        "detection": detection_summary(totals, screened_any),
         "convergence_round": convergence_round([(h["round"], h["score"]) for h in history]),
         "history": history,
         "cost": cost,

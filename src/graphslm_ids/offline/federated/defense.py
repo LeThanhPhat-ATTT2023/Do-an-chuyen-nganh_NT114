@@ -370,6 +370,7 @@ class RAGuard(Aggregator):
             weights=w,
             scores={"suspicion": suspicion, "abrupt": abrupt},
             info={
+                "beta": self.beta,
                 "num_groups": num_groups,
                 "num_groups_evaluated": num_evaluated,
                 "median_norm": median_norm,

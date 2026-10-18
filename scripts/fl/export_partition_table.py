@@ -1,6 +1,6 @@
 """Export the FL client x class flow-count table (CSV) and its heatmap (PNG) for the thesis.
 
-    python scripts/fl/export_partition_table.py --config configs/fl/fl_hgt.yaml \
+    python scripts/fl/export_partition_table.py --config configs/fl/fl_base.yaml \
         --out-csv outputs/fl/partition_table.csv --out-png outputs/fl/partition_table.png \
         --set partition.dominance=0.5
 

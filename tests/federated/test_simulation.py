@@ -6,6 +6,7 @@ import torch
 from graphslm_ids.offline.federated import simulation
 from graphslm_ids.offline.federated.config import apply_overrides
 from graphslm_ids.offline.federated.local_trainer import LocalTrainer
+from graphslm_ids.offline.federated.matrix import summary_row
 from graphslm_ids.offline.federated.models import rebuild_model
 from graphslm_ids.offline.federated.simulation import (
     load_context,
@@ -39,7 +40,13 @@ def test_fl_smoke_sign_flip_fedavg(smoke_cfg, tmp_path):
     assert records[0]["attack_active"] and len(records[0]["decisions"]) == 3
     assert 0.0 <= summary["final"]["test"]["macro_f1"] <= 1.0
     assert "clean" in summary["final"]["test"]
-    assert summary["detection"]["tp"] + summary["detection"]["fn"] == 2
+    # FedAvg gives no per-client verdict: detection is not applicable, not "0% caught".
+    assert summary["detection"]["screened"] is False
+    assert summary["detection"]["tpr"] is None and summary["detection"]["fpr"] is None
+    row = summary_row(summary)
+    assert row["detect_tpr"] is None and row["benign_false_rejection"] is None
+    assert all(r["screened"] is False and r["detection"]["tp"] + r["detection"]["fn"] == 1 for r in records)
+    assert records[0]["attack_info"] == {} and records[0]["scores"] == {}  # sign_flip records no diagnostics
     ckpt = torch.load(out / "global_final.pt", map_location="cpu", weights_only=False)
     assert ckpt["model_name"] == "hgt" and ckpt["label_names"][1] == "XSS" and ckpt["flow_feature_stats"]["mean"]
     rebuild_model(ckpt).load_state_dict(ckpt["model_state_dict"])
@@ -162,6 +169,8 @@ def test_context_reuse_and_validation(smoke_cfg):
         {"attack.placement": "bogus"},
         {"attack.name": "sign_flip", "attack.malicious_ratio": 0.34, "attack.placement": "group:G9"},
         {"attack.name": "sign_flip", "attack.malicious_ratio": 0.34, "attack.placement": "group:G1"},
+        {"defense.aggregator": {"name": "raguard", "params": {"beta": 0.3}}},
+        {"defense.aggregator": {"name": "trimmed_mean", "params": {"trim_ratio": 0.3}}},
     ],
 )
 def test_bad_config_fails_before_anything_is_written(smoke_cfg, tmp_path, override):
@@ -232,9 +241,19 @@ def test_client_cache_is_rebuilt_when_model_or_sampler_config_changes(smoke_cfg,
 
 
 def test_detection_is_graded_only_in_rounds_where_the_attack_is_active(smoke_cfg, tmp_path):
-    cfg = smoke_cfg("late", **{"attack.name": "sign_flip", "attack.malicious_ratio": 0.34, "attack.start_round": 2})
+    cfg = smoke_cfg(
+        "late",
+        **{
+            "attack.name": "sign_flip",
+            "attack.malicious_ratio": 0.34,
+            "attack.start_round": 2,
+            "defense.aggregator": {"name": "multi_krum", "params": {}},
+        },
+    )
     summary = run_experiment(cfg)
     first, second = _records(tmp_path / "late" / "rounds.jsonl")
+    assert first["screened"] and second["screened"] and summary["detection"]["screened"] is True
+    assert len(second["scores"]["krum"]) == 3
     assert not first["attack_active"] and first["malicious"] == []
     det1 = first["detection"]
     assert det1["tp"] + det1["fn"] == 0 and det1["fp"] + det1["tn"] == 3
@@ -303,10 +322,33 @@ def test_fl_smoke_baseline_models(smoke_cfg, tmp_path, name):
         assert run_experiment(apply_overrides(cfg, {"federated.mode": mode, "output.dir": str(tmp_path / f"{name}_{mode}")}))["mode"] == mode
 
 
+@pytest.mark.parametrize(
+    "name, key",
+    [("raguard", "beta"), ("trimmed_mean", "trim_ratio"), ("trimmed_mean", "trim_k"), ("multi_krum", "f"),
+     ("multi_krum", "f_ratio"), ("dnc", "f"), ("dnc", "f_ratio")],
+)
+def test_aggregator_params_may_not_override_the_assumed_malicious_ratio(smoke_cfg, tmp_path, name, key):
+    cfg = smoke_cfg("override", **{"defense.aggregator": {"name": name, "params": {key: 1}}})
+    with pytest.raises(ValueError, match="assumed_malicious_ratio"):
+        run_experiment(cfg)
+    assert not (tmp_path / "override").exists()
+
+
 def test_fl_smoke_raguard(smoke_cfg, tmp_path):
     summary = run_experiment(
         smoke_cfg("rag", **{"attack.name": "min_max", "attack.malicious_ratio": 0.34, "defense.aggregator": {"name": "raguard", "params": {}}})
     )
-    assert summary["aggregator"] == "raguard"
+    assert summary["aggregator"] == "raguard" and summary["detection"]["screened"] is True
     first = _records(tmp_path / "rag" / "rounds.jsonl")[0]
-    assert all("trust" in d for d in first["decisions"])
+    (attacker,) = summary["malicious_clients"]
+    assert first["malicious"] == [attacker] and first["screened"]
+    # The round record keeps the attack's and the defense's diagnostics.
+    assert first["attack_info"]["gamma"] > 0
+    suspicion = first["scores"]["suspicion"]
+    assert len(suspicion) == len(first["participants"]) == len(first["decisions"]) == 3
+    by_client = dict(zip([d["client_id"] for d in first["decisions"]], suspicion))
+    benign = [u for c, u in by_client.items() if c != attacker]
+    # End to end, round 1: the min_max attacker is the most suspicious client and is not accepted.
+    assert by_client[attacker] > max(benign)
+    verdict = {d["client_id"]: d for d in first["decisions"]}[attacker]
+    assert verdict["decision"] != "accept" and verdict["trust"] < 1.0

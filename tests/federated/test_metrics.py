@@ -7,6 +7,7 @@ from graphslm_ids.offline.federated.metrics import (
     convergence_round,
     detection_counts,
     detection_rates,
+    detection_summary,
     evaluate_predictions,
     merge_counts,
     metrics_from_confusion,
@@ -48,6 +49,15 @@ def test_detection_counts_and_rates():
     assert rates["fpr"] == pytest.approx(1 / 3)
     assert rates["malicious_acceptance_rate"] == pytest.approx(1 / 3)
     assert detection_rates({})["tpr"] is None
+
+
+def test_detection_summary_is_not_applicable_without_screening():
+    counts = detection_counts({0: "reject", 1: "accept"}, {0})
+    screened = detection_summary(counts, True)
+    assert screened["screened"] is True and screened["tpr"] == 1.0 and screened["fpr"] == 0.0
+    none = detection_summary({}, False)
+    assert none["screened"] is False and none["tpr"] is None and none["fpr"] is None
+    assert none["tp"] == none["fp"] == none["tn"] == none["fn"] == 0
 
 
 def test_convergence_round_and_compact():

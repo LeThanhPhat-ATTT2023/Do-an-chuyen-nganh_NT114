@@ -56,6 +56,22 @@ def require_file(value: Any, key: str) -> Path:
     return path
 
 
+def flow_start_times(artifact: HeteroGraphArtifact) -> np.ndarray | None:
+    """Per-flow start time (float64) used to order flows in the explicit partition, or None.
+
+    v3 keeps it as the ``flow_start_ts`` column of ``flow_x`` (named in ``metadata
+    ["flow_feature_names"]``); a ``metadata["flow_start_ts"]`` array is the fallback. ``flow_x`` is
+    float32, so unix-second timestamps resolve to about two minutes; ties fall back to flow id.
+    """
+    metadata = artifact.metadata or {}
+    names = list(metadata.get("flow_feature_names") or [])
+    if "flow_start_ts" in names:
+        return np.asarray(artifact.node_features["flow"][:, names.index("flow_start_ts")], dtype=np.float64)
+    if "flow_start_ts" in metadata:
+        return np.asarray(metadata["flow_start_ts"], dtype=np.float64)
+    return None
+
+
 def load_context(cfg: dict[str, Any]) -> ExperimentContext:
     data = cfg["data"]
     if str(data.get("artifact_version", "")).lower() != "v3":
@@ -88,14 +104,9 @@ def load_context(cfg: dict[str, Any]) -> ExperimentContext:
         if clean.size and (clean.min() < 0 or clean.max() >= num_classes):
             raise ValueError(f"clean_eval_labels entries must lie in [0, {num_classes})")
 
-    metadata = artifact.metadata or {}
-    flow_order = None
-    if "flow_start_ts" in metadata:
-        flow_order = np.asarray(metadata["flow_start_ts"], dtype=np.float64)
-        if flow_order.shape != labels.shape:
-            raise ValueError(
-                f"metadata flow_start_ts has shape {flow_order.shape}, expected ({labels.shape[0]},)"
-            )
+    flow_order = flow_start_times(artifact)
+    if flow_order is not None and flow_order.shape != labels.shape:
+        raise ValueError(f"flow_start_ts has shape {flow_order.shape}, expected ({labels.shape[0]},)")
 
     return ExperimentContext(
         data_key=data_key(cfg),

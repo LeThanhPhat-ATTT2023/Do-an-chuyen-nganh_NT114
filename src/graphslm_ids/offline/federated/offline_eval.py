@@ -134,7 +134,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--params-json",
         default=None,
-        help='JSON object (or path to a JSON file) mapping defense name to its params, e.g. {"krum": {"f": 1}}',
+        help='JSON object (or path to a JSON file) mapping defense name to its params, e.g. {"multi_krum": {"f": 1}}',
     )
     parser.add_argument("--out", default=None, help="output path (default <run>/offline_eval.json)")
     args = parser.parse_args(argv)
@@ -144,6 +144,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.params_json:
         text = args.params_json
         params = json.loads(Path(text).read_text(encoding="utf-8") if Path(text).is_file() else text)
+    stray = sorted(set(params) - set(args.defense))
+    if stray:
+        # A misspelled defense name would otherwise silently replay with the default params.
+        raise ValueError(f"--params-json has params for {stray}, which are not among --defense {args.defense}")
     meta_path = run / "deltas" / "meta.json"
     meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.is_file() else {}
     kwargs = {

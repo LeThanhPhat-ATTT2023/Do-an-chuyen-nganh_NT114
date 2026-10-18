@@ -129,6 +129,18 @@ def test_server_marks_multi_krum_dropped_clients_rejected():
     assert server.step([ClientMessage(i, 1, deltas[i], 1) for i in range(10)]).decision_map()[0] == "reject"
 
 
+def test_report_is_screened_only_when_the_aggregator_gives_per_client_verdicts():
+    from graphslm_ids.offline.federated.aggregators import Median
+
+    two = [_msg(0, [1.0, 1.0]), _msg(1, [2.0, 2.0])]
+    assert FLServer(global_vec=torch.zeros(2), aggregator=_Scripted(decisions=[ACCEPT, REJECT])).step(two).screened
+    assert FLServer(global_vec=torch.zeros(2), aggregator=_Scripted(selected=[True, True])).step(two).screened
+    assert not FLServer(global_vec=torch.zeros(2), aggregator=FedAvg()).step(two).screened
+    assert not FLServer(global_vec=torch.zeros(2), aggregator=Median()).step(two).screened
+    nothing_valid = [_msg(0, [float("nan"), 0.0])]
+    assert not FLServer(global_vec=torch.zeros(2), aggregator=_Scripted(selected=[True])).step(nothing_valid).screened
+
+
 @pytest.mark.parametrize("bad", [torch.full((4,), float("nan")), torch.zeros(3)])
 def test_server_rejects_a_broken_aggregate(bad):
     class Broken(Aggregator):
