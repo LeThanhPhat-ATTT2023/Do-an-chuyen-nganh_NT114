@@ -5,3 +5,5 @@ onnxruntime>=1.18
 scipy>=1.11
 scikit-learn>=1.3
 pyarrow>=14.0
+psutil>=5.9
+matplotlib>=3.8

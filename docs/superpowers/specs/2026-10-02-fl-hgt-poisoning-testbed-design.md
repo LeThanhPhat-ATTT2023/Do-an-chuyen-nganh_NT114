@@ -1,6 +1,6 @@
 # FL-HGT poisoning testbed — thiết kế
 
-**Ngày:** 2026-10-02 · **Cập nhật:** 2026-10-15 (điều chỉnh theo yêu cầu của giảng viên)
+**Ngày:** 2026-10-02 · **Cập nhật:** 2026-10-15 (điều chỉnh theo yêu cầu của giảng viên), 2026-10-18 (sửa sau review cuối)
 **Nhánh:** `feat/fl-poisoning-testbed`
 **Đầu vào:** `Tong_hop_4_bai_bao_Anti_Poisoning_FL_HGT_IDS.docx` (SecureDyn-FL, BPFLH,
 multi-signal fingerprinting, dual watermark) + đề cương FL đã chốt
@@ -82,9 +82,9 @@ tổng hợp nhỏ (`outputs/v3_ob` không có ở local).
 | Đặc trưng host | Tính lại `host_x` từ flow của client (bản gốc tổng hợp trên toàn bộ flow → rò rỉ chéo client) |
 | Chuẩn hóa flow | Round 0: client gửi moment `(n, Σx, Σx²)` của `flow_x`; server ra mean/std chung (dùng cho HGT và MLP) |
 | Đánh giá | Experiment-only: model global chấm trên val/test toàn cục (cùng giao thức centralized). **Round cuối là chỉ số chính**; best-val báo cáo kèm |
-| Biết f | Krum/DnC/Trimmed Mean dùng `assumed_malicious_ratio = 0.2` của defense, **cố định** trong mọi thí nghiệm, không lấy từ attack |
+| Biết f | Krum/DnC/Trimmed Mean (và `β` của `RAGuard`) dùng `assumed_malicious_ratio = 0.2` của defense, **cố định** trong mọi thí nghiệm, không lấy từ attack; `run_experiment` từ chối `defense.aggregator.params` ghi đè tỉ lệ này (`beta`, `trim_ratio`, `trim_k`, `f`, `f_ratio`) — chỉ thử độ nhạy ngoại tuyến bằng `offline_eval` |
 | Attacker | 20% (4/20) trong ma trận chính; vị trí cố định theo seed; thêm kịch bản cả nhóm attacker nằm trong một nhóm gateway; tấn công từ round 1, thêm kịch bản bắt đầu muộn |
-| Seed | 1 seed cho ma trận; 3 seed cho các kết quả chính |
+| Seed | 1 seed (42) cho ma trận; 3 seed (42, 43, 44, dữ liệu đầy đủ) cho các kết quả chính |
 
 ## 3. Kiến trúc
 
@@ -169,11 +169,25 @@ HGT, MLP và CNN, và test nhanh trên vector ngẫu nhiên.
 - **Số lượng (không ngẫu nhiên):** `n[k, c] = floor(f[k, c] · N_c + 1e-9)` (dung sai tránh lỗi làm
   tròn float); phần dư giao cho client có phần lẻ lớn nhất (largest remainder), hòa thì client có chỉ
   số nhỏ hơn.
-- **Chọn flow (không ngẫu nhiên):** sắp flow train của lớp c theo thời gian bắt đầu flow (nếu
-  metadata có `flow_start_ts`), nếu không theo flow id (ghi vào `partition.json` là `ordered_by`); cắt thành các đoạn liên tiếp dài `n[1, c], n[2, c], …`,
+- **Chọn flow (không ngẫu nhiên):** sắp flow train của lớp c theo thời gian bắt đầu flow — cột
+  `flow_start_ts` của `flow_x` (có tên trong `metadata.flow_feature_names`; dự phòng: khóa
+  `metadata.flow_start_ts`), nếu không có thì theo flow id (ghi vào `partition.json` là `ordered_by`);
+  hòa thời gian thì theo flow id. Cắt thành các đoạn liên tiếp dài `n[1, c], n[2, c], …`,
   giao lần lượt cho client 1, 2, … Mỗi gateway thấy một khoảng thời gian liên tục của traffic.
-- `max_flows_per_client` (tầng gọn): co bảng theo tỉ lệ bằng largest remainder, lấy **phần đầu** của
-  mỗi đoạn — vẫn xác định.
+- `max_flows_per_client` (tầng gọn): **co cả bảng theo cùng một hệ số** để tỉ lệ client × lớp vẫn
+  là của `f` (bản trước co riêng từng hàng client ⇒ ở p80 tỉ lệ DDoS nằm trong nhóm G1 tụt từ 0,85
+  xuống 0,54):
+  - bảng đầy đủ `n = explicit_counts(f, N)` như trên; nếu `max_k Σ_c n[k, c] ≤ cap` thì không đổi gì.
+  - ngược lại tìm hệ số `s`: bắt đầu `s = cap / max_k Σ_c n[k, c]`; chừng nào tổng lớn nhất của một
+    client vẫn `> cap` thì `s *= cap / tổng đó`. Bảng gọn `n' = explicit_counts(f, floor(s · N_c + 1e-9))`
+    (cùng tỉ lệ, cùng quy tắc hòa) — xác định.
+  - client k giữ `n'[k, c]` flow **đầu tiên** (theo thời gian) của đoạn dữ liệu đầy đủ của nó ở lớp c
+    (vẫn quy tắc "phần đầu mỗi đoạn"); bắt buộc `n'[k, c] ≤ n[k, c]`, sai ⇒ `AssertionError`.
+    Largest remainder không đơn điệu theo tổng (nghịch lý Alabama) nên điều này có thể sai với lớp
+    rất nhỏ (ví dụ 5 flow/lớp, p = 50%, cap 11); quét tổng hợp với mỗi lớp ≥ 200 flow không gặp lần nào.
+  - `partition.json` lưu `n'` trong `counts` và `params.cap_scale = s` (1 nếu cap không ràng buộc);
+    kiểm `min_flows_per_client` sau khi co.
+  - IID/Dirichlet giữ cách subsample phân tầng theo từng client như cũ.
 - Kiểm tra khi dựng: tổng `f[·, c] = 1` cho mọi lớp; nhóm không giao nhau và phủ đủ K client; mỗi
   client ≥ `min_flows_per_client`; sai → `ValueError` trước khi train.
 - `partition.json` lưu bảng số lượng `(K, C)` và tham số; `scripts/fl/export_partition_table.py`
@@ -374,7 +388,8 @@ Min-Max ràng buộc theo từng nhóm) là khảo sát bổ sung có điều ki
    với trọng số theo số mẫu.
 3. `W_{t+1} = W_t + η·Δ_agg` (`server_lr`, mặc định 1.0). Ghi `prev_aggregate`.
 4. Trả `RoundReport`: id client, quyết định (aggregator lọc như Krum/SignGuard/DnC: không được chọn
-   ⇒ `reject`), trust, đặc trưng, norm, thời gian.
+   ⇒ `reject`), trust, đặc trưng, norm, thời gian, `screened` (aggregator có trả phán quyết từng
+   client — `decisions` hoặc `selected` — hay không).
 5. Tùy chọn `save_deltas: true`: lưu `(N, D)` của round (float16; tràn float16 thì round đó tự lùi về float32) để chấm phát hiện ngoại tuyến.
 
 Server không bao giờ nhận cờ "là attacker"; simulation tự đối chiếu sau khi server trả kết quả.
@@ -418,7 +433,11 @@ Cache dữ liệu client khóa theo: tên mô hình + flow id của client + dig
 - Phát hiện IDS: macro-F1, weighted-F1, accuracy (nhãn gốc và clean); recall theo họ tấn công;
   FPR Benign → tấn công = `1 − recall(Benign)`.
 - Poisoning (theo round và cộng dồn): TPR phát hiện update độc hại, tỉ lệ loại nhầm client lành,
-  tỉ lệ downweight; malicious acceptance rate = 1 − TPR.
+  tỉ lệ downweight; malicious acceptance rate = 1 − TPR. Chỉ cộng dồn các round được **sàng lọc**
+  (`RoundReport.screened`: aggregator trả `decisions` hoặc `selected` — Multi-Krum, SignGuard, DnC,
+  `RAGuard`). FedAvg/Median/Trimmed Mean nhận mọi client theo định nghĩa ⇒ phát hiện **không áp
+  dụng**: các tỉ lệ là `None` và `detection.screened = false` (không phải "TPR = 0"); bản ghi round
+  vẫn giữ `detection` kèm cờ `screened`.
 - **Ngoại tuyến:** `offline_eval.py` nạp các `(N, D)` đã lưu từ một run FedAvg có attacker và cho mọi
   phòng thủ chấm lại để tính TPR/tỉ lệ loại nhầm mà không cần train lại. Macro-F1 khi bị tấn công
   vẫn cần chạy đầy đủ từng phòng thủ. Bản phát lại **bỏ qua** các message mà server trực tiếp đã
@@ -428,12 +447,17 @@ Cache dữ liệu client khóa theo: tên mô hình + flow id của client + dig
 - Chi phí: thời gian train client/round, thời gian server/round, peak RSS, peak VRAM, bytes lên/xuống
   = `4·D·|S_t|`.
 - Attack impact = F1(không attack, cùng mô hình, defense, bảng chia, seed) − F1(attack) — tính ở
-  summarizer; so sánh giữa mô hình dùng mức suy giảm tương đối.
+  summarizer (cả nhãn gốc lẫn clean); ô tham chiếu là run `fl`/`attack = none` trùng mọi nhãn trừ
+  `attack`, `malicious_ratio`, `placement`, `scenario`. So sánh giữa mô hình dùng mức suy giảm tương đối.
 
 ### 3.11 Đầu ra một run
 
 `outputs/fl/<run>/`: `config.resolved.yaml`, `partition.json` (kèm bảng số lượng), `rounds.jsonl`,
 `fl_summary.json`, `global_final.pt`, `global_best.pt`, (tùy chọn) `deltas/round_XXX.pt`.
+Mỗi dòng `rounds.jsonl` có quyết định từng client (kèm trust, trọng số, norm), `agg_info`, `scores`
+(điểm theo client của phòng thủ — suspicion/abrupt của `RAGuard`, điểm Krum, … — theo thứ tự các
+quyết định không `invalid`), `attack_info` (chẩn đoán attack như `gamma`, `z` khi round đó attack
+chạy, ngược lại `{}`), `screened` và `detection`.
 Checkpoint HGT có các key runtime cần: `model_state_dict, config, node_input_dims, edge_types,
 num_classes, num_tactics, label_names, flow_feature_stats, epoch, val_metrics, test_metrics`.
 
@@ -441,14 +465,28 @@ num_classes, num_tactics, label_names, flow_feature_stats, epoch, val_metrics, t
 
 `scripts/fl/run_matrix.py --grid <yaml> [--device cuda] [--dry-run] [--only <glob>]`: grid =
 `base_config` + `axes` + quy tắc `attack=none` ⇒ `malicious_ratio=0`; chạy tuần tự, tái dụng cache
-client, bỏ qua ô đã có `fl_summary.json`. `scripts/fl/summarize_matrix.py --root <dir>` →
-`matrix_results.csv` + bảng markdown.
+client, bỏ qua ô đã có `fl_summary.json`; ô lỗi ghi `error.txt` và in
+`[matrix] FAILED <ô>: <dòng đầu của lỗi>`. `scripts/fl/summarize_matrix.py --root <dir>` →
+`matrix_results.csv` + bảng markdown (mặc định: macro-F1 gốc/clean, loại nhầm, TPR, attack impact
+gốc/clean). Bảng markdown: mỗi run **một ô** — khóa hàng gồm mọi nhãn `label_*` trừ nhãn cột
+(`defense`) và nhãn nhóm (`partition`); nhãn mà run không có (lưới khác) để trống; hai run trùng
+mọi nhãn ⇒ `ValueError`.
 
 **Các lưới đã có** trong `configs/fl/` (số ô): `matrix_pilot` 8, `matrix_ch1` 27,
 `matrix_ch1_temporal` 9, `matrix_p0_defense` 84, `matrix_p0_ablation` 12, `matrix_p1_ratio` 18,
-`matrix_p1_group` 6, `matrix_p1_ch2` 96, `matrix_p1_seeds` 18, `matrix_p2_eacs` 4, `matrix_p2_threat` 8.
-`max_flows_per_client: 2000` và hai phòng thủ so sánh của P1/P2 (`multi_krum`, `signguard`) là
-**giá trị tạm**, chốt lại sau pilot / kết quả P0.
+`matrix_p1_group` 6, `matrix_p1_ch2` 96, `matrix_p1_seeds` 27, `matrix_p2_eacs` 4, `matrix_p2_threat` 8.
+`max_flows_per_client: 2000` được đặt **trong các grid** tầng gọn (config gốc `fl_base.yaml` và mặc
+định để `null` = dữ liệu đầy đủ); giá trị 2000 và hai phòng thủ so sánh của P1/P2 (`multi_krum`,
+`signguard`) là **giá trị tạm**, chốt lại sau pilot / kết quả P0.
+
+- `matrix_p1_seeds`: seed 42, 43, 44 trên dữ liệu đầy đủ (seed 42 là bản đối ứng dữ liệu đầy đủ của
+  các ô một seed của P0, vốn chạy tầng gọn).
+- `matrix_p0_defense`: các ô FedAvg bật `output.save_deltas` (float16) để `offline_eval` chấm lại phát
+  hiện của mọi phòng thủ.
+- `matrix_p1_ratio`, `matrix_p1_group`, `matrix_p2_threat`: trục một giá trị `partition: {p80: …}` để
+  nhãn khớp các ô `none` của P0 (attack impact khi tóm tắt thư mục cha chứa cả hai gốc);
+  `matrix_p1_group` thêm trục một giá trị `placement: {g2: …}` để không trùng ô với P0 trong bảng
+  markdown (`placement` cũng bị bỏ qua khi ghép attack impact).
 
 Ma trận thu gọn theo ưu tiên (số run là ước lượng; chốt sau pilot):
 
@@ -460,7 +498,7 @@ Ma trận thu gọn theo ưu tiên (số run là ước lượng; chốt sau pil
 | Quét tỉ lệ attacker | 3 phòng thủ × 2 attack × {10%, 30%, 40%} | ~18 | P1 |
 | Attacker cùng nhóm | 3 phòng thủ × 2 attack, `placement: group:G2` | ~6 | P1 |
 | CH2 (MLP, CNN) | 2 mô hình × 2 mức lệch × 6 tình huống × 4 phòng thủ (FedAvg, 2 so sánh mạnh nhất, `RAGuard`) | ~96 | P1 |
-| 3 seed | các kết quả chính | ~20 | P1 |
+| 3 seed | các kết quả chính, seed 42/43/44, dữ liệu đầy đủ | ~27 | P1 |
 | FL có EACS (HGT) | không attack, lệch 80% | ~4 | P2 |
 | Bắt đầu muộn, `partial`, ablation PMI | | ~10–15 | P2 |
 
@@ -471,10 +509,12 @@ dùng dữ liệu đầy đủ.
 ## 4. Xử lý lỗi
 
 - Config sai (tên model/attack/aggregator/defense lạ, tham số lạ, mode/monitor lạ) → `ValueError`
-  khi dựng, trước khi train. `k ≥ N/2` cho trimmed mean hoặc Krum thiếu `N > 2f + 2` → `ValueError`
+  khi dựng, trước khi train. `defense.aggregator.params` ghi đè tỉ lệ attacker giả định (`beta`,
+  `trim_ratio`, `trim_k`, `f`, `f_ratio`) → `ValueError` từ `run_experiment` (các hàm dựng vẫn nhận,
+  cho unit test và `offline_eval`). `k ≥ N/2` cho trimmed mean hoặc Krum thiếu `N > 2f + 2` → `ValueError`
   lúc aggregate.
 - Bảng tường minh: tổng tỉ lệ một lớp ≠ 1, nhóm giao nhau/không phủ đủ, client dưới
-  `min_flows_per_client` → `ValueError`.
+  `min_flows_per_client` → `ValueError`; bảng gọn có ô lớn hơn đoạn dữ liệu đầy đủ → `AssertionError`.
 - Dirichlet không đạt `min_flows_per_client` sau 100 lần → `ValueError` gợi ý tăng α.
 - Model có buffer không phải float (ví dụ BatchNorm) → `ValueError` từ `ParamLayout`.
 - Delta không hữu hạn/sai kích thước/sai round → `invalid`, bị loại, ghi log; round không có delta
@@ -501,7 +541,11 @@ Mọi test chạy CPU, dưới `tests/federated/`:
 - `offline_eval`: chấm lại trên delta đã lưu cho cùng quyết định như chạy trực tiếp.
 - `server`: cập nhật W đúng; từ chối NaN/sai round.
 - Smoke: `run_experiment` 3 client × 2 round × 1 attacker sign-flip cho **cả ba mô hình**; tạo đủ
-  file đầu ra; checkpoint dựng lại được model; `centralized`, `local_only` chạy được.
+  file đầu ra; checkpoint dựng lại được model; `centralized`, `local_only` chạy được; FedAvg ⇒ phát
+  hiện không áp dụng (`screened = false`, tỉ lệ `None`); `RAGuard` + Min-Max ⇒ ở round 1 attacker có
+  suspicion cao nhất và không được `accept`.
+- `matrix`: bảng markdown mỗi run một ô (trùng nhãn ⇒ `ValueError`); attack impact ghép được giữa
+  các gốc lưới P0/P1/P2; mọi lưới gộp lại không trùng ô.
 - Chạy lại toàn bộ `tests/`.
 
 ## 6. Giới hạn ghi vào luận văn
@@ -517,6 +561,9 @@ Mọi test chạy CPU, dưới `tests/federated/`:
   hoặc không có mẫu của lớp đó.
 - MLP/CNN không có nhóm quan hệ ⇒ `RAGuard` suy biến; đây là đối chứng chủ đích.
 - Đánh giá dùng dữ liệu toàn cục (experiment-only), không phải một bước của giao thức FL.
+- `host_x` tính lại theo client khi train nhưng mô hình chung được chấm trên `host_x` toàn cục →
+  thang đặc trưng host lệch (số đếm theo client nhỏ hơn nhiều so với số đếm toàn cục), bất lợi cho
+  HGT-FL trong CH1/CH2 (MLP/CNN không dùng `host_x`). Đợt này giữ nguyên mô hình; kiểm ở pilot (mục 8).
 - MSGuard và ablation bỏ nguồn PMI **không được cài đặt**.
 - Kết luận chỉ đúng trên các attack, bảng chia và tỉ lệ độc hại đã thử.
 
@@ -524,8 +571,11 @@ Mọi test chạy CPU, dưới `tests/federated/`:
 
 **Đã xong:** T1–T6 (config/records, linalg, partition IID/Dirichlet, client_graph, params, attacks)
 và **T7–T16** (server/metrics, models + adapter, simulation + cli, bảng tường minh, MLP/CNN, aggregators,
-`RAGuard`, lưu delta + offline_eval, matrix + scripts + configs, tài liệu). `tests/federated`:
-325 test pass; toàn repo (bỏ `tests/baselines`, vì venv không có `torch_geometric`): 645 passed, 3 skipped.
+`RAGuard`, lưu delta + offline_eval, matrix + scripts + configs, tài liệu), cùng đợt sửa sau review
+cuối (bảng markdown mỗi run một ô, co cả bảng ở tầng gọn, phát hiện N/A cho aggregator không phán
+quyết từng client, chẩn đoán trong `rounds.jsonl`, seed 42 dữ liệu đầy đủ, attack impact giữa các gốc
+lưới, cấm ghi đè tỉ lệ giả định, `flow_start_ts` từ `flow_x`). `tests/federated`: 347 test pass; toàn
+repo (bỏ `tests/baselines`, vì venv không có `torch_geometric`): 667 passed, 3 skipped.
 
 **Thứ tự đã thực hiện** (đưa vòng FL tối giản lên trước để chạy CH1 sớm):
 
@@ -550,6 +600,13 @@ Plan chi tiết: `docs/superpowers/plans/2026-10-02-fl-hgt-poisoning-testbed.md`
   phòng thủ so sánh (có làm MSGuard không); sửa đề cương (20 client, 2 baseline MLP/CNN, XAI làm sau,
   MITM sang hướng phát triển).
 - **Số liệu từ server:** số flow train từng lớp cho split ngẫu nhiên và theo thời gian
-  (`outputs/v3_ob/splits.json`); metadata có thời gian bắt đầu flow hay không (quy tắc chọn flow).
+  (`outputs/v3_ob/splits.json`); với số liệu này kiểm luôn bảng gọn (`max_flows_per_client`) không
+  gặp `AssertionError` của lớp rất nhỏ (mục 3.1).
+- **Đã trả lời — thời gian bắt đầu flow:** v3 không ghi `metadata["flow_start_ts"]`; thời gian là cột
+  `flow_start_ts` của `flow_x` (có tên trong `metadata.flow_feature_names`) ⇒ bảng tường minh sắp flow
+  theo cột này (float64 hóa từ float32, độ phân giải ≈ 2 phút (128 s) với giây unix; hòa thì theo flow id).
 - **Pilot:** cấu hình HGT A/B, số local epoch, thời gian một run 20 × 20 → chốt ngân sách và kích
   thước ma trận.
+- **Pilot — kiểm thang `host_x` (mục 6):** chấm một model FL với `host_x` toàn cục so với `host_x` tính
+  từ hợp các flow train của client (hoặc một bản đã co thang); nếu chênh lệch đáng kể thì quyết định
+  dùng `log1p` + moment host liên kết (như moment flow ở round 0).

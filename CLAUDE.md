@@ -16,7 +16,7 @@ it (negative gap). See `docs/reports/2026-06-13-eacs-vs-baselines.md`.
 - Interpreter: **`D:\v\nt114\Scripts\python.exe`** (Python 3.14).
 - Installed: numpy 2.4.4, pandas 3.0.2, scipy 1.17.1, torch 2.14 CPU, scikit-learn 1.8.0, dpkt, scapy, pytest 9.0.3, psutil, matplotlib. `torch_geometric` is NOT installed, so `tests/baselines` cannot run locally: use `pytest tests -q --ignore=tests/baselines`.
 - Always run project scripts with this interpreter, e.g.:
-  `D:\v\nt114\Scripts\python.exe -m pytest tests/ -q`
+  `D:\v\nt114\Scripts\python.exe -m pytest tests/ -q --ignore=tests/baselines`
 - Machine: 16 logical CPUs, ~16 GB RAM. CPU-only torch locally; full HGT training runs on a remote L40S (48 GB) VM.
 
 ## Local data
@@ -157,7 +157,9 @@ D:\v\nt114\Scripts\python.exe -m graphslm_ids.offline.federated.offline_eval --r
 D:\v\nt114\Scripts\python.exe -m pytest tests/federated -q
 ```
 
-Per-run output in `outputs/fl/<run>/`: `config.resolved.yaml`, `partition.json` (with the count table), `rounds.jsonl`, `fl_summary.json`, `global_final.pt`, `global_best.pt`, and optionally `deltas/round_XXX.pt` (`output.save_deltas=true`). The matrix runner also writes `matrix_results.csv` and a markdown table per grid root.
+Per-run output in `outputs/fl/<run>/`: `config.resolved.yaml`, `partition.json` (with the count table), `rounds.jsonl` (per round: decisions with trust, defense `scores`, `attack_info`, `screened`, detection counts), `fl_summary.json`, `global_final.pt`, `global_best.pt`, and optionally `deltas/round_XXX.pt` (`output.save_deltas=true`; on in the P0 FedAvg cells). The matrix runner also writes `matrix_results.csv` and a markdown table per grid root (one cell per run; summarizing a parent folder of several grid roots also fills the P1/P2 attack impact).
+
+Rules worth knowing: detection rates are `None` (`detection.screened = false`) for aggregators that give no per-client verdict (FedAvg, Median, Trimmed Mean); `run_experiment` rejects `defense.aggregator.params` that override the fixed `assumed_malicious_ratio = 0.2` (`beta`, `trim_ratio`, `trim_k`, `f`, `f_ratio`; vary them only offline with `offline_eval`); `max_flows_per_client` (set to 2000 in the grids, null in the base config) shrinks the whole explicit table by one scale (`partition.json` `params.cap_scale`) so the class shares survive.
 
 ## Diagnosis history (v1, May 2026)
 v1 HGT plateaued at macro-F1 ≈ 0.12. Root cause was the input pipeline, not the recipe:
