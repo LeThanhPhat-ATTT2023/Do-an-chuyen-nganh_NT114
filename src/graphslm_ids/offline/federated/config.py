@@ -59,7 +59,7 @@ DEFAULT_FL_CONFIG: dict[str, Any] = {
     },
     "partition": {
         "scheme": "dirichlet",
-        "num_clients": 10,
+        "num_clients": 20,
         "alpha": 0.5,
         "min_flows_per_client": 50,
         "max_flows_per_client": None,
@@ -107,7 +107,7 @@ DEFAULT_FL_CONFIG: dict[str, Any] = {
     },
     "federated": {
         "mode": "fl",
-        "rounds": 30,
+        "rounds": 20,
         "participation": 1.0,
         "server_lr": 1.0,
         "seed": 42,
@@ -121,11 +121,8 @@ DEFAULT_FL_CONFIG: dict[str, Any] = {
         "params": {},
     },
     "defense": {
-        "clip": {"mode": "none", "factor": 1.0, "value": None},
-        "screen": {"name": "none", "params": {}},
         "aggregator": {"name": "fedavg", "params": {}},
         "assumed_malicious_ratio": 0.2,
-        "relation_aware": False,
         "weighting": "samples",
     },
     "eval": {
@@ -144,7 +141,6 @@ DEFAULT_FL_CONFIG: dict[str, Any] = {
 OPEN_SUBTREES: tuple[str, ...] = (
     "experiment.labels",
     "attack.params",
-    "defense.screen.params",
     "defense.aggregator.params",
     "sampler.fanouts",
     "sampler.reverse_fanouts",

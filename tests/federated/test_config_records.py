@@ -237,3 +237,17 @@ def test_write_json_failure_keeps_previous_file_and_leaves_no_tmp_file(tmp_path)
         write_json(target, {"bad": object()})
     assert json.loads(target.read_text(encoding="utf-8")) == {"k": 1}
     assert [p.name for p in tmp_path.iterdir()] == ["x.json"]
+
+
+# --- revised defaults (20 clients x 20 rounds, no screener/clip/relation-aware) ---------------
+
+
+def test_defaults_follow_the_revised_spec():
+    cfg = load_fl_config(None)
+    assert cfg["federated"]["rounds"] == 20 and cfg["partition"]["num_clients"] == 20
+    assert cfg["federated"]["participation"] == 1.0
+    assert set(cfg["defense"]) == {"aggregator", "assumed_malicious_ratio", "weighting"}
+    assert cfg["defense"]["aggregator"] == {"name": "fedavg", "params": {}}
+    assert cfg["defense"]["assumed_malicious_ratio"] == 0.2
+    assert unknown_keys(apply_overrides(cfg, {"defense.aggregator.params.anything": 1})) == []
+    assert unknown_keys({"defense": {"screen": {"name": "x"}}}) == ["defense.screen"]
