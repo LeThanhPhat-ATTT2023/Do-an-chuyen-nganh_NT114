@@ -1,9 +1,11 @@
 import importlib.util
+import itertools
 from pathlib import Path
 
 import pytest
 import yaml
 
+from graphslm_ids.offline.federated import matrix
 from graphslm_ids.offline.federated.matrix import (
     add_attack_impact,
     expand_grid,
@@ -96,7 +98,8 @@ def test_matrix_scripts(smoke_cfg, tmp_path, capsys):
     assert _load_script("run_matrix").main(["--grid", str(grid_path), "--only", "none__*"]) == 0
     assert _load_script("summarize_matrix").main(["--root", str(tmp_path / "matrix")]) == 0
     assert (tmp_path / "matrix" / "matrix_results.csv").exists()
-    assert (tmp_path / "matrix" / "matrix_results.md").exists()
+    md = (tmp_path / "matrix" / "matrix_results.md").read_text(encoding="utf-8")
+    assert "impact_final_test_macro_f1_clean" in md
 
 
 def test_failed_cell_is_rerun_on_resume(smoke_cfg, tmp_path):
@@ -157,3 +160,56 @@ def test_run_grid_rejects_a_typo_before_training(smoke_cfg, tmp_path):
     with pytest.raises(ValueError, match="agregator"):
         run_grid(grid_path)
     assert not (tmp_path / "matrix").exists()
+
+
+def _row(name, value, **labels):
+    return {"name": name, "mode": "fl", "attack": "none", "final_test_macro_f1": value, **{f"label_{k}": v for k, v in labels.items()}}
+
+
+def test_pivot_gives_every_run_its_own_cell():
+    combos = list(itertools.product(("centralized", "local_only", "fl"), ("hgt", "mlp", "cnn"), ("p0", "p50", "p80")))
+    rows = [_row(f"{m}__{mo}__{p}", 0.01 * (i + 1), mode=m, model=mo, partition=p, defense="fedavg") for i, (m, mo, p) in enumerate(combos)]
+    md = pivot_markdown(rows)
+    assert md.count("| mode | model | fedavg |") == 3
+    for i, (m, mo, _p) in enumerate(combos):
+        assert md.count(f"| {m} | {mo} | {0.01 * (i + 1):.4f} |") == 1
+    # A label missing from some rows (runs of two grid roots) is a blank, not a merge.
+    mixed = pivot_markdown([*rows, _row("temporal_fl_p0", 0.99, mode="fl", partition="p0", defense="fedavg")])
+    assert "| fl |  | 0.9900 |" in mixed and "| fl | hgt | 0.1900 |" in mixed
+
+
+def test_pivot_rejects_two_runs_in_one_cell():
+    rows = [_row("a", 0.5, attack="alie", defense="fedavg", partition="p80"), _row("b", 0.6, attack="alie", defense="fedavg", partition="p80")]
+    with pytest.raises(ValueError, match="'a'.*'b'|'b'.*'a'"):
+        pivot_markdown(rows)
+
+
+def test_attack_impact_matches_across_grid_roots():
+    clean = {"final_test_macro_f1": 0.9, "final_test_macro_f1_clean": 0.8}
+    rows = [
+        {"name": "p0", "mode": "fl", "attack": "none", "label_partition": "p80", "label_attack": "none", "label_defense": "raguard", **clean},
+        {"name": "p1_ratio", "mode": "fl", "attack": "alie", "label_partition": "p80", "label_defense": "raguard", "label_attack": "alie",
+         "label_malicious_ratio": "0.3", "final_test_macro_f1": 0.5, "final_test_macro_f1_clean": 0.4},
+        {"name": "p1_group", "mode": "fl", "attack": "alie", "label_partition": "p80", "label_defense": "raguard", "label_attack": "alie",
+         "label_placement": "g2", "final_test_macro_f1": 0.6, "final_test_macro_f1_clean": 0.5},
+        {"name": "p2_threat", "mode": "fl", "attack": "min_max", "label_partition": "p80", "label_defense": "raguard", "label_attack": "min_max",
+         "label_scenario": "late_start", "final_test_macro_f1": 0.7, "final_test_macro_f1_clean": 0.6},
+    ]
+    out = {r["name"]: r for r in add_attack_impact(rows)}
+    assert out["p1_ratio"]["impact_final_test_macro_f1"] == pytest.approx(0.4)
+    assert out["p1_group"]["impact_final_test_macro_f1"] == pytest.approx(0.3)
+    assert out["p2_threat"]["impact_final_test_macro_f1"] == pytest.approx(0.2)
+    assert out["p2_threat"]["impact_final_test_macro_f1_clean"] == pytest.approx(0.2)
+
+
+def test_failed_cell_prints_the_first_line_of_the_error(smoke_cfg, tmp_path, monkeypatch, capsys):
+    grid_path = _grid(smoke_cfg, tmp_path)
+
+    def boom(cfg, *, out_dir, context):
+        raise ValueError("bad thing\nsecond line")
+
+    monkeypatch.setattr(matrix, "run_experiment", boom)
+    assert run_grid(grid_path, only="none__*") == [{"name": "none__m0__fedavg", "status": "failed"}]
+    out = capsys.readouterr().out
+    assert "[matrix] FAILED none__m0__fedavg: ValueError: bad thing\n" in out and "second line" not in out
+    assert "second line" in (tmp_path / "matrix" / "none__m0__fedavg" / "error.txt").read_text(encoding="utf-8")

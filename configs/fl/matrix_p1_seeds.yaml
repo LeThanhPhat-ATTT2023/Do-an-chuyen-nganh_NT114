@@ -1,4 +1,5 @@
-# P1 extra seeds (18 cells): HGT, p80, attack x defense x seed {43, 44}, 20% attackers, full data.
+# P1 seeds (27 cells): HGT, p80, attack x defense x seed {42, 43, 44}, 20% attackers, full data
+# (seed 42 is the full-data counterpart of the single-seed P0 cells, which run on compact data).
 # `multi_krum` is a placeholder for "the two strongest comparison defenses" (only one is used
 # here; `signguard` is the other placeholder): replace it after the P0 results (spec 3.12).
 base_config: configs/fl/fl_base.yaml
@@ -18,5 +19,6 @@ axes:
     multi_krum: {defense.aggregator: {name: multi_krum}}
     raguard: {defense.aggregator: {name: raguard}}
   seed:
+    "42": {federated.seed: 42, partition.seed: 42}
     "43": {federated.seed: 43, partition.seed: 43}
     "44": {federated.seed: 44, partition.seed: 44}

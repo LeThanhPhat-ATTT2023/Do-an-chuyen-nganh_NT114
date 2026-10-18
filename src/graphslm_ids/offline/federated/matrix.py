@@ -21,8 +21,9 @@ from graphslm_ids.offline.federated.context import data_key, load_context
 from graphslm_ids.offline.federated.simulation import run_experiment
 
 IMPACT_METRICS = ("final_test_macro_f1", "final_test_macro_f1_clean")
-# Labels that describe the attack itself: they differ between a cell and its no-attack reference.
-ATTACK_LABELS = ("label_attack", "label_malicious_ratio", "label_placement")
+# Labels that describe the attack itself (``scenario``: when it starts, what it knows): they differ
+# between a cell and its no-attack reference.
+ATTACK_LABELS = ("label_attack", "label_malicious_ratio", "label_placement", "label_scenario")
 _SORT_LABELS = ("split", "model", "partition", "seed")
 
 
@@ -104,9 +105,11 @@ def run_grid(
             run_experiment(cfg, out_dir=out, context=ctx)
             (out / "error.txt").unlink(missing_ok=True)
             results.append({"name": cell["name"], "status": "done"})
-        except Exception:
+        except Exception as exc:
             out.mkdir(parents=True, exist_ok=True)
             (out / "error.txt").write_text(traceback.format_exc(), encoding="utf-8")
+            first = (f"{type(exc).__name__}: {exc}".splitlines() or [type(exc).__name__])[0]
+            print(f"[matrix] FAILED {cell['name']}: {first}", flush=True)
             results.append({"name": cell["name"], "status": "failed"})
             if fail_fast:
                 raise
@@ -174,7 +177,8 @@ def add_attack_impact(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """impact = metric(no-attack reference) - metric(cell).
 
     The reference of a cell is the ``fl`` / ``attack == none`` row whose labels equal the cell's
-    on everything except the attack, its ratio and its placement.
+    on everything except ``ATTACK_LABELS`` (the attack, its ratio, placement and scenario), so a
+    P1/P2 cell finds its P0 reference when a parent folder of both grid roots is summarized.
     """
 
     def key(r: dict[str, Any]) -> tuple:
@@ -222,16 +226,39 @@ def pivot_markdown(
     col_key: str = "label_defense",
     group_key: str = "label_partition",
 ) -> str:
+    """One markdown table of ``value`` per ``group_key`` value, columns ``col_key``.
+
+    A table row is keyed by every ``label_*`` column present in ``rows`` except ``col_key`` and
+    ``group_key`` (``row_keys`` that are present first, the rest sorted), so runs that differ in
+    any label never share a cell; a label a run lacks (another grid root) is blank. Two runs with
+    identical labels would share a cell: ``ValueError``.
+    """
+    present = {k for r in rows for k in r if k.startswith("label_") or k in row_keys} - {col_key, group_key}
+    keys_order = [k for k in row_keys if k in present] + sorted(present.difference(row_keys))
+
+    def label(r: dict[str, Any], key: str) -> str:
+        return "" if r.get(key) is None else str(r.get(key))
+
     lines: list[str] = []
     for group in sorted({str(r.get(group_key)) for r in rows}):
         sub = [r for r in rows if str(r.get(group_key)) == group]
         cols = sorted({str(r.get(col_key)) for r in sub})
-        keys = sorted({tuple(str(r.get(k)) for k in row_keys) for r in sub})
-        cell = {(tuple(str(r.get(k)) for k in row_keys), str(r.get(col_key))): r.get(value) for r in sub}
+        cell: dict[tuple[tuple[str, ...], str], Any] = {}
+        owner: dict[tuple[tuple[str, ...], str], Any] = {}
+        for r in sub:
+            at = (tuple(label(r, k) for k in keys_order), str(r.get(col_key)))
+            if at in owner:
+                raise ValueError(
+                    f"runs {owner[at]!r} and {r.get('name')!r} have identical labels {dict(zip(keys_order, at[0]))} "
+                    f"({group_key}={group}, {col_key}={at[1]}); they would share one pivot cell"
+                )
+            owner[at] = r.get("name")
+            cell[at] = r.get(value)
+        keys = sorted({rk for rk, _c in cell})
         lines.append(f"### {group_key.removeprefix('label_')} = {group} - {value}")
         lines.append("")
-        lines.append("| " + " | ".join([*(k.removeprefix("label_") for k in row_keys), *cols]) + " |")
-        lines.append("|" + "---|" * (len(row_keys) + len(cols)))
+        lines.append("| " + " | ".join([*(k.removeprefix("label_") for k in keys_order), *cols]) + " |")
+        lines.append("|" + "---|" * (len(keys_order) + len(cols)))
         for rk in keys:
             lines.append("| " + " | ".join([*rk, *(_fmt(cell.get((rk, c))) for c in cols)]) + " |")
         lines.append("")

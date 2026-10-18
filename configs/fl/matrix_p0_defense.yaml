@@ -1,5 +1,6 @@
 # P0 defense comparison (84 cells): HGT, partition x attack x defense, 20% attackers, compact data.
-# `max_flows_per_client: 2000` is a placeholder to be fixed after the pilot.
+# `max_flows_per_client: 2000` is a placeholder to be fixed after the pilot. The FedAvg cells save
+# their per-round deltas (float16) so offline_eval can replay every defense on them.
 base_config: configs/fl/fl_base.yaml
 output_root: outputs/fl/matrix_p0_defense
 name_template: "{partition}__{attack}__{defense}"
@@ -19,7 +20,7 @@ axes:
     min_sum: {attack.name: min_sum}
     scale_sign: {attack.name: scale_sign}
   defense:
-    fedavg: {defense.aggregator: {name: fedavg}}
+    fedavg: {defense.aggregator: {name: fedavg}, output.save_deltas: true}
     median: {defense.aggregator: {name: median}}
     trimmed_mean: {defense.aggregator: {name: trimmed_mean}}
     multi_krum: {defense.aggregator: {name: multi_krum}}

@@ -19,6 +19,7 @@ DEFAULT_VALUES = [
     "benign_false_rejection",
     "detect_tpr",
     "impact_final_test_macro_f1",
+    "impact_final_test_macro_f1_clean",
 ]
 
 
