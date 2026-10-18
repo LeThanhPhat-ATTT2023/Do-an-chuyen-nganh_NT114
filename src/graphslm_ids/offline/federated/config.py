@@ -44,6 +44,7 @@ DEFAULT_FL_CONFIG: dict[str, Any] = {
         "clean_eval_labels": None,
     },
     "model": {
+        "name": "hgt",
         "hidden_dim": 64,
         "num_layers": 2,
         "num_heads": 4,

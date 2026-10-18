@@ -137,3 +137,46 @@ def tiny_artifact(tiny_paths):
     return load_v3_artifact(
         tiny_paths["graph_npz"], tiny_paths["graph_meta_json"], packet_dtype="float32"
     )
+
+
+@pytest.fixture
+def smoke_cfg(tiny_paths, tmp_path):
+    """Factory: CPU smoke config on the tiny artifact writing to tmp_path/<name>."""
+    from graphslm_ids.offline.federated.config import apply_overrides, load_fl_config
+
+    def make(name: str = "run", **overrides):
+        base = {
+            "data.graph_npz": str(tiny_paths["graph_npz"]),
+            "data.graph_meta_json": str(tiny_paths["graph_meta_json"]),
+            "data.splits_json": str(tiny_paths["splits_json"]),
+            "data.clean_eval_labels": str(tiny_paths["clean_eval_labels"]),
+            "data.packet_dtype": "float32",
+            "model.hidden_dim": 8,
+            "model.num_layers": 2,
+            "model.num_heads": 2,
+            "model.dropout": 0.0,
+            "sampler.hops": 2,
+            "partition.scheme": "iid",
+            "partition.num_clients": 3,
+            "partition.min_flows_per_client": 1,
+            "partition.max_flows_per_client": None,
+            "partition.seed": 0,
+            "client.batch_seed_flows": 8,
+            "client.gcl.enabled": True,
+            "client.gcl.class_technique_map_csv": str(tiny_paths["class_technique_map_csv"]),
+            "client.eacs.enabled": True,
+            "client.eacs.anchor_mask_npy": str(tiny_paths["anchor_mask_npy"]),
+            "client.eacs.warmup_rounds": 1,
+            "client.eacs.suspect_classes": ["XSS"],
+            "federated.rounds": 2,
+            "federated.seed": 0,
+            "eval.every": 1,
+            "eval.monitor": "val_macro_f1_clean",
+            "eval.batch_seed_flows": 16,
+            "output.dir": str(tmp_path / name),
+            "device": "cpu",
+        }
+        base.update(overrides)
+        return apply_overrides(load_fl_config(None), base)
+
+    return make
