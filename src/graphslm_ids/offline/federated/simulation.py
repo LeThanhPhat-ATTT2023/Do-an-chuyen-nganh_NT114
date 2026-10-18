@@ -15,6 +15,7 @@ best-validation round is reported alongside.
 from __future__ import annotations
 
 import hashlib
+import json
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -59,13 +60,17 @@ from graphslm_ids.offline.training.train_hgt_flow_classifier import resolve_devi
 VALID_MODES = ("fl", "centralized", "local_only")
 VALID_MONITORS = ("val_macro_f1", "val_macro_f1_clean", "val_loss")
 
-# The centralized upper bound: one silo, no adversary, plain FedAvg, always participating.
+# The centralized upper bound: one silo, no adversary, plain FedAvg, always participating,
+# exactly one full epoch per round and an unscaled server step.
 CENTRALIZED_OVERRIDES: dict[str, Any] = {
     "client.optimizer_state": "persist",
+    "client.local_epochs": 1,
+    "client.max_local_steps": None,
     "attack.name": "none",
     "attack.malicious_ratio": 0.0,
     "defense.aggregator": {"name": "fedavg", "params": {}},
     "federated.participation": 1.0,
+    "federated.server_lr": 1.0,
 }
 # Local-only clients train alone for every round, so Adam moments carry across rounds.
 LOCAL_ONLY_OVERRIDES: dict[str, Any] = {"client.optimizer_state": "persist"}
@@ -195,13 +200,24 @@ def _check_config(cfg: dict[str, Any], context: ExperimentContext | None) -> str
     return mode
 
 
-def client_cache_tag(model_name: str, partition: ClientPartition) -> str:
-    """Identifies the cached per-client model data: the model plus every client's flow ids."""
+def client_cache_tag(model_name: str, partition: ClientPartition, cfg: dict[str, Any]) -> str:
+    """Identifies the cached per-client model data.
+
+    Covers the model name, every client's flow ids and the config the data is built from:
+    ``model`` and ``sampler`` (``make_sampler`` reads ``sampler.*`` and ``model.num_layers``)
+    and ``data.standardize_flow_features``. Anything else in ``data`` is fixed by the context.
+    """
     digest = hashlib.sha1()
     for ids in partition.client_flow_ids:
         arr = np.ascontiguousarray(ids, dtype=np.int64)
         digest.update(np.int64(arr.shape[0]).tobytes())
         digest.update(arr.tobytes())
+    built_from = {
+        "model": cfg["model"],
+        "sampler": cfg["sampler"],
+        "standardize_flow_features": cfg["data"].get("standardize_flow_features", True),
+    }
+    digest.update(json.dumps(to_jsonable(built_from), sort_keys=True).encode("utf-8"))
     return f"{model_name}:{digest.hexdigest()}"
 
 
@@ -212,7 +228,7 @@ def build_clients(
     seed = int(cfg["federated"].get("seed", 42))
     use_cache = bool(cfg["federated"].get("cache_clients", True))
     if use_cache:
-        tag = client_cache_tag(adapter.name, partition)
+        tag = client_cache_tag(adapter.name, partition, cfg)
         if ctx.cache_tag != tag:
             ctx.client_cache.clear()
             ctx.cache_tag = tag
@@ -362,12 +378,14 @@ def _run_federated(run: _Run) -> dict[str, Any]:
             )
         train_seconds = time.perf_counter() - t_train
         deltas = {cid: upd.delta for cid, upd in updates.items()}
-        mal_now = [c for c in participants if c in mal_set]
-        if attack_on and mal_now:
+        # Before start_round the designated attackers are honest clients: nothing to craft or grade.
+        active = mal_set if attack_on else set()
+        mal_now = [c for c in participants if c in active]
+        if mal_now:
             deltas.update(_craft(attack, knowledge, updates, participants, mal_set, mal_now, layout.numel, run.device))
         messages = [ClientMessage(c, r, deltas[c], int(run.clients[c].flow_ids.shape[0])) for c in participants]
         report = server.step(messages)
-        det = detection_counts(report.decision_map(), mal_set)
+        det = detection_counts(report.decision_map(), active)
         totals = merge_counts(totals, det)
         cost["client_train_seconds"] += train_seconds
         cost["server_seconds"] += report.seconds

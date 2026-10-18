@@ -193,3 +193,46 @@ def test_out_dir_argument_overrides_output_dir(smoke_cfg, tmp_path):
     summary = run_experiment(smoke_cfg("cfgdir", **{"federated.rounds": 1}), out_dir=tmp_path / "elsewhere")
     assert (tmp_path / "elsewhere" / "fl_summary.json").exists() and not (tmp_path / "cfgdir").exists()
     assert summary["config"]["output"]["dir"] == str(tmp_path / "elsewhere")
+
+
+def test_centralized_baseline_is_exactly_one_epoch_per_round(smoke_cfg, tmp_path):
+    odd = {"client.local_epochs": 2, "client.max_local_steps": 1, "federated.server_lr": 0.5}
+    summary = run_experiment(smoke_cfg("central_odd", **{"federated.mode": "centralized", **odd}))
+    plain = run_experiment(smoke_cfg("central_plain", **{"federated.mode": "centralized"}))
+    resolved = summary["config"]
+    assert resolved["client"]["local_epochs"] == 1 and resolved["client"]["max_local_steps"] is None
+    assert resolved["federated"]["server_lr"] == 1.0
+    assert plain["config"]["client"]["local_epochs"] == 1
+    # The overrides are in force, not just recorded: both runs take the same optimizer steps.
+    odd_first = _records(tmp_path / "central_odd" / "rounds.jsonl")[0]["client_metrics"]["0"]
+    plain_first = _records(tmp_path / "central_plain" / "rounds.jsonl")[0]["client_metrics"]["0"]
+    assert odd_first["steps"] == plain_first["steps"] > 1
+    assert summary["final"]["test"]["macro_f1"] == plain["final"]["test"]["macro_f1"]
+
+
+@pytest.mark.parametrize("override", [{"sampler.hops": 1}, {"model.num_layers": 3}, {"model.hidden_dim": 16}])
+def test_client_cache_is_rebuilt_when_model_or_sampler_config_changes(smoke_cfg, tmp_path, override):
+    cfg = smoke_cfg("cache_cfg", **{"federated.rounds": 1})
+    ctx = load_context(cfg)
+    run_experiment(cfg, context=ctx)
+    tag, cached = ctx.cache_tag, dict(ctx.client_cache)
+
+    run_experiment(cfg, out_dir=tmp_path / "same", context=ctx)
+    assert ctx.cache_tag == tag and all(ctx.client_cache[c] is cached[c] for c in cached)
+
+    run_experiment(apply_overrides(cfg, override), out_dir=tmp_path / "changed", context=ctx)
+    assert ctx.cache_tag != tag and sorted(ctx.client_cache) == sorted(cached)
+    assert all(ctx.client_cache[c] is not cached[c] for c in cached)
+
+
+def test_detection_is_graded_only_in_rounds_where_the_attack_is_active(smoke_cfg, tmp_path):
+    cfg = smoke_cfg("late", **{"attack.name": "sign_flip", "attack.malicious_ratio": 0.34, "attack.start_round": 2})
+    summary = run_experiment(cfg)
+    first, second = _records(tmp_path / "late" / "rounds.jsonl")
+    assert not first["attack_active"] and first["malicious"] == []
+    det1 = first["detection"]
+    assert det1["tp"] + det1["fn"] == 0 and det1["fp"] + det1["tn"] == 3
+    assert second["attack_active"] and second["malicious"] == summary["malicious_clients"]
+    assert len(summary["malicious_clients"]) == 1
+    assert summary["detection"]["tp"] + summary["detection"]["fn"] == 1
+    assert summary["detection"]["fp"] + summary["detection"]["tn"] == 5
