@@ -179,3 +179,12 @@ def test_partially_prefixed_relation_key_is_rejected_and_named():
 def test_model_without_relations_does_not_trigger_prefix_error():
     layout = ParamLayout.from_state_dict({"classifier.0.weight": torch.zeros(3)})
     assert layout.group_names == ["classifier"]
+
+
+def test_layout_from_groups_round_trip():
+    layout = ParamLayout.from_state_dict(
+        {"layers.0.relation_key.a__r__b.weight": torch.zeros(3), "classifier.weight": torch.zeros(2)}
+    )
+    back = ParamLayout.from_groups({g: [tuple(s) for s in spans] for g, spans in layout.groups_json().items()}, layout.numel)
+    assert back.group_names == layout.group_names and back.numel == 5
+    assert torch.equal(back.group_coords(["classifier"]), layout.group_coords(["classifier"]))

@@ -172,7 +172,12 @@ DEFAULT_FL_CONFIG: dict[str, Any] = {
         "batch_seed_flows": 512,
         "families": copy.deepcopy(DEFAULT_FAMILIES),
     },
-    "output": {"dir": "outputs/fl/fl_run", "save_checkpoints": True},
+    "output": {
+        "dir": "outputs/fl/fl_run",
+        "save_checkpoints": True,
+        "save_deltas": False,
+        "save_deltas_dtype": "float16",
+    },
     "device": "auto",
 }
 

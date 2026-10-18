@@ -51,6 +51,7 @@ from graphslm_ids.offline.federated.metrics import (
     merge_counts,
 )
 from graphslm_ids.offline.federated.models import ModelAdapter, build_adapter
+from graphslm_ids.offline.federated.offline_eval import save_round_deltas, write_delta_meta
 from graphslm_ids.offline.federated.params import ParamLayout
 from graphslm_ids.offline.federated.partition import (
     ClientPartition,
@@ -234,6 +235,9 @@ def _check_config(cfg: dict[str, Any], context: ExperimentContext | None) -> str
         raise ValueError(f"unknown config keys (typo?): {bad_keys}")
     if context is not None and context.data_key != data_key(cfg):
         raise ValueError("experiment context was loaded for a different data section")
+    dtype = str(cfg["output"].get("save_deltas_dtype", "float16"))
+    if dtype not in ("float16", "float32"):
+        raise ValueError(f"output.save_deltas_dtype must be 'float16' or 'float32', got {dtype!r}")
     rounds = int(cfg["federated"]["rounds"])
     if rounds < 1:
         raise ValueError(f"federated.rounds must be >= 1, got {rounds}")
@@ -421,6 +425,21 @@ def _run_federated(run: _Run) -> dict[str, Any]:
     }
     if run.device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(run.device)
+    save_deltas = bool(cfg["output"].get("save_deltas", False))
+    deltas_dir = run.out / "deltas"
+    deltas_dtype = str(cfg["output"].get("save_deltas_dtype", "float16"))
+    if save_deltas:
+        cost["saved_delta_dtypes"] = {}
+        write_delta_meta(
+            deltas_dir,
+            layout,
+            weighting=server.weighting,
+            server_lr=server.server_lr,
+            malicious_clients=malicious,
+            rounds=rounds,
+            assumed_malicious_ratio=float(cfg["defense"].get("assumed_malicious_ratio", 0.2)),
+            seed=seed,
+        )
     run_start = time.perf_counter()
     for r in range(1, rounds + 1):
         round_start = time.perf_counter()
@@ -445,6 +464,11 @@ def _run_federated(run: _Run) -> dict[str, Any]:
             deltas.update(_craft(attack, knowledge, updates, participants, mal_set, mal_now, layout.numel, run.device))
         messages = [ClientMessage(c, r, deltas[c], int(run.clients[c].flow_ids.shape[0])) for c in participants]
         report = server.step(messages)
+        if save_deltas:
+            ids, saved, samples = server.last_inputs or ([], torch.zeros((0, layout.numel)), torch.zeros(0))
+            cost["saved_delta_dtypes"][str(r)] = save_round_deltas(
+                deltas_dir, r, ids, saved.detach().cpu(), samples.detach().cpu(), sorted(active), deltas_dtype
+            )
         det = detection_counts(report.decision_map(), active)
         totals = merge_counts(totals, det)
         cost["client_train_seconds"] += train_seconds

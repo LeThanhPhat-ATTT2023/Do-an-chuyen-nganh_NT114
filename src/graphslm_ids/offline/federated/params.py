@@ -78,6 +78,15 @@ class ParamLayout:
         return cls(names, shapes, dtypes, offsets, offset, groups)
 
     @classmethod
+    def from_groups(cls, groups: dict[str, list[tuple[int, int]]], numel: int) -> "ParamLayout":
+        """A layout carrying only the group spans (enough for the group methods)."""
+        spans = {str(g): [(int(a), int(b)) for a, b in s] for g, s in groups.items()}
+        return cls([], [], [], [], int(numel), spans)
+
+    def groups_json(self) -> dict[str, list[list[int]]]:
+        return {g: [[int(a), int(b)] for a, b in spans] for g, spans in self.groups.items()}
+
+    @classmethod
     def from_model(cls, model: torch.nn.Module) -> "ParamLayout":
         return cls.from_state_dict(model.state_dict())
 
