@@ -1,0 +1,20 @@
+# P0 RAGuard ablation (12 cells): HGT, p80, variant x attack, 20% attackers, compact data.
+# `max_flows_per_client: 2000` is a placeholder to be fixed after the pilot.
+base_config: configs/fl/fl_base.yaml
+output_root: outputs/fl/matrix_p0_ablation
+name_template: "{variant}__{attack}"
+overrides:
+  partition.dominance: 0.8
+  attack.malicious_ratio: 0.2
+  partition.max_flows_per_client: 2000
+  output.save_checkpoints: false
+axes:
+  variant:
+    no_relation: {defense.aggregator: {name: raguard, params: {relation_aware: false}}}
+    no_temporal: {defense.aggregator: {name: raguard, params: {temporal: false}}}
+    no_downweight: {defense.aggregator: {name: raguard, params: {downweight: false}}}
+    median_agg: {defense.aggregator: {name: raguard, params: {aggregator: median}}}
+  attack:
+    none: {attack.name: none}
+    alie: {attack.name: alie}
+    min_max: {attack.name: min_max}

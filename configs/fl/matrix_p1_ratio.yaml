@@ -1,0 +1,22 @@
+# P1 attacker-ratio sweep (18 cells): HGT, p80, defense x attack x malicious ratio, compact data.
+# `multi_krum` / `signguard` are placeholders for "the two strongest comparison defenses": replace
+# them after the P0 results (spec 3.12). `max_flows_per_client: 2000` is a placeholder (pilot).
+base_config: configs/fl/fl_base.yaml
+output_root: outputs/fl/matrix_p1_ratio
+name_template: "{attack}__m{malicious_ratio}__{defense}"
+overrides:
+  partition.dominance: 0.8
+  partition.max_flows_per_client: 2000
+  output.save_checkpoints: false
+axes:
+  defense:
+    multi_krum: {defense.aggregator: {name: multi_krum}}
+    signguard: {defense.aggregator: {name: signguard}}
+    raguard: {defense.aggregator: {name: raguard}}
+  attack:
+    alie: {attack.name: alie}
+    min_max: {attack.name: min_max}
+  malicious_ratio:
+    "0.1": {attack.malicious_ratio: 0.1}
+    "0.3": {attack.malicious_ratio: 0.3}
+    "0.4": {attack.malicious_ratio: 0.4}

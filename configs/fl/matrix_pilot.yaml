@@ -1,0 +1,49 @@
+# Pilot (8 cells): HGT configuration A vs B x local epochs x partition, no attack, full data.
+# A = the base config (64/2/4, 2 hops). B = 128/4/8 with 4 hops and the full-tier fanouts.
+base_config: configs/fl/fl_base.yaml
+output_root: outputs/fl/matrix_pilot
+name_template: "{hgt_config}__e{local_epochs}__{partition}"
+overrides:
+  output.save_checkpoints: false
+axes:
+  hgt_config:
+    A: {}
+    B:
+      model.hidden_dim: 128
+      model.num_layers: 4
+      model.num_heads: 8
+      sampler.hops: 4
+      sampler.fanouts:
+        flow__contains__packet: 20
+        packet__next_packet__packet: 4
+        packet__evidence_injection__technique: 4
+        packet__evidence_command_exec__technique: 4
+        packet__evidence_file_upload__technique: 3
+        packet__evidence_recon__technique: 3
+        packet__evidence_c2_beacon__technique: 3
+        flow__from_host__host: 1
+        flow__to_host__host: 1
+        flow__burst_neighbor__flow: 6
+        flow__matches_technique__technique: 3
+        technique__has_subtechnique__technique: 2
+        technique__belongs_to_tactic__tactic: 1
+      sampler.reverse_fanouts:
+        rev_contains: 3
+        rev_next_packet: 2
+        rev_evidence_injection: 2
+        rev_evidence_command_exec: 2
+        rev_evidence_file_upload: 2
+        rev_evidence_recon: 2
+        rev_evidence_c2_beacon: 2
+        rev_from_host: 3
+        rev_to_host: 3
+        rev_burst_neighbor: 3
+        rev_matches_technique: 2
+        rev_has_subtechnique: 2
+        rev_belongs_to_tactic: 1
+  local_epochs:
+    "1": {client.local_epochs: 1}
+    "2": {client.local_epochs: 2}
+  partition:
+    p0: {partition.dominance: 0.0}
+    p80: {partition.dominance: 0.8}

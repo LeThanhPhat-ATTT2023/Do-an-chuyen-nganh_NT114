@@ -1,0 +1,192 @@
+# FL-HGT poisoning testbed - base config shared by every grid in configs/fl/.
+# HGT configuration A (64/2/4, 2-hop sampling, fanout 5-10 per relation), 20 clients on the
+# explicit gateway partition (dominance p), 20 rounds, full participation, no attack, FedAvg.
+# Grids override single keys (see configs/fl/matrix_*.yaml); every section is spelled out so a
+# typo in a grid cell is caught by unknown_keys() before training.
+experiment:
+  name: fl_base
+  labels: {}
+
+data:
+  artifact_version: v3
+  graph_npz: outputs/v3_ob/graph.npz
+  graph_meta_json: outputs/v3_ob/graph.meta.json
+  splits_json: outputs/v3_ob/splits.json
+  split_protocol: random
+  packet_dtype: preserve
+  add_reverse_edges: true
+  use_semantic_edge_weights: true
+  standardize_flow_features: true
+  clean_eval_labels: outputs/v3_ob/clean_eval_labels.npy
+
+model:
+  name: hgt
+  hidden_dim: 64
+  num_layers: 2
+  num_heads: 4
+  dropout: 0.2
+  ffn_multiplier: 2
+  mlp:
+    hidden_dims: [256, 128, 64]
+    dropout: 0.2
+  cnn:
+    num_packets: 8
+    byte_prefix: obyte_
+    channels: [32, 64, 128]
+    kernel_size: 7
+    num_groups: 8
+    dropout: 0.2
+
+sampler:
+  hops: 2
+  fanouts:
+    flow__contains__packet: 10
+    packet__next_packet__packet: 5
+    packet__evidence_injection__technique: 5
+    packet__evidence_command_exec__technique: 5
+    packet__evidence_file_upload__technique: 5
+    packet__evidence_recon__technique: 5
+    packet__evidence_c2_beacon__technique: 5
+    flow__from_host__host: 1
+    flow__to_host__host: 1
+    flow__burst_neighbor__flow: 5
+    flow__matches_technique__technique: 5
+    technique__has_subtechnique__technique: 5
+    technique__belongs_to_tactic__tactic: 5
+  reverse_fanouts:
+    rev_contains: 5
+    rev_next_packet: 5
+    rev_evidence_injection: 5
+    rev_evidence_command_exec: 5
+    rev_evidence_file_upload: 5
+    rev_evidence_recon: 5
+    rev_evidence_c2_beacon: 5
+    rev_from_host: 5
+    rev_to_host: 5
+    rev_burst_neighbor: 5
+    rev_matches_technique: 5
+    rev_has_subtechnique: 5
+    rev_belongs_to_tactic: 5
+  always_include_all_techniques: true
+  always_include_all_tactics: true
+
+partition:
+  scheme: explicit
+  num_clients: 20
+  alpha: 0.5
+  dominance: 0.8
+  groups:
+    G1: {clients: [1, 5], family: ddos}
+    G2: {clients: [6, 10], family: recon}
+    G3: {clients: [11, 14], family: web}
+    G4: {clients: [15, 16], family: other}
+    G5: {clients: [17, 20], family: null}
+  families:
+    ddos:
+      - DDoS-ACK_Fragmentation
+      - DDoS-ICMP_Flood
+      - DDoS-ICMP_Fragmentation
+      - DDoS-PSHACK_Flood
+      - DDoS-RSTFINFlood
+    recon:
+      - Recon-HostDiscovery
+      - Recon-OSScan
+      - Recon-PingSweep
+      - Recon-PortScan
+      - VulnerabilityScan
+    web:
+      - CommandInjection
+      - XSS
+      - SqlInjection
+      - Uploading_Attack
+      - BrowserHijacking
+    other:
+      - Backdoor_Malware
+      - Mirai-udpplain
+  min_flows_per_client: 50
+  max_flows_per_client: null
+  seed: 42
+
+client:
+  local_epochs: 1
+  max_local_steps: null
+  batch_seed_flows: 256
+  lr: 1.0e-3
+  lr_schedule: cosine_rounds
+  lr_min: 1.0e-5
+  weight_decay: 5.0e-5
+  adamw_eps: 1.0e-6
+  adamw_betas: [0.9, 0.95]
+  grad_clip_norm: 1.0
+  optimizer_state: reset
+  loss_type: focal
+  focal_gamma: 1.5
+  label_smoothing: 0.05
+  class_weight: balanced
+  class_weight_method: cb
+  cb_beta: 0.985
+  class_weight_cap: 4.0
+  stratified_batch_sampling: true
+  drop_edge_prob: 0.1
+  num_workers: 0
+  pin_memory: false
+  gcl:
+    enabled: true
+    weight: 0.3
+    temperature: 0.1
+    n_negatives: 16
+    class_technique_map_csv: data/mitre/class_technique_map.csv
+  eacs:
+    enabled: false
+    anchor_mask_npy: null
+    warmup_rounds: 5
+    ema_decay: 0.9
+    lambda_disambig: 0.7
+    suspect_classes: [CommandInjection, XSS, SqlInjection, Uploading_Attack]
+    mitre_dir: data/mitre
+
+federated:
+  mode: fl
+  rounds: 20
+  participation: 1.0
+  server_lr: 1.0
+  seed: 42
+  cache_clients: true
+
+attack:
+  name: none
+  malicious_ratio: 0.0
+  knowledge: omniscient
+  start_round: 1
+  placement: random
+  params: {}
+
+defense:
+  aggregator: {name: fedavg, params: {}}
+  assumed_malicious_ratio: 0.2
+  weighting: samples
+
+eval:
+  every: 1
+  max_val_flows: 5000
+  monitor: val_macro_f1_clean
+  batch_seed_flows: 512
+  families:
+    web: [CommandInjection, XSS, SqlInjection, Uploading_Attack, BrowserHijacking]
+    ddos:
+      - DDoS-ACK_Fragmentation
+      - DDoS-ICMP_Flood
+      - DDoS-ICMP_Fragmentation
+      - DDoS-PSHACK_Flood
+      - DDoS-RSTFINFlood
+    recon: [Recon-HostDiscovery, Recon-OSScan, Recon-PingSweep, Recon-PortScan, VulnerabilityScan]
+    mirai: [Mirai-udpplain]
+    malware: [Backdoor_Malware]
+
+output:
+  dir: outputs/fl/fl_base
+  save_checkpoints: true
+  save_deltas: false
+  save_deltas_dtype: float16
+
+device: cuda

@@ -1,0 +1,30 @@
+# P1 chapter 2, flat baselines (96 cells): MLP / CNN x partition x attack x defense, 20% attackers,
+# compact data. `multi_krum` / `signguard` are placeholders for "the two strongest comparison
+# defenses": replace them after the P0 results (spec 3.12). `max_flows_per_client: 2000` is a
+# placeholder to be fixed after the pilot.
+base_config: configs/fl/fl_base.yaml
+output_root: outputs/fl/matrix_p1_ch2
+name_template: "{model}__{partition}__{attack}__{defense}"
+overrides:
+  attack.malicious_ratio: 0.2
+  partition.max_flows_per_client: 2000
+  output.save_checkpoints: false
+axes:
+  model:
+    mlp: {model.name: mlp}
+    cnn: {model.name: cnn}
+  partition:
+    p0: {partition.dominance: 0.0}
+    p80: {partition.dominance: 0.8}
+  attack:
+    none: {attack.name: none}
+    sign_flip: {attack.name: sign_flip}
+    alie: {attack.name: alie}
+    min_max: {attack.name: min_max}
+    min_sum: {attack.name: min_sum}
+    scale_sign: {attack.name: scale_sign}
+  defense:
+    fedavg: {defense.aggregator: {name: fedavg}}
+    multi_krum: {defense.aggregator: {name: multi_krum}}
+    signguard: {defense.aggregator: {name: signguard}}
+    raguard: {defense.aggregator: {name: raguard}}

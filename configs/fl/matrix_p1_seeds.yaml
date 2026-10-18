@@ -1,0 +1,22 @@
+# P1 extra seeds (18 cells): HGT, p80, attack x defense x seed {43, 44}, 20% attackers, full data.
+# `multi_krum` is a placeholder for "the two strongest comparison defenses" (only one is used
+# here; `signguard` is the other placeholder): replace it after the P0 results (spec 3.12).
+base_config: configs/fl/fl_base.yaml
+output_root: outputs/fl/matrix_p1_seeds
+name_template: "{attack}__{defense}__s{seed}"
+overrides:
+  partition.dominance: 0.8
+  attack.malicious_ratio: 0.2
+  output.save_checkpoints: false
+axes:
+  attack:
+    none: {attack.name: none}
+    alie: {attack.name: alie}
+    min_max: {attack.name: min_max}
+  defense:
+    fedavg: {defense.aggregator: {name: fedavg}}
+    multi_krum: {defense.aggregator: {name: multi_krum}}
+    raguard: {defense.aggregator: {name: raguard}}
+  seed:
+    "43": {federated.seed: 43, partition.seed: 43}
+    "44": {federated.seed: 44, partition.seed: 44}

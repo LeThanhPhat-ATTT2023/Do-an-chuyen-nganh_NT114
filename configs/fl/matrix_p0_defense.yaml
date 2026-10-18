@@ -1,0 +1,28 @@
+# P0 defense comparison (84 cells): HGT, partition x attack x defense, 20% attackers, compact data.
+# `max_flows_per_client: 2000` is a placeholder to be fixed after the pilot.
+base_config: configs/fl/fl_base.yaml
+output_root: outputs/fl/matrix_p0_defense
+name_template: "{partition}__{attack}__{defense}"
+overrides:
+  attack.malicious_ratio: 0.2
+  partition.max_flows_per_client: 2000
+  output.save_checkpoints: false
+axes:
+  partition:
+    p0: {partition.dominance: 0.0}
+    p80: {partition.dominance: 0.8}
+  attack:
+    none: {attack.name: none}
+    sign_flip: {attack.name: sign_flip}
+    alie: {attack.name: alie}
+    min_max: {attack.name: min_max}
+    min_sum: {attack.name: min_sum}
+    scale_sign: {attack.name: scale_sign}
+  defense:
+    fedavg: {defense.aggregator: {name: fedavg}}
+    median: {defense.aggregator: {name: median}}
+    trimmed_mean: {defense.aggregator: {name: trimmed_mean}}
+    multi_krum: {defense.aggregator: {name: multi_krum}}
+    signguard: {defense.aggregator: {name: signguard}}
+    dnc: {defense.aggregator: {name: dnc}}
+    raguard: {defense.aggregator: {name: raguard}}

@@ -1,0 +1,22 @@
+# P2 threat-model variants (8 cells): HGT, p80, scenario x attack x defense, 20% attackers, compact data.
+# late_start = attackers turn malicious at round 10; partial = attackers know only some updates.
+# `multi_krum` is a placeholder for "the two strongest comparison defenses" (only one is used
+# here; `signguard` is the other placeholder): replace it after the P0 results (spec 3.12). `max_flows_per_client: 2000` is a placeholder to be fixed after the pilot.
+base_config: configs/fl/fl_base.yaml
+output_root: outputs/fl/matrix_p2_threat
+name_template: "{scenario}__{attack}__{defense}"
+overrides:
+  partition.dominance: 0.8
+  attack.malicious_ratio: 0.2
+  partition.max_flows_per_client: 2000
+  output.save_checkpoints: false
+axes:
+  scenario:
+    late_start: {attack.start_round: 10}
+    partial: {attack.knowledge: partial}
+  attack:
+    alie: {attack.name: alie}
+    min_max: {attack.name: min_max}
+  defense:
+    multi_krum: {defense.aggregator: {name: multi_krum}}
+    raguard: {defense.aggregator: {name: raguard}}

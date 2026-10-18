@@ -1,0 +1,17 @@
+# P0, chapter 1 under the temporal split protocol (9 cells): HGT, mode x partition, full data.
+base_config: configs/fl/fl_base.yaml
+output_root: outputs/fl/matrix_ch1_temporal
+name_template: "{mode}__{partition}"
+overrides:
+  data.split_protocol: temporal
+  model.name: hgt
+  output.save_checkpoints: false
+axes:
+  mode:
+    centralized: {federated.mode: centralized}
+    local_only: {federated.mode: local_only}
+    fl: {federated.mode: fl}
+  partition:
+    p0: {partition.dominance: 0.0}
+    p50: {partition.dominance: 0.5}
+    p80: {partition.dominance: 0.8}

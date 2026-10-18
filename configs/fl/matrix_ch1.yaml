@@ -1,0 +1,19 @@
+# P0, chapter 1 (27 cells): centralized / local-only / FL x HGT, MLP, CNN x partition, full data.
+base_config: configs/fl/fl_base.yaml
+output_root: outputs/fl/matrix_ch1
+name_template: "{mode}__{model}__{partition}"
+overrides:
+  output.save_checkpoints: false
+axes:
+  mode:
+    centralized: {federated.mode: centralized}
+    local_only: {federated.mode: local_only}
+    fl: {federated.mode: fl}
+  model:
+    hgt: {model.name: hgt}
+    mlp: {model.name: mlp}
+    cnn: {model.name: cnn}
+  partition:
+    p0: {partition.dominance: 0.0}
+    p50: {partition.dominance: 0.5}
+    p80: {partition.dominance: 0.8}

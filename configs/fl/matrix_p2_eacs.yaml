@@ -1,0 +1,20 @@
+# P2 EACS clients (4 cells): HGT, p80, EACS enabled, no attack, defense comparison, compact data.
+# `multi_krum` / `signguard` are placeholders for "the two strongest comparison defenses": replace
+# them after the P0 results (spec 3.12). `max_flows_per_client: 2000` is a placeholder (pilot).
+base_config: configs/fl/fl_base.yaml
+output_root: outputs/fl/matrix_p2_eacs
+name_template: "{defense}"
+overrides:
+  partition.dominance: 0.8
+  client.eacs.enabled: true
+  client.eacs.anchor_mask_npy: outputs/v3_ob/eacs_anchor_mask.npy
+  attack.name: none
+  attack.malicious_ratio: 0.0
+  partition.max_flows_per_client: 2000
+  output.save_checkpoints: false
+axes:
+  defense:
+    fedavg: {defense.aggregator: {name: fedavg}}
+    multi_krum: {defense.aggregator: {name: multi_krum}}
+    signguard: {defense.aggregator: {name: signguard}}
+    raguard: {defense.aggregator: {name: raguard}}
