@@ -149,3 +149,15 @@ def test_coordinate_reduction_edge_cases():
     assert torch.equal(coordinate_median(x1), x1[0])
     x = torch.randn(5, 9)
     assert torch.allclose(coordinate_trimmed_mean(x, 0, chunk=4), x.mean(0))
+
+
+def test_weighted_trimmed_mean_cases():
+    from graphslm_ids.offline.federated.linalg import weighted_trimmed_mean
+
+    x = torch.tensor([[0.0], [1.0], [2.0], [100.0]])
+    assert torch.allclose(weighted_trimmed_mean(x, torch.ones(4), 0.25), torch.tensor([1.5]))
+    assert torch.allclose(weighted_trimmed_mean(x, torch.tensor([1.0, 1.0, 1.0, 1.0]), 0.0), x.mean(0))
+    two = torch.tensor([[0.0], [10.0]])
+    assert torch.allclose(weighted_trimmed_mean(two, torch.tensor([3.0, 1.0]), 0.2), torch.tensor([0.5 / 0.6]))
+    with pytest.raises(ValueError):
+        weighted_trimmed_mean(x, torch.ones(4), 0.5)

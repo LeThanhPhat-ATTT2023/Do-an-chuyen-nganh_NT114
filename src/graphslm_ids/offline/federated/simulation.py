@@ -26,7 +26,6 @@ import numpy as np
 import torch
 import yaml
 
-from graphslm_ids.offline.federated.aggregators import build_aggregator
 from graphslm_ids.offline.federated.attacks import Attack, AttackContext, build_attack
 from graphslm_ids.offline.federated.config import apply_overrides, unknown_keys
 from graphslm_ids.offline.federated.context import (
@@ -35,6 +34,7 @@ from graphslm_ids.offline.federated.context import (
     federated_flow_stats,
     load_context,
 )
+from graphslm_ids.offline.federated.defense import build_defense
 from graphslm_ids.offline.federated.local_trainer import (
     ClientState,
     LocalTrainer,
@@ -598,7 +598,7 @@ def run_experiment(
     defense = cfg["defense"]
     # Built up front only to reject bad names / params before any work is done.
     attack = build_attack(cfg["attack"])
-    aggregator = build_aggregator(
+    aggregator = build_defense(
         defense["aggregator"],
         # The defender's fixed assumption about attackers; never derived from the attack config.
         assumed_malicious_ratio=float(defense.get("assumed_malicious_ratio", 0.2)),

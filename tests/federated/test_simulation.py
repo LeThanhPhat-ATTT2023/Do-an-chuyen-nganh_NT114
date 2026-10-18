@@ -90,13 +90,13 @@ def test_client_rng_seed_follows_the_round_client_formula(smoke_cfg, monkeypatch
 
 def test_assumed_malicious_ratio_comes_from_defense_config_only(smoke_cfg, monkeypatch):
     seen = []
-    original = simulation.build_aggregator
+    original = simulation.build_defense
 
     def spy(cfg, *, assumed_malicious_ratio, seed):
         seen.append(assumed_malicious_ratio)
         return original(cfg, assumed_malicious_ratio=assumed_malicious_ratio, seed=seed)
 
-    monkeypatch.setattr(simulation, "build_aggregator", spy)
+    monkeypatch.setattr(simulation, "build_defense", spy)
     run_experiment(smoke_cfg("amr1", **{"attack.name": "sign_flip", "attack.malicious_ratio": 0.34}))
     run_experiment(smoke_cfg("amr2", **{"defense.assumed_malicious_ratio": 0.1, "federated.rounds": 1}))
     assert seen == [0.2, 0.1]
@@ -152,6 +152,7 @@ def test_context_reuse_and_validation(smoke_cfg):
         {"attack.name": "bogus"},
         {"attack.knowledge": "bogus"},
         {"defense.aggregator": {"name": "bogus", "params": {}}},
+        {"defense.aggregator": {"name": "raguard", "params": {"bogus": 1}}},
         {"defense.weighting": "bogus"},
         {"client.lr_schedule": "bogus"},
         {"client.optimizer_state": "bogus"},
@@ -300,3 +301,12 @@ def test_fl_smoke_baseline_models(smoke_cfg, tmp_path, name):
     rebuild_model(ckpt).load_state_dict(ckpt["model_state_dict"])
     for mode in ("centralized", "local_only"):
         assert run_experiment(apply_overrides(cfg, {"federated.mode": mode, "output.dir": str(tmp_path / f"{name}_{mode}")}))["mode"] == mode
+
+
+def test_fl_smoke_raguard(smoke_cfg, tmp_path):
+    summary = run_experiment(
+        smoke_cfg("rag", **{"attack.name": "min_max", "attack.malicious_ratio": 0.34, "defense.aggregator": {"name": "raguard", "params": {}}})
+    )
+    assert summary["aggregator"] == "raguard"
+    first = _records(tmp_path / "rag" / "rounds.jsonl")[0]
+    assert all("trust" in d for d in first["decisions"])

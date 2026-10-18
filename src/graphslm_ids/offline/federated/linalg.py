@@ -93,6 +93,41 @@ def coordinate_trimmed_mean(x: torch.Tensor, k: int, chunk: int = CHUNK) -> torc
     return out
 
 
+def weighted_trimmed_mean(x: torch.Tensor, w: torch.Tensor, beta: float, chunk: int = CHUNK) -> torch.Tensor:
+    """Coordinate-wise trimmed mean that trims weight mass ``beta`` from each end.
+
+    Per coordinate the values are sorted and carry their weights (normalized to sum 1) with
+    cumulative mass ``c_i``; element i keeps ``max(0, min(c_i, 1 - beta) - max(c_{i-1}, beta))``
+    of its mass and the result is ``sum(kept * value) / (1 - 2 beta)``. Equal weights and
+    ``beta = k / N`` give ``coordinate_trimmed_mean(x, k)``; ``beta = 0`` gives the weighted mean.
+    """
+    _check_chunk(chunk)
+    beta = float(beta)
+    if not 0.0 <= beta < 0.5:
+        raise ValueError(f"beta must be in [0, 0.5), got {beta}")
+    n = x.shape[0]
+    if n == 0:
+        raise ValueError("cannot take a weighted trimmed mean of zero rows")
+    w = torch.as_tensor(w).to(x.device, torch.float64).reshape(-1)
+    if w.shape[0] != n:
+        raise ValueError(f"got {w.shape[0]} weights for {n} rows")
+    if bool((w < 0).any()) or not float(w.sum()) > 0:
+        raise ValueError("weights must be non-negative with a positive sum")
+    w = w / w.sum()
+    out = torch.empty(x.shape[1], dtype=x.dtype, device=x.device)
+    for start in range(0, x.shape[1], chunk):
+        vals, order = x[:, start:start + chunk].sort(dim=0)
+        cum = w[order].cumsum_(dim=0)  # float64 mass; in-place ops bound the per-chunk memory
+        del order
+        kept = cum.clamp(max=1.0 - beta)
+        lower = cum.clamp_(min=beta)  # max(c_{i-1}, beta) once shifted down by one row
+        kept[1:] -= lower[:-1]
+        kept[0] -= beta  # c_{-1} = 0
+        kept.clamp_(min=0.0)
+        out[start:start + vals.shape[1]] = (kept.mul_(vals).sum(dim=0) / (1.0 - 2.0 * beta)).to(x.dtype)
+    return out
+
+
 def top_right_singular_vector(x: torch.Tensor) -> torch.Tensor:
     _u, _s, vh = torch.linalg.svd(x.to(torch.float32), full_matrices=False)
     return vh[0].to(x.dtype)
