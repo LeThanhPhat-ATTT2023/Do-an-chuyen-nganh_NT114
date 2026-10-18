@@ -50,6 +50,16 @@ DEFAULT_FL_CONFIG: dict[str, Any] = {
         "num_heads": 4,
         "dropout": 0.2,
         "ffn_multiplier": 2,
+        # Flat baselines (model.name: mlp / cnn); HGT ignores both blocks.
+        "mlp": {"hidden_dims": [256, 128, 64], "dropout": 0.2},
+        "cnn": {
+            "num_packets": 8,
+            "byte_prefix": "obyte_",
+            "channels": [32, 64, 128],
+            "kernel_size": 7,
+            "num_groups": 8,
+            "dropout": 0.2,
+        },
     },
     "sampler": {
         "hops": 2,

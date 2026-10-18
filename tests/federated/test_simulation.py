@@ -285,3 +285,18 @@ def test_export_partition_table_script(smoke_cfg, tmp_path):
     assert lines[0] == "client,group,Benign,XSS,DDoS-ICMP_Flood,total" and len(lines) == 4
     pytest.importorskip("matplotlib")
     assert (tmp_path / "t.png").exists()
+
+
+@pytest.mark.parametrize("name", ["mlp", "cnn"])
+def test_fl_smoke_baseline_models(smoke_cfg, tmp_path, name):
+    cfg = smoke_cfg(
+        name,
+        **{"model.name": name, "model.cnn.num_groups": 2,
+           "attack.name": "sign_flip", "attack.malicious_ratio": 0.34},
+    )
+    summary = run_experiment(cfg)
+    assert summary["model"] == name and len(summary["malicious_clients"]) == 1
+    ckpt = torch.load(tmp_path / name / "global_final.pt", map_location="cpu", weights_only=False)
+    rebuild_model(ckpt).load_state_dict(ckpt["model_state_dict"])
+    for mode in ("centralized", "local_only"):
+        assert run_experiment(apply_overrides(cfg, {"federated.mode": mode, "output.dir": str(tmp_path / f"{name}_{mode}")}))["mode"] == mode

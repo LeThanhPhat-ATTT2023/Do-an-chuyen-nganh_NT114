@@ -89,6 +89,7 @@ def write_tiny_v3(root: Path, num_flows: int = 48, seed: int = 0) -> dict[str, P
                 "num_techniques": len(TECHNIQUES),
                 "label_mapping": LABELS,
                 "flow_feature_names": FLOW_FEATURES,
+                "packet_feature_names": ["pkt_len", "pkt_dir"] + [f"obyte_{i:03d}" for i in range(6)],
                 "technique_id_to_idx": TECHNIQUES,
             }
         ),
