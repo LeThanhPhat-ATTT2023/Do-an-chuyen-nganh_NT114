@@ -117,3 +117,27 @@ def test_server_weighting_modes():
     assert torch.allclose(server.global_vec, torch.tensor([2.0]))
     with pytest.raises(ValueError):
         FLServer(global_vec=torch.zeros(1), aggregator=FedAvg(), weighting="bogus")
+
+
+def test_server_marks_multi_krum_dropped_clients_rejected():
+    from graphslm_ids.offline.federated.aggregators import MultiKrum
+
+    g = torch.Generator().manual_seed(0)
+    deltas = torch.randn(20, generator=g) + 0.1 * torch.randn(10, 20, generator=g)
+    deltas[0] = -50.0 * deltas[1]
+    server = FLServer(global_vec=torch.zeros(20), aggregator=MultiKrum(f_ratio=0.2))
+    assert server.step([ClientMessage(i, 1, deltas[i], 1) for i in range(10)]).decision_map()[0] == "reject"
+
+
+@pytest.mark.parametrize("bad", [torch.full((4,), float("nan")), torch.zeros(3)])
+def test_server_rejects_a_broken_aggregate(bad):
+    class Broken(Aggregator):
+        name = "broken_agg"
+
+        def aggregate(self, deltas, weights, ctx=None):
+            return AggResult(bad)
+
+    server = FLServer(global_vec=torch.zeros(4), aggregator=Broken())
+    with pytest.raises(ValueError, match="broken_agg"):
+        server.step([ClientMessage(0, 1, torch.ones(4), 1)])
+    assert torch.equal(server.global_vec, torch.zeros(4))

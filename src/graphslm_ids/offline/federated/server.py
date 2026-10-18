@@ -161,6 +161,11 @@ class FLServer:
         agg_norm = 0.0
         if applied:
             delta = result.delta.detach().to(self.device, torch.float32)
+            if tuple(delta.shape) != (self.dim,) or not bool(torch.isfinite(delta).all()):
+                raise ValueError(
+                    f"aggregator {self.aggregator.name!r} returned an invalid aggregate "
+                    f"(shape {tuple(delta.shape)}, expected ({self.dim},); all finite required)"
+                )
             self.global_vec += self.server_lr * delta
             self.prev_aggregate = delta.clone()
             agg_norm = float(delta.norm())
